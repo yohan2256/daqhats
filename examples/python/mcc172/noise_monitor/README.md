@@ -1,18 +1,21 @@
 # MCC 172 Noise Monitor
 
 A headless setup that turns a Raspberry Pi + **MCC 172** DAQ HAT into a
-network sound/vibration probe you can **remote-control from a laptop**. On
-boot the Pi powers an IEPE microphone, applies your calibration, and (by
-default) starts streaming the raw waveform over TCP. A separate control port
-lets a client drive every configurable feature of the MCC 172 and start/stop
-the stream on demand.
+network **sound level meter** you control from a laptop. On boot the Pi
+powers an IEPE microphone, applies your calibration, and streams the
+**Fast time-weighted, A-weighted level** (the SLM "needle") continuously.
+Raw samples are kept in a ring buffer on the Pi, and on request it computes
+**Leq, Lmax, Lmin, Lpeak, and LN percentiles** over a window — like a class
+sound level meter. A separate control port drives every configurable
+feature of the MCC 172.
 
 ```
 [IEPE mic] --2 mA IEPE--> [MCC 172 HAT] --SPI--> [Raspberry Pi]
                                                        |  (systemd @ boot)
                                                        |  noise_monitor.py
-                                    control port 5000  <->  commands / responses
-                                    stream  port 5001   ->  raw waveform frames
+                                                       |  + raw ring buffer
+                                    control port 5000  <->  commands / metrics
+                                    stream  port 5001   ->  levels (+ raw/bands)
                                                     Wi-Fi / USB-ethernet
                                                        v
                                                    [Laptop]
@@ -29,8 +32,8 @@ to **51.2 kHz per channel**.
 
 | Port | Default | Direction | Content |
 |------|:-------:|-----------|---------|
-| **Control** | 5000 | both ways | Newline-delimited JSON commands, responses, and events. No binary. |
-| **Stream**  | 5001 | Pi → client | Typed length-prefixed frames: a JSON handshake, then the raw waveform (`float64`), optional 1/3-octave band output, plus events. |
+| **Control** | 5000 | both ways | Newline-delimited JSON commands, responses (incl. on-demand metrics), and events. No binary. |
+| **Stream**  | 5001 | Pi → client | Typed length-prefixed frames: JSON handshake, time-weighted **LEVEL** frames (default), optional per-band levels, optional raw waveform / band waveforms, plus events. |
 
 The client is yours to write — see **[`PROTOCOL.md`](PROTOCOL.md)** for the
 complete, language-agnostic wire specification (framing, handshake, the full
@@ -40,11 +43,18 @@ command list with request/response schemas, events, and examples).
 
 | File | Runs on | Purpose |
 |------|---------|---------|
-| `noise_monitor.py`     | Raspberry Pi | IEPE + calibration + continuous scan; control-port command server and stream-port waveform/band server. |
-| `band_filter.py`       | Raspberry Pi | Fractional-octave (1/3-octave) decimating Butterworth filter bank (needs numpy/scipy; only used when band output is on). |
-| `config.ini`           | Raspberry Pi | Boot defaults: sample rate, channels, IEPE, sensitivity, ports, autostart, bands. |
+| `noise_monitor.py`     | Raspberry Pi | IEPE + calibration + continuous scan; level streaming, raw ring buffer + on-demand metrics; control/stream servers. |
+| `slm.py`               | Raspberry Pi | Sound-level-meter DSP: IEC 61672 A/C/Z weighting, Fast/Slow/Impulse time weighting, Leq/Lmax/Lmin/Lpeak/LN. |
+| `band_filter.py`       | Raspberry Pi | Fractional-octave (1/3-octave) decimating Butterworth filter bank. |
+| `config.ini`           | Raspberry Pi | Boot defaults: sample rate, channels, IEPE, sensitivity, weighting, level rate, buffer, bands, ports. |
 | `noise-monitor.service`| Raspberry Pi | systemd unit for automatic start at boot. |
 | `PROTOCOL.md`          | —            | Communication protocol specification for your client. |
+
+Python dependencies on the Pi (for the level/metrics DSP):
+
+```sh
+sudo apt install python3-numpy python3-scipy
+```
 
 ## 1. Hardware
 
@@ -129,38 +139,32 @@ After editing `config.ini`, apply changes with:
 sudo systemctl restart noise-monitor
 ```
 
-## 1/3-octave band output (optional)
+## Sound-level-meter behavior
 
-The Pi can additionally stream fractional-octave (1/3-octave by default)
-band-filtered audio: each band is a real-time Butterworth band-pass filter,
-**decimated per band** to just above twice its upper edge, sent as `BAND`
-frames on the stream port. The laptop then does time-weighting
-(Fast/Slow/Impulse), Leq, band SPL, A/C-weighting, etc. (see PROTOCOL.md §5.1).
+What streams continuously, and what is computed on demand:
 
-Enable it in `config.ini` (`[bands] enabled = true`) or at runtime with the
-`set_bands` command. It needs numpy + scipy on the Pi:
+- **LEVEL frames (default on).** The Pi applies the configured frequency
+  weighting (A/C/Z) and time weighting (Fast/Slow/Impulse) and streams the
+  broadband level in dB at `[level] output_rate` (default 10/s) — the live
+  needle. A few hundred bytes per second.
+- **Raw ring buffer + `get_metrics`.** Raw samples are stored for
+  `[storage] buffer_seconds` (default 60 s). The `get_metrics` command
+  computes **Leq, Lmax, Lmin, Lpeak, LN (L10/L50/L90...)** over a requested
+  window — while running or after a stop — optionally with per-band Leq
+  (`include_bands`).
+- **1/3-octave spectrum (optional).** `[bands] enabled = true` adds per-band
+  output. `output = level` (default) streams Fast time-weighted band levels
+  in dB (`BAND_LEVEL` frames) — the octave-analyzer bar display, tiny
+  bandwidth. `output = waveform` streams each band's decimated time signal
+  (`BAND` frames) — heavy; the full 20 Hz–20 kHz set for 2 ch is ~36 Mbit/s,
+  so lower `f_max` to fit Wi-Fi if you need waveforms.
+- **Raw waveform streaming (optional).** `stream_raw = true` additionally
+  streams the full-rate raw waveform (~6.6 Mbit/s for 2 ch) if you want to
+  record everything on the laptop.
 
-```sh
-sudo apt install python3-numpy python3-scipy
-```
-
-**Bandwidth — read this before enabling the full range.** High 1/3-octave
-bands are wide in absolute Hz, so they barely decimate. For two channels at
-51.2 kHz:
-
-| Band range | Approx. band-output rate (2 ch) |
-|------------|--------------------------------:|
-| 20 Hz – 20 kHz (31 bands) | ~36 Mbit/s (≈5× the raw stream) |
-| 20 Hz – 5 kHz (25 bands)  | ~7 Mbit/s |
-| 20 Hz – 1 kHz (18 bands)  | ~1 Mbit/s |
-
-The top few bands dominate, so **lowering `f_max` is the most effective way to
-fit a Wi-Fi link.** Using one channel, or `stream_raw = false` (send only
-band frames, no raw), also helps. CPU cost is modest — the full 31-band ×
-2-channel bank is roughly one-third to one-half of one Pi Zero 2 W core.
-
-For a broadband (overall) Leq or time-weighting, don't use bands at all — the
-raw DATA stream is far lighter and the laptop can compute it directly.
+Frequency weighting, time weighting, level rate, buffer length, and band
+setup are all changeable at runtime (`set_weighting`, `set_level`,
+`set_storage`, `set_bands`) — stop the scan, set, start.
 
 ## Notes & tips
 

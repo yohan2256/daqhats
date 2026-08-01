@@ -70,17 +70,27 @@ Everything the server sends here is a **typed, length-prefixed frame**:
 |:----:|------|---------|
 | `0x01` | DATA | Raw waveform: interleaved `float64` (8 bytes each), little-endian. |
 | `0x02` | MSG  | A UTF-8 JSON object (handshake on connect, then events). |
-| `0x03` | BAND | Optional fractional-octave band output (see §2.2). |
+| `0x03` | BAND | Fractional-octave band **waveform** (decimated), see §2.2. |
+| `0x04` | LEVEL | Broadband time-weighted **level** (dB), see §2.3. |
+| `0x05` | BAND_LEVEL | Per-band time-weighted **level** (dB), see §2.4. |
 
 **Reading loop (pseudocode):**
 
 ```
 read 5 bytes -> (type, length)
 read `length` bytes -> payload
-if type == 0x01: decode payload as float64[]
-if type == 0x02: parse payload as JSON
-if type == 0x03: band_index,channel = payload[:8]; float64[] = payload[8:]
+if type == 0x01: float64[]                = payload            # raw waveform
+if type == 0x02: json                     = payload            # msg / event
+if type == 0x03: band_index,channel,float64[]  = payload       # band waveform
+if type == 0x04: channel,float64[]        = payload            # level dB
+if type == 0x05: band_index,channel,float64[]  = payload       # band level dB
 ```
+
+**Which frames you get depends on configuration.** By default the monitor
+behaves like a sound level meter: it sends `LEVEL` frames (and `BAND_LEVEL`
+if bands are enabled) and keeps raw samples buffered for `get_metrics`
+(§4). Raw `DATA` is sent only when `stream_raw` is on; `BAND` (waveform)
+frames only when band output mode is `waveform`.
 
 ### DATA payload layout
 
@@ -130,8 +140,38 @@ decimated time series for that band.
 **Bandwidth:** high fractional-octave bands are wide in absolute Hz and
 barely decimate, so the full 20 Hz–20 kHz set at 51.2 kHz is roughly **5× the
 raw stream** for two channels (~36 Mbit/s) — marginal on Wi-Fi. Lower `f_max`
-(the top bands dominate), use one channel, or set `stream_raw = false` to
-drop the raw stream. See §5.1.
+(the top bands dominate), use one channel, or set `stream_raw = false`. For a
+sound level meter you usually want band **levels** (§2.4) instead, which are
+tiny. See §5.1.
+
+### 2.3 LEVEL frames (type `0x04`) — broadband time-weighted level
+
+The sound-level-meter "needle": the Pi applies the configured **frequency
+weighting** (A/C/Z) and **time weighting** (Fast/Slow/Impulse) to the
+broadband signal and streams the resulting level in dB, downsampled to the
+level output rate.
+
+```
+payload = [4-byte channel uint32][level float64 samples...]   # dB
+```
+
+- Sample count = `(length - 4) / 8`; the sample rate is `level.output_rate`
+  from the handshake (e.g. 10 Hz).
+- dB reference is 20 µPa when the channel is calibrated to Pa, else 1.0
+  (see `units` in the handshake). This is L_AF, L_ZF, etc. per the weighting.
+
+### 2.4 BAND_LEVEL frames (type `0x05`) — per-band time-weighted level
+
+Same idea per fractional-octave band (the real-time spectrum). Each band's
+decimated signal is Fast/Slow/Impulse time-weighted, and the A/C
+frequency-weighting **offset for that band's center frequency** is added.
+
+```
+payload = [4-byte band_index uint32][4-byte channel uint32][level float64 samples...]  # dB
+```
+
+- `band_index` maps to the handshake `band_table`; sample rate is
+  `level.output_rate`. This is what you display as bars in an octave analyzer.
 
 ---
 
@@ -160,9 +200,12 @@ The full configuration plus protocol metadata:
   "units": {"0": "Pa", "1": "V"},
   "trigger": {"enabled": false, "source": "LOCAL", "mode": "RISING_EDGE"},
   "options": {"continuous": true, "ext_clock": false},
-  "stream_raw": true,
-  "bands": {"enabled": true, "fraction": 3, "order": 6,
+  "stream_raw": false,
+  "bands": {"enabled": true, "output": "level", "fraction": 3, "order": 6,
             "f_min": 20.0, "f_max": 20000.0},
+  "weighting": {"frequency": "A", "time": "Fast"},
+  "level": {"enabled": true, "output_rate": 10.0},
+  "storage": {"buffer_seconds": 60.0},
   "dtype": "float64",
   "byte_order": "little",
   "interleave": "channel-fastest"
@@ -262,14 +305,38 @@ configuration changes during an active scan, so the server returns an error
 | `set_channels` | `channels` (list, subset of `[0,1]`) | `{"channels"}` |
 | `set_trigger` | `enable` (bool); optional `mode`, `source` | `{"enabled", "source", "mode"}` |
 | `set_options` | optional `continuous` (bool), `ext_clock` (bool), `stream_raw` (bool) | `{"continuous", "ext_clock", "stream_raw"}` |
-| `set_bands` | optional `enabled` (bool), `f_min`, `f_max`, `fraction`, `order`, `margin` | `{"enabled", "fraction", "order", "f_min", "f_max", "band_table"}` |
+| `set_bands` | optional `enabled` (bool), `output` (`level`\|`waveform`), `f_min`, `f_max`, `fraction`, `order`, `margin` | `{"enabled", "output", "fraction", "order", "f_min", "f_max", "band_table"}` |
+| `set_weighting` | optional `frequency` (`A`\|`C`\|`Z`), `time` (`Fast`\|`Slow`\|`Impulse`) | `{"frequency", "time"}` |
+| `set_level` | optional `enabled` (bool), `output_rate` (Hz) | `{"enabled", "output_rate"}` |
+| `set_storage` | `buffer_seconds` (raw ring-buffer length) | `{"buffer_seconds"}` |
 | `calibration_write` | `channel`, `slope`, `offset` (overrides factory ADC cal) | `{"channel", "slope", "offset"}` |
 | `test_signals_write` | `mode` (int); optional `clock`, `sync` (int) | `{"mode", "clock", "sync"}` |
 
 `set_bands` validates the settings immediately (building the filter bank) and
 returns the resulting `band_table`; it errors if `numpy`/`scipy` are not
-installed on the Pi. `set_options stream_raw=false` streams only BAND frames
-(no raw DATA).
+installed on the Pi. `set_bands output=level` sends per-band levels
+(`BAND_LEVEL`), `waveform` sends decimated band signals (`BAND`).
+`set_options stream_raw=false` stops raw `DATA` (levels still stream).
+
+### On-demand metrics (anytime — the sound-level-meter statistics)
+
+| cmd | fields | result |
+|-----|--------|--------|
+| `get_metrics` | optional `seconds`, `weighting`, `time_weighting`, `percentiles` (list), `channels` (list), `include_bands` (bool) | per-channel `{Leq, Lmax, Lmin, Lpeak, LN:{L10,...}, units, calibrated, window_seconds, n_samples[, bands]}` |
+
+`get_metrics` computes over the most-recent buffered raw samples (kept
+`buffer_seconds` long), so it works while running **and** after `stop`. The
+`weighting`/`time_weighting` fields override the current settings for that
+one calculation. `include_bands` adds a per-band `Leq` list. Example result:
+
+```json
+{"sample_rate": 51200.0, "requested_seconds": 10,
+ "channels": {"0": {"Leq": 74.8, "Lmax": 88.1, "Lmin": 61.2, "Lpeak": 96.0,
+                    "LN": {"L10": 78.9, "L50": 72.5, "L90": 64.1},
+                    "weighting": "A", "time_weighting": "Fast",
+                    "units": "Pa", "calibrated": true,
+                    "window_seconds": 10.0, "n_samples": 512000}}}
+```
 
 ### Controls (anytime)
 
@@ -312,28 +379,32 @@ SPL  = 20 * log10(Prms / 20e-6)      # dB
 The stream is unweighted (Z-weighting). Apply an A-weighting filter on your
 side if you need dB(A).
 
-### 5.1 Band levels, time-weighting, and Leq (laptop side)
+### 5.1 What the Pi computes vs. what you can compute
 
-BAND frames (§2.2) give you each fractional-octave band as a continuous,
-decimated time series in Pa. From those the laptop computes the usual
-metrics — the Pi deliberately does none of this so it stays light:
+The Pi already does the sound-level-meter math:
+
+- **LEVEL / BAND_LEVEL frames** are frequency-weighted (A/C/Z per
+  `weighting.frequency`) and time-weighted (Fast/Slow/Impulse per
+  `weighting.time`) levels in dB — display them directly (L_AF etc.).
+- **`get_metrics`** returns Leq, Lmax, Lmin, Lpeak, and LN percentiles over
+  the buffered window, with optional per-band Leq.
+
+If you prefer to compute on the client (from raw DATA or BAND waveforms),
+the definitions used are:
 
 ```
-# per band b, per channel, over its decimated stream x_b[n] (in Pa):
-
 # Time-weighted level (Fast tau=0.125 s, Slow tau=1 s, Impulse tau=0.035 s):
-#   exponential moving average of the squared signal, then to dB
-a      = dt / tau                       # dt = 1 / decimated_rate[b]
-ms[n]  = ms[n-1] + a * (x_b[n]^2 - ms[n-1])
+#   one-pole exponential average of the squared signal, then to dB
+alpha  = exp(-1 / (fs * tau))
+ms[n]  = alpha * ms[n-1] + (1 - alpha) * x[n]^2
 L_tw   = 10 * log10(ms[n] / (20e-6)^2)
 
 # Equivalent continuous level over T seconds (energy average):
-Leq_T  = 10 * log10( mean(x_b^2 over T) / (20e-6)^2 )
-```
+Leq_T  = 10 * log10( mean(x^2 over T) / (20e-6)^2 )
 
-Choosing `f_max` sets the highest band and therefore most of the bandwidth
-(the top bands barely decimate). For overall (broadband) Leq/time-weighting,
-use the raw DATA stream instead — it is far lighter than the full band set.
+# L_N: level exceeded N % of the time = (100-N)th percentile of the
+# time-weighted level series. Lpeak = 20*log10(max|x| / 20e-6).
+```
 
 ---
 
