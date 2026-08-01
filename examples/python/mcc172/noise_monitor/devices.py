@@ -36,6 +36,11 @@ means "no scaling" (data in volts) for both backends.
 """
 from __future__ import print_function
 
+import numpy as np
+
+#: Shared empty block returned when a device has produced no new samples.
+_EMPTY = np.empty(0, dtype=np.float64)
+
 
 class Mcc172Backend:
     """MCC 172 DAQ HAT via the daqhats library (2 IEPE channels)."""
@@ -111,9 +116,14 @@ class Mcc172Backend:
         self.running = True
 
     def read_new(self):
-        result = self._hat.a_in_scan_read(-1, 0)
+        """Return (interleaved float64 numpy array, overrun).
+
+        Uses the daqhats NumPy read so samples never pass through a Python
+        list -- 8 bytes/sample instead of ~32, and no per-sample boxing.
+        """
+        result = self._hat.a_in_scan_read_numpy(-1, 0)
         overrun = result.hardware_overrun or result.buffer_overrun
-        return list(result.data), overrun
+        return result.data, overrun
 
     def stop(self):
         try:
@@ -201,6 +211,7 @@ class Dt9837aBackend:
         self.num_channels = len(self.channels)
         self._range = info.get_ranges(self._input_mode())[0]
         self._buffer = None
+        self._view = None
         self._last_total = 0
         self.actual_rate = 51200.0
         self.running = False
@@ -256,6 +267,7 @@ class Dt9837aBackend:
                                          self.BUFFER_SECONDS))
         self._buffer = ul.create_float_buffer(self.num_channels,
                                               samples_per_chan)
+        self._view = None          # numpy view, built on first read
         self._last_total = 0
         options = ul.ScanOption.CONTINUOUS
         if triggered:
@@ -267,7 +279,12 @@ class Dt9837aBackend:
         self.running = True
 
     def read_new(self):
-        """Return samples written to the circular buffer since the last call."""
+        """Return (interleaved float64 numpy array, overrun).
+
+        The uldaq scan buffer is a ctypes double array; ``np.frombuffer``
+        wraps it without copying, so only the new span is copied out.
+        """
+        import numpy as np
         ul = self._ul
         status, transfer = self._ai.get_scan_status()
         total = transfer.current_total_count      # cumulative, interleaved
@@ -281,12 +298,14 @@ class Dt9837aBackend:
             overrun = True
         start = self._last_total % buf_len
         end = (start + new) % buf_len
+        if self._view is None:
+            self._view = np.frombuffer(self._buffer, dtype=np.float64)
         if new == 0:
-            data = []
+            data = _EMPTY
         elif start < end:
-            data = list(self._buffer[start:end])
+            data = self._view[start:end].copy()
         else:
-            data = list(self._buffer[start:]) + list(self._buffer[:end])
+            data = np.concatenate((self._view[start:], self._view[:end]))
         self._last_total = total
         # A non-RUNNING status is an error only once data has flowed; an
         # armed scan waiting for its trigger edge must not be flagged.

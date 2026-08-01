@@ -77,6 +77,7 @@ command list with request/response schemas, events, and examples).
 | `devices.py`           | Raspberry Pi | Device backends: MCC 172 (daqhats) and DT9837A (uldaq), plus the global channel map. |
 | `slm.py`               | Raspberry Pi | Sound-level-meter DSP: IEC 61672 A/C/Z weighting, Fast/Slow/Impulse time weighting, Leq/Lmax/Lmin/Lpeak/LN. |
 | `band_filter.py`       | Raspberry Pi | Fractional-octave (1/3-octave) decimating Butterworth filter bank. |
+| `dsp_pool.py`          | Raspberry Pi | Multi-core DSP: worker processes + shared memory for the level/band computation. |
 | `gpio_trigger.py`      | Raspberry Pi | GPIO trigger-pulse output for the synchronized start (gpiod v2/v1 or RPi.GPIO). |
 | `config.ini`           | Raspberry Pi | Boot defaults: devices, channels, IEPE, sensitivity, sample rate, weighting, level rate, buffer, bands, ports. |
 | `noise-monitor.service`| Raspberry Pi | systemd unit for automatic start at boot. |
@@ -217,6 +218,27 @@ What streams continuously, and what is computed on demand:
 Frequency weighting, time weighting, level rate, buffer length, and band
 setup are all changeable at runtime (`set_weighting`, `set_level`,
 `set_storage`, `set_bands`) — stop the scan, set, start.
+
+## Multi-core DSP
+
+The level/band computation is the only heavy work, and it parallelizes by
+channel, so it runs in **worker processes** (`[dsp] workers`, default `-1`
+= `cpu_count-1`, i.e. 3 on a Pi 4). Each worker owns the filter state for
+its channels and receives blocks through **shared memory** — sample data is
+never pickled. Threads are not an option: `scipy.signal.sosfilt` holds the
+GIL, so a thread pool measures *slower* than serial.
+
+Measured, 6 ch at 51.2 kHz with 1/3-octave bands to 20 kHz:
+
+| Mode | One-core load (Pi 4) |
+|------|---------------------:|
+| inline (`workers = 0`) | ~91% — no headroom |
+| 3 workers (default) | **~41%**, spread over 3 cores |
+
+Set `workers = 0` to keep everything in the acquisition thread (simplest,
+fine for levels-only use). The acquisition loop always keeps its own core:
+it reads the devices, fills the RAM ring buffer, and broadcasts frames,
+while the workers only compute.
 
 ## Notes & tips
 

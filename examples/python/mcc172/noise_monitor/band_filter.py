@@ -117,6 +117,17 @@ class BandFilterBank:
         """
         n_chan = len(self.channels)
         data = np.asarray(interleaved, dtype=np.float64).reshape(-1, n_chan)
+        for item in self.process_2d(data):
+            yield item
+
+    def process_2d(self, data):
+        """Filter + decimate a block already shaped (frames, channels).
+
+        This is the zero-copy entry point: callers that already hold a 2-D
+        view (e.g. a shared-memory slot) avoid the reshape in
+        :meth:`process`. Same yields as :meth:`process`.
+        """
+        n_chan = len(self.channels)
         block_len = data.shape[0]
         if block_len == 0:
             return

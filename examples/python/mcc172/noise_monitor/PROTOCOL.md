@@ -275,6 +275,8 @@ The full configuration plus protocol metadata:
   "storage": {"buffer_seconds": 60.0},
   "trigger": {"enabled": false, "source": "gpio", "gpio_pin": 17,
               "pulse_ms": 10.0, "mode": "RISING_EDGE"},
+  "dsp": {"workers_configured": -1, "workers": 3, "dropped_blocks": 0,
+          "channels": [[0, 1], [2, 3], [4, 5]]},
   "clock_sync_note": "shared-trigger start aligns scan start; ADC clocks still drift (~ppm) between devices",
   "dtype": "float64",
   "byte_order": "little",
@@ -389,6 +391,7 @@ All `channel` fields take **global** channel numbers.
 | `set_weighting` | optional `frequency` (`A`\|`C`\|`Z`), `time` (`Fast`\|`Slow`\|`Impulse`) | `{"frequency", "time"}` |
 | `set_level` | optional `enabled` (bool), `output_rate` (Hz) | `{"enabled", "output_rate"}` |
 | `set_storage` | `buffer_seconds` (raw ring-buffer length) | `{"buffer_seconds"}` |
+| `set_dsp` | `workers` (`-1` auto, `0` inline, `N` cap) | `{"workers_configured", "cpu_count", "note"}` |
 | `calibration_write` | `channel`, `slope`, `offset` (**mcc172 channels only**) | `{"channel", "slope", "offset"}` |
 | `test_signals_write` | `mode` (int); optional `clock`, `sync` (**mcc172 only**) | `{"mode", "clock", "sync"}` |
 
