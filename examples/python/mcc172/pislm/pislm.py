@@ -365,6 +365,7 @@ class ClientRegistry:
         self._max_queue_blocks = max_queue_blocks
         self._clients = {}          # conn -> (kind, queue.Queue of bytes)
         self._lock = threading.Lock()
+        self._frames_dropped = 0    # stream frames evicted by a slow client
 
     @staticmethod
     def _encode(kind, obj):
@@ -393,8 +394,15 @@ class ClientRegistry:
         with self._lock:
             queues = [q for (kind, q) in self._clients.values()
                       if kind == 'stream']
-        for send_queue in queues:
-            self._enqueue(send_queue, frame, drop_oldest=True)
+        dropped = sum(1 for send_queue in queues
+                     if self._enqueue(send_queue, frame, drop_oldest=True))
+        if dropped:
+            with self._lock:
+                self._frames_dropped += dropped
+
+    def stream_frames_dropped(self):
+        with self._lock:
+            return self._frames_dropped
 
     def broadcast_message(self, obj):
         """Send a MSG/event to every client, encoded per client kind."""
@@ -423,16 +431,23 @@ class ClientRegistry:
 
     @staticmethod
     def _enqueue(send_queue, frame, drop_oldest=False):
+        """Return True if an already-queued frame had to be evicted (i.e. a
+        frame was lost to a slow consumer), False otherwise."""
         try:
             send_queue.put_nowait(frame)
+            return False
         except queue.Full:
             if not drop_oldest:
-                return
+                return False
             try:
                 send_queue.get_nowait()
-                send_queue.put_nowait(frame)
-            except (queue.Empty, queue.Full):
+            except queue.Empty:
                 pass
+            try:
+                send_queue.put_nowait(frame)
+            except queue.Full:
+                pass
+            return True
 
     def _remove(self, conn):
         with self._lock:
@@ -695,6 +710,13 @@ class Controller:
                 'clock_sync_note': ('shared-trigger start aligns scan start; '
                                     'ADC clocks still drift (~ppm) between '
                                     'devices'),
+                'network': {
+                    'stream_clients': (self._registry.stream_client_count()
+                                       if self._registry else 0),
+                    'stream_frames_dropped': (
+                        self._registry.stream_frames_dropped()
+                        if self._registry else 0),
+                },
             }
 
     def handshake(self):

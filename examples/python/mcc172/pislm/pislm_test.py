@@ -36,7 +36,7 @@ import struct
 import sys
 import threading
 from array import array
-from time import time
+from time import sleep, time
 
 TYPE_DATA = 0x01
 TYPE_MSG = 0x02
@@ -44,6 +44,12 @@ TYPE_BAND = 0x03
 TYPE_LEVEL = 0x04
 TYPE_BAND_LEVEL = 0x05
 TYPE_RAW_DUMP = 0x06
+
+TYPE_NAMES = {
+    TYPE_DATA: 'DATA', TYPE_MSG: 'MSG', TYPE_BAND: 'BAND',
+    TYPE_LEVEL: 'LEVEL', TYPE_BAND_LEVEL: 'BAND_LEVEL',
+    TYPE_RAW_DUMP: 'RAW_DUMP',
+}
 
 FRAME_HEADER = struct.Struct('<BI')
 DATA_HEADER = struct.Struct('<I')
@@ -210,6 +216,11 @@ class StreamReader(threading.Thread):
         self._last_print = 0.0
         self._dump_files = {}       # dump_id -> {device: file handle}
         self._dump_meta = {}        # dump_id -> response 'devices' info
+        # Cumulative bandwidth counters, keyed by frame type; only ever
+        # written from this thread (run()), so plain dicts are fine to read
+        # from elsewhere without a lock (see Shell._bench).
+        self.bytes_by_type = {}
+        self.frames_by_type = {}
 
     def start_dump(self, dump_id, meta_devices, path_template):
         """Register file handles for an in-flight get_raw dump. Call this
@@ -232,6 +243,11 @@ class StreamReader(threading.Thread):
                 ftype, payload = read_frame(self.sock)
                 if ftype is None:
                     break
+                frame_len = FRAME_HEADER.size + len(payload)
+                self.bytes_by_type[ftype] = (
+                    self.bytes_by_type.get(ftype, 0) + frame_len)
+                self.frames_by_type[ftype] = (
+                    self.frames_by_type.get(ftype, 0) + 1)
                 if ftype == TYPE_MSG:
                     self._on_msg(payload)
                 elif ftype == TYPE_LEVEL:
@@ -319,6 +335,10 @@ Commands:
   rate <hz>                            set_sample_rate (scan must be stopped)
   raw <seconds> <file_prefix>          get_raw, saved to <prefix>_devN.f64
                                         (raw interleaved little-endian float64)
+  bench [seconds]                      measure stream bandwidth for N s
+                                        (default 10); reports KB/s, Mbps,
+                                        frames/s per frame type, plus
+                                        dropped-block/frame deltas
   blink [count]                        blink_led
   meter on|off                         toggle the live level readout
   send <raw json>                      send any command verbatim, e.g.
@@ -355,6 +375,62 @@ class Shell:
                 continue
             if not self._dispatch(line):
                 break
+
+    def _bench(self, seconds):
+        """Measure stream-port throughput over `seconds`, cross-checked
+        against the server's device-side (dsp) and network-side (stream
+        queue eviction) drop counters -- see PROTOCOL.md section 8."""
+        if seconds <= 0:
+            print('[bench] seconds must be > 0')
+            return
+        status0 = self._call({'cmd': 'status'})
+        bytes0 = dict(self.stream.bytes_by_type)
+        frames0 = dict(self.stream.frames_by_type)
+        rtt0 = time()
+        self._call({'cmd': 'ping'})
+        rtt_ms = (time() - rtt0) * 1000.0
+        print('[bench] measuring for {:.1f}s ...'.format(seconds))
+        t0 = time()
+        sleep(seconds)
+        elapsed = time() - t0
+        bytes1 = dict(self.stream.bytes_by_type)
+        frames1 = dict(self.stream.frames_by_type)
+        status1 = self._call({'cmd': 'status'})
+
+        types = sorted(set(bytes0) | set(bytes1))
+        total_bytes = sum(bytes1.get(t, 0) - bytes0.get(t, 0) for t in types)
+        total_frames = sum(frames1.get(t, 0) - frames0.get(t, 0)
+                          for t in types)
+        print('[bench] {:.1f}s window, control RTT ~{:.1f} ms'.format(
+            elapsed, rtt_ms))
+        print('  total: {:8.1f} KB/s  ({:.2f} Mbps), {:.1f} frames/s'.format(
+            total_bytes / elapsed / 1024.0,
+            total_bytes * 8 / elapsed / 1e6,
+            total_frames / elapsed))
+        for ftype in types:
+            db = bytes1.get(ftype, 0) - bytes0.get(ftype, 0)
+            df = frames1.get(ftype, 0) - frames0.get(ftype, 0)
+            if db == 0 and df == 0:
+                continue
+            name = TYPE_NAMES.get(ftype, 'type0x{:02x}'.format(ftype))
+            print('  {:<12s}{:8.1f} KB/s  {:7.1f} fps'.format(
+                name, db / elapsed / 1024.0, df / elapsed))
+
+        if status0 and status0.get('ok') and status1 and status1.get('ok'):
+            r0, r1 = status0['result'], status1['result']
+            dsp_dropped = (r1.get('dsp', {}).get('dropped_blocks', 0) -
+                          r0.get('dsp', {}).get('dropped_blocks', 0))
+            net_dropped = (r1.get('network', {}).get(
+                              'stream_frames_dropped', 0) -
+                          r0.get('network', {}).get(
+                              'stream_frames_dropped', 0))
+            print('  dsp dropped_blocks: +{}   '
+                  'stream frames dropped: +{}'.format(
+                      dsp_dropped, net_dropped))
+            if net_dropped:
+                print('  [bench] network dropped frames during the window -- '
+                      'the link cannot keep up with the current streaming '
+                      'mode.')
 
     def _dispatch(self, line):
         parts = line.split()
@@ -419,6 +495,9 @@ class Shell:
                         result['dump_id'], result['devices'],
                         prefix + '_dev{device}.f64')
                     print('[raw] writing to {}_dev*.f64 ...'.format(prefix))
+            elif cmd == 'bench':
+                seconds = float(args[0]) if args else 10.0
+                self._bench(seconds)
             elif cmd == 'blink':
                 count = int(args[0]) if args else 1
                 self._call({'cmd': 'blink_led', 'count': count})

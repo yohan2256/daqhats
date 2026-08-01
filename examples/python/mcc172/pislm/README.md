@@ -192,9 +192,26 @@ python3 pislm_test.py --host 192.168.50.1
 
 Type `help` at its prompt for the full command list (`status`, `metrics`,
 `calibrate`, `sens`, `iepe`, `rate`, `raw` to dump buffered audio to a file,
-`send <json>` for anything not covered by a shortcut). It is meant for quick
-checks during commissioning, not as your production client — implement that
-against [`PROTOCOL.md`](PROTOCOL.md), which documents both ports in full.
+`bench` to measure streaming bandwidth, `send <json>` for anything not
+covered by a shortcut). It is meant for quick checks during commissioning,
+not as your production client — implement that against
+[`PROTOCOL.md`](PROTOCOL.md), which documents both ports in full.
+
+To check how much bandwidth the current configuration actually uses on
+your network (useful before deciding between Wi-Fi and Ethernet, or before
+enabling `stream_raw`/bands at a high sample rate):
+
+```sh
+> start
+> bench 15
+[bench] measuring for 15.0s ... control RTT ~2.1 ms
+  total:   2312.4 KB/s  (18.94 Mbps), 1583.2 frames/s
+  DATA         2312.4 KB/s   180.1 fps
+  dsp dropped_blocks: +0   stream frames dropped: +0
+```
+
+See [`PROTOCOL.md` §8](PROTOCOL.md#8-bandwidth--performance-testing) for
+expected bandwidth per mode and what a non-zero drop count means.
 
 For a one-off check without even that:
 
