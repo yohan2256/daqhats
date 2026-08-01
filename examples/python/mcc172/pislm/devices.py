@@ -217,7 +217,9 @@ class Dt9837aBackend:
         self.running = False
 
     def _input_mode(self):
-        return self._ul.AiInputMode.DIFFERENTIAL
+        # The DT9837A's ADC only supports single-ended inputs; DIFFERENTIAL
+        # has no ranges registered in the driver and get_ranges() returns [].
+        return self._ul.AiInputMode.SINGLE_ENDED
 
     # -- configuration (call while stopped) --
     def configure(self, rate, iepe, sensitivity_mv):

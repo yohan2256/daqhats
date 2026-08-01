@@ -544,6 +544,8 @@ resampling, keep phase-coherent channel pairs on the same device.
 |---------|-------------|
 | `daqhats_list_boards` finds nothing | HAT not fully seated, or another SPI device configured. Check `/boot/firmware/config.txt` for display/SPI overlays. |
 | `No DT9837A device found` | udev rule not applied, or user not in `plugdev`. Re-log in; check `lsusb`. |
+| `dt9837a: libuldaq.so: cannot open shared object file` | The `uldaq` C library was never built/installed (the `pip install uldaq` wrapper needs it separately). Redo §7's `./configure && make && sudo make install && sudo ldconfig`, then confirm with `ldconfig -p \| grep uldaq`. |
+| `dt9837a: list index out of range` | Fixed in this repo — update to the latest `pislm` (`git pull`) and restart the service; the DT9837A only supports single-ended inputs. |
 | `overrun` events, scan stops | The Pi cannot keep up. Lower `sample_rate`, lower `[bands] f_max`, turn off `[resample]`, or confirm `[dsp] workers` is `-1` (not `0`). |
 | Cross-device phase drifts over time | Enable `[resample]`; wait for `clock.settled` on both devices (~60 s). |
 | `clock.ppm` reads hundreds of ppm | Not a crystal error — usually a stalled or restarted scan. Restart and re-check; values beyond ±500 ppm are rejected as implausible. |
