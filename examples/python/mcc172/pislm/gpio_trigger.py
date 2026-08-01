@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #  -*- coding: utf-8 -*-
 """
-GPIO trigger-pulse output for the synchronized start of the noise monitor.
+GPIO trigger-pulse output for the synchronized start of the PiSLM.
 
 One Raspberry Pi GPIO pin, driven low at rest, is wired in parallel to the
 trigger inputs of every acquisition device:
@@ -67,7 +67,7 @@ class GpioTrigger:
         import gpiod
         from gpiod.line import Direction, Value
         self._request = gpiod.request_lines(
-            chip_path, consumer='noise-monitor-trigger',
+            chip_path, consumer='pislm-trigger',
             config={pin: gpiod.LineSettings(direction=Direction.OUTPUT,
                                             output_value=Value.INACTIVE)})
         self._v2_value = Value
@@ -79,7 +79,7 @@ class GpioTrigger:
             raise ImportError('gpiod module has no v1 Chip API')
         chip = gpiod.Chip(chip_path)
         line = chip.get_line(pin)
-        line.request(consumer='noise-monitor-trigger',
+        line.request(consumer='pislm-trigger',
                      type=gpiod.LINE_REQ_DIR_OUT, default_vals=[0])
         self._line = line
         self._backend = 'gpiod-v1'

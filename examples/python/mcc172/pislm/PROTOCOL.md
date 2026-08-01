@@ -1,10 +1,10 @@
-# Noise Monitor — Communication Protocol
+# PiSLM — Communication Protocol
 
-Wire specification for talking to `noise_monitor.py` running on the
+Wire specification for talking to `pislm.py` running on the
 Raspberry Pi. It is language-agnostic: any TCP client that follows this
 document can receive levels/waveforms and control the acquisition devices.
 
-- **Protocol version:** `noise-monitor/3` (see the handshake).
+- **Protocol version:** `pislm/3` (see the handshake).
 - **Devices:** up to two IEPE acquisition devices — an MCC 172 DAQ HAT
   (2 channels) and a Data Translation DT9837A (4 channels) — for **6
   channels total**. Channels are numbered **globally** in device order
@@ -244,7 +244,7 @@ The full configuration plus protocol metadata:
 ```json
 {
   "type": "handshake",
-  "protocol": "noise-monitor/3",
+  "protocol": "pislm/3",
   "running": false,
   "channels": [0, 1, 2, 3, 4, 5],
   "num_channels": 6,
@@ -275,6 +275,8 @@ The full configuration plus protocol metadata:
   "storage": {"buffer_seconds": 60.0},
   "trigger": {"enabled": false, "source": "gpio", "gpio_pin": 17,
               "pulse_ms": 10.0, "mode": "RISING_EDGE"},
+  "dsp": {"workers_configured": -1, "workers": 3, "dropped_blocks": 0,
+          "channels": [[0, 1], [2, 3], [4, 5]]},
   "clock_sync_note": "shared-trigger start aligns scan start; ADC clocks still drift (~ppm) between devices",
   "dtype": "float64",
   "byte_order": "little",
@@ -389,6 +391,7 @@ All `channel` fields take **global** channel numbers.
 | `set_weighting` | optional `frequency` (`A`\|`C`\|`Z`), `time` (`Fast`\|`Slow`\|`Impulse`) | `{"frequency", "time"}` |
 | `set_level` | optional `enabled` (bool), `output_rate` (Hz) | `{"enabled", "output_rate"}` |
 | `set_storage` | `buffer_seconds` (raw ring-buffer length) | `{"buffer_seconds"}` |
+| `set_dsp` | `workers` (`-1` auto, `0` inline, `N` cap) | `{"workers_configured", "cpu_count", "note"}` |
 | `calibration_write` | `channel`, `slope`, `offset` (**mcc172 channels only**) | `{"channel", "slope", "offset"}` |
 | `test_signals_write` | `mode` (int); optional `clock`, `sync` (**mcc172 only**) | `{"mode", "clock", "sync"}` |
 
@@ -566,7 +569,7 @@ Control port (5000) — JSON lines both ways:
 
 ```
 connect 5000
-  <- {"type":"handshake", "protocol":"noise-monitor/3", "num_channels":6, ...}
+  <- {"type":"handshake", "protocol":"pislm/3", "num_channels":6, ...}
   -> {"id":1,"cmd":"stop"}                       (ignore error if already stopped)
   -> {"id":2,"cmd":"set_sensitivity","channel":3,"value":50}     (global ch 3 = DT9837A ch 1)
   <- {"type":"response","id":2,"ok":true,"result":{"channel":3,"sensitivity":50.0,"units":"Pa"}}
@@ -586,7 +589,7 @@ Stream port (5001) — typed frames, Pi → client (default SLM configuration):
 
 ```
 connect 5001
-  <- MSG    {"type":"handshake", "protocol":"noise-monitor/3", ...}
+  <- MSG    {"type":"handshake", "protocol":"pislm/3", ...}
   <- LEVEL  ch0 <dB samples>                     (repeats for every channel
   <- LEVEL  ch2 <dB samples>                      at the level output rate)
   <- BAND_LEVEL band 12, ch 0 <dB samples>       (if bands enabled)

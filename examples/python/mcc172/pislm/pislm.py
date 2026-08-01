@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #  -*- coding: utf-8 -*-
 """
-Multi-device noise monitor -- Raspberry Pi side.
+PiSLM -- multi-device sound level meter -- Raspberry Pi side.
 
 Runs on a headless Raspberry Pi and behaves like a networked sound level
 meter across up to two IEPE acquisition devices:
@@ -20,7 +20,7 @@ only valid within one device.
 It streams Fast/Slow/Impulse time-weighted levels continuously, keeps raw
 samples in per-device ring buffers, and computes Leq / Lmax / Lmin / Lpeak /
 LN over a window on the "get_metrics" command. Designed to be launched at
-boot by systemd (see noise-monitor.service).
+boot by systemd (see pislm.service).
 
 Two separate TCP ports (see PROTOCOL.md for the full specification):
 
@@ -60,7 +60,6 @@ import socket
 import struct
 import sys
 import threading
-from array import array
 from time import sleep
 
 try:
@@ -70,7 +69,7 @@ except ImportError:  # pragma: no cover - Python 2 fallback
 
 from devices import open_backends, ChannelMap, Mcc172Backend
 
-PROTOCOL_VERSION = 'noise-monitor/3'
+PROTOCOL_VERSION = 'pislm/3'
 
 # Downstream frame types.
 TYPE_DATA = 0x01        # raw interleaved waveform (per device)
@@ -158,6 +157,9 @@ def load_config(path):
             'buffer_seconds': parser.getfloat('storage', 'buffer_seconds',
                                               fallback=60.0),
         },
+        'dsp': {
+            'workers': parser.getint('dsp', 'workers', fallback=-1),
+        },
         'trigger': {
             'enabled': parser.getboolean('trigger', 'sync_start',
                                          fallback=False),
@@ -218,31 +220,33 @@ def raw_dump_frame(dump_id, device_index, chunk_index, is_last, sample_bytes):
 class RawRingBuffer:
     """Rolling store of interleaved raw samples, trimmed to a max duration.
 
-    Blocks are stored as packed ``array('d')`` (8 bytes per sample), so the
+    Blocks are stored as float64 numpy arrays (8 bytes per sample), so the
     RAM cost is the theoretical minimum -- e.g. 2 ch x 51.2 kHz for 300 s is
     ~246 MB -- and blocks are never mutated after append, so readers can
-    snapshot the block list under the lock and copy outside it.
+    snapshot the block list under the lock and concatenate outside it.
     """
 
     def __init__(self, max_seconds, num_channels, sample_rate):
         self._num_channels = num_channels
         self._max_interleaved = int(max_seconds * sample_rate) * num_channels
-        self._blocks = []            # list of packed array('d') blocks
+        self._blocks = []            # list of float64 numpy arrays
         self._count = 0              # total interleaved samples held
         self._lock = threading.Lock()
 
     def append(self, interleaved):
-        if not isinstance(interleaved, array):
-            interleaved = array('d', interleaved)
+        """Store one interleaved block (a float64 numpy array)."""
         with self._lock:
             self._blocks.append(interleaved)
-            self._count += len(interleaved)
+            self._count += interleaved.size
             while (self._blocks and
-                   self._count - len(self._blocks[0]) >= self._max_interleaved):
-                self._count -= len(self._blocks.pop(0))
+                   self._count - self._blocks[0].size >=
+                   self._max_interleaved):
+                self._count -= self._blocks.pop(0).size
 
     def get_recent(self, seconds, sample_rate):
-        """Return the most recent ``seconds`` as one packed array('d')."""
+        """Return the most recent ``seconds`` as one interleaved float64
+        numpy array (trimmed to whole frames)."""
+        import numpy as np
         want = int(seconds * sample_rate) * self._num_channels
         with self._lock:
             blocks = list(self._blocks)
@@ -250,16 +254,17 @@ class RawRingBuffer:
         total = 0
         for block in reversed(blocks):
             picked.append(block)
-            total += len(block)
+            total += block.size
             if total >= want:
                 break
         picked.reverse()
-        data = array('d')
-        for block in picked:
-            data.extend(block)
-        if want and len(data) > want:
+        if not picked:
+            return np.empty(0, dtype=np.float64)
+        data = (picked[0] if len(picked) == 1
+                else np.concatenate(picked))
+        if want and data.size > want:
             data = data[-want:]
-        extra = len(data) % self._num_channels
+        extra = data.size % self._num_channels
         return data[extra:] if extra else data
 
 
@@ -458,6 +463,9 @@ class Controller:
         self.level_rate = level.get('output_rate', 10.0)
         storage = settings.get('storage', {})
         self.buffer_seconds = storage.get('buffer_seconds', 60.0)
+        # DSP worker processes: -1 = auto (cpu_count-1), 0 = inline.
+        self.dsp_workers = settings.get('dsp', {}).get('workers', -1)
+        self._pool = None
 
         # Runtime state, rebuilt on start(): all keyed by device index or
         # global channel as noted.
@@ -555,6 +563,9 @@ class Controller:
                 'level': {'enabled': self.level_enabled,
                           'output_rate': self.level_rate},
                 'storage': {'buffer_seconds': self.buffer_seconds},
+                'dsp': dict({'workers_configured': self.dsp_workers},
+                            **(self._pool.stats() if self._pool
+                               else {'workers': 0, 'mode': 'inline'})),
                 'trigger': {
                     'enabled': bool(self.trigger_cfg.get('enabled')),
                     'source': self.trigger_cfg.get('source', 'gpio'),
@@ -573,11 +584,37 @@ class Controller:
                      'protocol': PROTOCOL_VERSION,
                      'dtype': 'float64', 'byte_order': 'little',
                      'interleave': 'channel-fastest-per-device'})
-        if self._band_banks:
-            snap['band_table'] = [
-                dict(self._band_banks[i].metadata(), device=i)
-                for i in sorted(self._band_banks)]
+        table = self._band_table()
+        if table:
+            snap['band_table'] = table
         return snap
+
+    def _band_table(self):
+        """Per-device band tables, from the DSP pool or the inline banks.
+
+        With workers, a device's channels may be split across several
+        workers; their band layouts are identical (same rate and settings),
+        so the entries are merged back into one table per device.
+        """
+        if self._pool is not None:
+            merged = {}
+            for worker, meta in zip(self._pool.workers,
+                                    (self._pool.band_metadata.get(i)
+                                     for i in range(
+                                         len(self._pool.workers)))):
+                if not meta:
+                    continue
+                dev = worker['spec']['device']
+                entry = merged.setdefault(
+                    dev, dict(meta, device=dev, channels=[]))
+                entry['channels'].extend(meta.get('channels', []))
+            for entry in merged.values():
+                entry['channels'] = sorted(entry['channels'])
+            return [merged[d] for d in sorted(merged)]
+        if self._band_banks:
+            return [dict(self._band_banks[i].metadata(), device=i)
+                    for i in sorted(self._band_banks)]
+        return []
 
     # -- streaming lifecycle ----------------------------------------------
     def start(self):
@@ -682,8 +719,9 @@ class Controller:
                 'devices': {str(i): bool(v) for i, v in status.items()}}
 
     def _build_processing(self):
-        """(Re)build ring buffers, band banks, weighting filters, and level
-        integrators for the devices' current actual rates."""
+        """(Re)build ring buffers and the DSP: either a multi-process pool
+        (default) or the inline single-process path."""
+        self._close_pool()
         self._raw_buffers = {}
         self._band_banks = {}
         self._wsos = {}
@@ -696,6 +734,78 @@ class Controller:
             self._raw_buffers[dev_idx] = RawRingBuffer(
                 self.buffer_seconds, backend.num_channels, backend.actual_rate)
 
+        if self.dsp_workers != 0 and self._build_pool():
+            return          # the pool owns all filter state
+
+        self._build_inline_processing()
+
+    def _band_output_mode(self):
+        """'level', 'waveform', or None when band output is off."""
+        if not self.band_config.get('enabled'):
+            return None
+        return self.band_config.get('output', 'level')
+
+    def _build_pool(self):
+        """Start the DSP worker processes. Returns False to fall back to
+        inline processing (missing dependency, or nothing to compute)."""
+        band_output = self._band_output_mode()
+        if not (self.level_enabled or band_output):
+            return False
+        try:
+            import dsp_pool
+        except ImportError as err:
+            print('[dsp] pool unavailable ({}); running inline'.format(err),
+                  flush=True)
+            return False
+
+        device_channels = [self._chan_map.globals_for_device(i)
+                           for i in range(len(self._backends))]
+        max_workers = (None if self.dsp_workers < 0 else self.dsp_workers)
+        plan = dsp_pool.plan_workers(device_channels, max_workers)
+        if not plan:
+            return False
+
+        cfg = self.band_config
+        common = {
+            'level_enabled': self.level_enabled,
+            'level_rate': self.level_rate,
+            'freq_weighting': self.freq_weighting,
+            'time_weighting': self.time_weighting,
+            'band_output': band_output,
+            'bands': {'f_min': cfg.get('f_min', 20.0),
+                      'f_max': cfg.get('f_max', 20000.0),
+                      'fraction': cfg.get('fraction', 3),
+                      'order': cfg.get('order', 6),
+                      'margin': cfg.get('margin', 1.0)},
+        }
+        for spec in plan:
+            backend = self._backends[spec['device']]
+            spec['rate'] = backend.actual_rate
+            spec['refs'] = {g: self._ref_for(g) for g in spec['channels']}
+
+        # One second of samples per slot is ample for any read block.
+        max_frames = int(max(b.actual_rate for b in self._backends))
+        try:
+            self._pool = dsp_pool.DspPool(plan, common, max_frames)
+        except Exception as err:        # noqa: BLE001 - fall back safely
+            print('[dsp] pool start failed ({}); running inline'.format(err),
+                  flush=True)
+            self._pool = None
+            return False
+        print('[dsp] {} worker processes: {}'.format(
+            len(plan), [s['channels'] for s in plan]), flush=True)
+        return True
+
+    def _close_pool(self):
+        if self._pool is not None:
+            try:
+                self._pool.close()
+            except Exception:           # noqa: BLE001
+                pass
+            self._pool = None
+
+    def _build_inline_processing(self):
+        """Single-process DSP state (used when workers = 0 or unavailable)."""
         if self.band_config.get('enabled'):
             try:
                 from band_filter import BandFilterBank
@@ -778,7 +888,7 @@ class Controller:
                                 {'type': 'event', 'event': 'overrun',
                                  'device': dev_idx, 'kind': 'buffer'})
                         return
-                    if not data:
+                    if data.size == 0:
                         continue
                     got_any = True
                     if dev_idx in self._trigger_pending:
@@ -788,23 +898,23 @@ class Controller:
                             self._registry.broadcast_message(
                                 {'type': 'event', 'event': 'triggered',
                                  'device': dev_idx})
-                    # Pack once; the buffer, DATA frame, and DSP all share it.
-                    block = array('d', data)
-                    self._raw_buffers[dev_idx].append(block)
+                    # The backend hands us a float64 array; the ring buffer,
+                    # the DATA frame, and the DSP all share that one buffer.
+                    self._raw_buffers[dev_idx].append(data)
                     if not self._registry:
                         continue
                     if self.stream_raw:
                         self._registry.broadcast_stream_frame(data_frame(
-                            dev_idx, block.tobytes()))
-                    if self.level_enabled and self._level:
-                        self._emit_levels(dev_idx, backend, block)
-                    bank = self._band_banks.get(dev_idx)
-                    if bank is not None:
-                        if self.band_config.get('output', 'level') == \
-                                'waveform':
-                            self._emit_bands(bank, block)
-                        else:
-                            self._emit_band_levels(dev_idx, bank, block)
+                            dev_idx, data.tobytes()))
+                    if self._pool is not None:
+                        # (frames, channels) view -- no copy.
+                        self._pool.submit(
+                            dev_idx,
+                            data.reshape(-1, backend.num_channels))
+                    else:
+                        self._process_inline(dev_idx, backend, data)
+                if self._pool is not None:
+                    self._emit_pool_frames()
                 if not got_any:
                     sleep(0.002)
         finally:
@@ -815,10 +925,47 @@ class Controller:
                     except Exception:   # noqa: BLE001
                         pass
                 self._running = False
+            # Flush anything the workers finished during shutdown, then
+            # release the processes and their shared-memory slots.
+            if self._pool is not None:
+                try:
+                    self._emit_pool_frames()
+                except Exception:       # noqa: BLE001
+                    pass
+                self._close_pool()
             print('[scan] stopped', flush=True)
             if self._registry:
                 self._registry.broadcast_message(
                     {'type': 'event', 'event': 'stopped'})
+
+    _POOL_FRAME_BUILDERS = {
+        'level': level_frame,
+        'band': band_frame,
+        'band_level': band_level_frame,
+    }
+
+    def _emit_pool_frames(self):
+        """Broadcast whatever the DSP workers have finished."""
+        for kind, args, payload in self._pool.drain():
+            builder = self._POOL_FRAME_BUILDERS.get(kind)
+            if builder is not None:
+                self._registry.broadcast_stream_frame(
+                    builder(*(args + (payload,))))
+        if self._pool.errors:
+            for wid, err in self._pool.errors:
+                print('[dsp] worker {} error: {}'.format(wid, err), flush=True)
+            self._pool.errors = []
+
+    def _process_inline(self, dev_idx, backend, block):
+        """Single-process DSP path (workers = 0 or pool unavailable)."""
+        if self.level_enabled and self._level:
+            self._emit_levels(dev_idx, backend, block)
+        bank = self._band_banks.get(dev_idx)
+        if bank is not None:
+            if self.band_config.get('output', 'level') == 'waveform':
+                self._emit_bands(bank, block)
+            else:
+                self._emit_band_levels(dev_idx, bank, block)
 
     def _emit_bands(self, bank, raw_data):
         """BAND (waveform) frames; bank yields GLOBAL channel labels."""
@@ -1131,6 +1278,20 @@ class Controller:
             self._raw_buffers = {}
         return {'buffer_seconds': self.buffer_seconds}
 
+    def _cmd_set_dsp(self, req):
+        """Set the number of DSP worker processes (-1 auto, 0 inline)."""
+        self._require_stopped()
+        if 'workers' in req:
+            workers = int(req['workers'])
+            if workers < -1:
+                raise CommandError('workers must be -1 (auto), 0, or more')
+            self.dsp_workers = workers
+        import os as _os
+        return {'workers_configured': self.dsp_workers,
+                'cpu_count': _os.cpu_count(),
+                'note': 'applies from the next start; a worker serves one '
+                        'device, so the effective minimum is one per device'}
+
     def _cmd_get_raw(self, req):
         """Dump the most recent buffered raw samples to the stream clients as
         chunked RAW_DUMP frames. The copy and the send run outside the device
@@ -1208,6 +1369,26 @@ class Controller:
         pct = req.get('percentiles', [10, 50, 90])
         want = req.get('channels', self.channels)
 
+        # Fetch each device's window once, not once per channel: the window
+        # can be hundreds of MB and concatenating it per channel would be
+        # both slow and a memory spike.
+        windows = {}
+        for g in want:
+            try:
+                dev_idx, _local = self._chan_map.resolve(int(g))
+            except ValueError:
+                continue
+            if dev_idx in windows:
+                continue
+            backend = self._backends[dev_idx]
+            buffer_ = self._raw_buffers.get(dev_idx)
+            if buffer_ is None:
+                continue
+            flat = buffer_.get_recent(seconds, backend.actual_rate)
+            nch = backend.num_channels
+            windows[dev_idx] = (flat.reshape(-1, nch)
+                                if flat.size >= nch else None)
+
         results = {}
         for g in want:
             g = int(g)
@@ -1216,14 +1397,9 @@ class Controller:
             except ValueError:
                 continue
             backend = self._backends[dev_idx]
-            buffer_ = self._raw_buffers.get(dev_idx)
-            if buffer_ is None:
+            data = windows.get(dev_idx)
+            if data is None:
                 continue
-            flat = buffer_.get_recent(seconds, backend.actual_rate)
-            nch = backend.num_channels
-            if len(flat) < nch:
-                continue
-            data = np.asarray(flat, dtype=np.float64).reshape(-1, nch)
             ci = backend.channels.index(local)
             metrics = slm.window_metrics(
                 data[:, ci], backend.actual_rate, weighting=weighting,
@@ -1253,8 +1429,10 @@ class Controller:
             f_min=cfg.get('f_min', 20.0), f_max=cfg.get('f_max', 20000.0),
             fraction=cfg.get('fraction', 3), order=cfg.get('order', 6),
             margin=cfg.get('margin', 1.0))
+        # Single-channel 2-D view -- no Python-list round trip.
         segments = {}
-        for band_index, _c, samples in bank.process(list(x)):
+        for band_index, _c, samples in bank.process_2d(
+                np.ascontiguousarray(x).reshape(-1, 1)):
             segments.setdefault(band_index, []).append(samples)
         ref2 = self._ref_for(g_chan) ** 2
         out = []
@@ -1312,6 +1490,7 @@ class Controller:
         'set_weighting': _cmd_set_weighting,
         'set_level': _cmd_set_level,
         'set_storage': _cmd_set_storage,
+        'set_dsp': _cmd_set_dsp,
         'get_metrics': _cmd_get_metrics,
         'get_raw': _cmd_get_raw,
         'calibration_write': _cmd_calibration_write,
@@ -1324,7 +1503,7 @@ class Controller:
 # --------------------------------------------------------------------------
 def main():
     config_path = os.environ.get(
-        'NOISE_MONITOR_CONFIG',
+        'PISLM_CONFIG',
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini'))
     settings = load_config(config_path)
 
@@ -1408,6 +1587,7 @@ def main():
                 backend.close()
             except Exception:   # noqa: BLE001
                 pass
+        controller._close_pool()
         if controller._gpio is not None:
             controller._gpio.close()
 
