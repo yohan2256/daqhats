@@ -4,28 +4,28 @@
 MCC 172 Noise Monitor -- Raspberry Pi side (bidirectional control).
 
 Runs on a headless Raspberry Pi with an MCC 172 DAQ HAT. It acquires the
-raw waveform from an IEPE microphone/accelerometer and streams it to one or
-more laptops over TCP, while also accepting control commands so the laptop
-can drive every configurable feature of the MCC 172 (sensitivity,
-sample rate, IEPE power, trigger, calibration, LED, test signals, ...) and
-start/stop streaming on demand. Designed to be launched automatically at
-boot by systemd (see noise-monitor.service).
+raw waveform from an IEPE microphone/accelerometer and serves it over TCP,
+while also accepting control commands so a laptop can drive every
+configurable feature of the MCC 172 (sensitivity, sample rate, IEPE power,
+trigger, calibration, LED, test signals, ...) and start/stop streaming on
+demand. Designed to be launched automatically at boot by systemd (see
+noise-monitor.service).
 
-Wire protocol
--------------
-Downstream (Pi -> laptop) frames:
-    [1-byte type][4-byte little-endian uint32 length][payload]
+Two separate TCP ports (see PROTOCOL.md for the full specification):
+
+  Control port (default 5000) -- newline-delimited UTF-8 JSON, both ways.
+      On connect the server sends a handshake JSON line describing the
+      current configuration. The client then sends command lines, e.g.
+          {"id": 4, "cmd": "set_sensitivity", "channel": 0, "value": 50}
+      and receives response lines and event lines. The optional "id" is
+      echoed back so replies can be matched.
+
+  Streaming port (default 5001) -- typed, length-prefixed binary frames:
+          [1-byte type][4-byte little-endian uint32 length][payload]
       type 0x01 DATA : payload = interleaved little-endian float64 samples,
                        channel-fastest: ch0[n], ch1[n], ch0[n+1], ...
-      type 0x02 MSG  : payload = UTF-8 JSON. The first MSG on connect is the
-                       handshake; the rest are command responses and events.
-
-Upstream (laptop -> Pi) commands:
-    One UTF-8 JSON object per line ('\\n' terminated), e.g.
-        {"id": 4, "cmd": "set_sensitivity", "channel": 0, "value": 50}
-    Every command may include an optional "id" which is echoed back in the
-    response so the laptop can match replies. See COMMANDS below for the
-    full list.
+      type 0x02 MSG  : payload = UTF-8 JSON (handshake on connect, then
+                       events). Upstream bytes on this port are ignored.
 """
 from __future__ import print_function
 
@@ -91,7 +91,8 @@ def load_config(path):
             1: parser.getfloat('calibration', 'sensitivity_ch1'),
         },
         'host': parser.get('network', 'host'),
-        'port': parser.getint('network', 'port'),
+        'control_port': parser.getint('network', 'control_port'),
+        'stream_port': parser.getint('network', 'stream_port'),
         'max_queue_blocks': parser.getint('network', 'max_queue_blocks'),
         'autostart': parser.getboolean('control', 'autostart', fallback=True),
     }
@@ -121,43 +122,56 @@ def msg_frame(obj):
 
 
 # --------------------------------------------------------------------------
-# Client registry (each laptop gets its own send queue + reader/sender)
+# Client registry -- two client kinds on two ports:
+#   'control' : newline-delimited JSON, both directions (commands/responses).
+#   'stream'  : typed length-prefixed frames (handshake + DATA + events);
+#               anything the client sends on this port is ignored.
 # --------------------------------------------------------------------------
 class ClientRegistry:
-    """Manages connected laptops: fan out data/events, deliver replies."""
+    """Manages connected clients: fan out data/events, deliver replies."""
 
     def __init__(self, controller, max_queue_blocks):
         self._controller = controller
         self._max_queue_blocks = max_queue_blocks
-        self._clients = {}          # conn -> queue.Queue of framed bytes
+        self._clients = {}          # conn -> (kind, queue.Queue of bytes)
         self._lock = threading.Lock()
 
-    def add(self, conn, addr):
+    @staticmethod
+    def _encode(kind, obj):
+        """Encode a JSON message the way the given client kind expects."""
+        if kind == 'stream':
+            return msg_frame(obj)
+        return (json.dumps(obj) + '\n').encode('utf-8')
+
+    def add(self, conn, addr, kind):
         send_queue = queue.Queue(maxsize=self._max_queue_blocks)
         with self._lock:
-            self._clients[conn] = send_queue
+            self._clients[conn] = (kind, send_queue)
         threading.Thread(target=self._sender,
                          args=(conn, addr, send_queue), daemon=True).start()
         threading.Thread(target=self._reader,
-                         args=(conn, addr, send_queue), daemon=True).start()
+                         args=(conn, addr, send_queue, kind),
+                         daemon=True).start()
         # Greet the new client with the current configuration.
-        self._enqueue(send_queue, msg_frame(self._controller.handshake()))
-        print('[net] client connected: {}'.format(addr), flush=True)
+        self._enqueue(send_queue,
+                      self._encode(kind, self._controller.handshake()))
+        print('[net] {} client connected: {}'.format(kind, addr), flush=True)
 
-    def broadcast_data(self, frame):
-        """Fan a DATA frame out to every client, dropping oldest on overflow."""
+    def broadcast_data(self, payload_bytes):
+        """Send a DATA frame to stream clients, dropping oldest on overflow."""
+        frame = data_frame(payload_bytes)
         with self._lock:
-            queues = list(self._clients.values())
+            queues = [q for (kind, q) in self._clients.values()
+                      if kind == 'stream']
         for send_queue in queues:
             self._enqueue(send_queue, frame, drop_oldest=True)
 
     def broadcast_message(self, obj):
-        """Send a MSG (e.g. an event) to every connected client."""
-        frame = msg_frame(obj)
+        """Send a MSG/event to every client, encoded per client kind."""
         with self._lock:
-            queues = list(self._clients.values())
-        for send_queue in queues:
-            self._enqueue(send_queue, frame)
+            targets = list(self._clients.values())
+        for kind, send_queue in targets:
+            self._enqueue(send_queue, self._encode(kind, obj))
 
     @staticmethod
     def _enqueue(send_queue, frame, drop_oldest=False):
@@ -193,15 +207,17 @@ class ClientRegistry:
                 pass
             print('[net] client disconnected: {}'.format(addr), flush=True)
 
-    def _reader(self, conn, addr, send_queue):
-        """Read newline-delimited JSON commands and reply on this client's
-        queue."""
+    def _reader(self, conn, addr, send_queue, kind):
+        """For control clients, read newline-delimited JSON commands and reply
+        on their queue. For stream clients, just watch for disconnect."""
         buf = bytearray()
         try:
             while True:
                 chunk = conn.recv(4096)
                 if not chunk:
                     break
+                if kind != 'control':
+                    continue   # ignore any upstream bytes on the stream port
                 buf.extend(chunk)
                 while b'\n' in buf:
                     line, _, rest = buf.partition(b'\n')
@@ -235,7 +251,7 @@ class ClientRegistry:
         except (ValueError, KeyError, TypeError) as err:
             reply = {'type': 'response', 'id': cmd_id, 'ok': False,
                      'error': '{}: {}'.format(type(err).__name__, err)}
-        self._enqueue(send_queue, msg_frame(reply))
+        self._enqueue(send_queue, self._encode('control', reply))
 
 
 # --------------------------------------------------------------------------
@@ -401,7 +417,7 @@ class Controller:
                 if result.data:
                     payload = array('d', result.data).tobytes()
                     if self._registry:
-                        self._registry.broadcast_data(data_frame(payload))
+                        self._registry.broadcast_data(payload)
                 else:
                     sleep(0.002)
         finally:
@@ -654,15 +670,32 @@ def main():
     registry = ClientRegistry(controller, settings['max_queue_blocks'])
     controller.attach_registry(registry)
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((settings['host'], settings['port']))
-    server.listen(5)
-    server.settimeout(1.0)
-    print('[net] listening on {}:{}'.format(
-        settings['host'], settings['port']), flush=True)
-
     stop_event = threading.Event()
+
+    def make_server(port):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((settings['host'], port))
+        srv.listen(5)
+        srv.settimeout(1.0)
+        return srv
+
+    def accept_loop(srv, kind):
+        while not stop_event.is_set():
+            try:
+                conn, addr = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            registry.add(conn, addr, kind)
+
+    control_server = make_server(settings['control_port'])
+    stream_server = make_server(settings['stream_port'])
+    print('[net] control port {}:{}, stream port {}:{}'.format(
+        settings['host'], settings['control_port'],
+        settings['host'], settings['stream_port']), flush=True)
 
     def handle_signal(_signum, _frame):
         stop_event.set()
@@ -682,26 +715,24 @@ def main():
         except HatError as err:
             print('[scan] autostart failed: {}'.format(err), flush=True)
 
+    # Accept stream connections in a background thread; control in the main one.
+    stream_thread = threading.Thread(
+        target=accept_loop, args=(stream_server, 'stream'), daemon=True)
+    stream_thread.start()
     try:
-        while not stop_event.is_set():
-            try:
-                conn, addr = server.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            registry.add(conn, addr)
+        accept_loop(control_server, 'control')
     finally:
+        stop_event.set()
         try:
             if controller.running:
                 controller.stop()
         except HatError:
             pass
-        try:
-            server.close()
-        except OSError:
-            pass
+        for srv in (control_server, stream_server):
+            try:
+                srv.close()
+            except OSError:
+                pass
         # Power the sensors down on exit.
         for chan in (0, 1):
             try:
