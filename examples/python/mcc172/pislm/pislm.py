@@ -60,7 +60,7 @@ import socket
 import struct
 import sys
 import threading
-from time import sleep
+from time import monotonic, sleep
 
 try:
     import queue
@@ -98,6 +98,81 @@ class CommandError(Exception):
 # --------------------------------------------------------------------------
 def _channel_list(text):
     return [int(c) for c in text.split(',') if c.strip() != '']
+
+
+def update_ini(path, values, note=None):
+    """Set ``{(section, key): value}`` in an ini file, preserving layout.
+
+    configparser would drop every comment on write, and config.ini is
+    largely documentation, so this rewrites the affected lines in place:
+    existing keys keep their position (an optional ``note`` replaces their
+    inline comment), and keys that do not exist yet are appended to their
+    section. Sections that do not exist are created at the end.
+
+    Returns the list of "section.key" entries that were written.
+    """
+    with open(path, 'r') as handle:
+        lines = handle.read().splitlines()
+
+    pending = dict(values)
+    written = []
+    section = None
+    out = []
+    # Track where each section ends so new keys land inside it.
+    section_last_line = {}
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('[') and stripped.endswith(']'):
+            section = stripped[1:-1]
+        elif section is not None and stripped and \
+                not stripped.startswith((';', '#')):
+            section_last_line[section] = idx
+
+    section = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('[') and stripped.endswith(']'):
+            section = stripped[1:-1]
+            out.append(line)
+            continue
+        key = None
+        if '=' in line and not stripped.startswith((';', '#')):
+            key = line.split('=', 1)[0].strip()
+        if key is not None and (section, key) in pending:
+            value = pending.pop((section, key))
+            text = '{} = {}'.format(key, value)
+            if note:
+                text += '   ; {}'.format(note)
+            out.append(text)
+            written.append('{}.{}'.format(section, key))
+        else:
+            out.append(line)
+        if section is not None and idx == section_last_line.get(section):
+            # End of this section's body: append its missing keys here.
+            for (sec, k) in [kv for kv in pending if kv[0] == section]:
+                value = pending.pop((sec, k))
+                text = '{} = {}'.format(k, value)
+                if note:
+                    text += '   ; {}'.format(note)
+                out.append(text)
+                written.append('{}.{}'.format(sec, k))
+
+    # Anything left belongs to a section the file does not have yet.
+    for (sec, k), value in list(pending.items()):
+        if not any(ln.strip() == '[{}]'.format(sec) for ln in out):
+            out.extend(['', '[{}]'.format(sec)])
+        text = '{} = {}'.format(k, value)
+        if note:
+            text += '   ; {}'.format(note)
+        out.append(text)
+        written.append('{}.{}'.format(sec, k))
+
+    # Write via a temporary file so a crash cannot truncate the config.
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as handle:
+        handle.write('\n'.join(out) + '\n')
+    os.replace(tmp, path)
+    return written
 
 
 def load_config(path):
@@ -159,6 +234,14 @@ def load_config(path):
         },
         'dsp': {
             'workers': parser.getint('dsp', 'workers', fallback=-1),
+        },
+        'resample': {
+            'enabled': parser.getboolean('resample', 'enabled',
+                                         fallback=False),
+            'output_rate': parser.getfloat('resample', 'output_rate',
+                                           fallback=48000.0),
+            'taps': parser.getint('resample', 'taps', fallback=32),
+            'phases': parser.getint('resample', 'phases', fallback=4096),
         },
         'trigger': {
             'enabled': parser.getboolean('trigger', 'sync_start',
@@ -425,8 +508,9 @@ class ClientRegistry:
 class Controller:
     """Serializes access to the devices and executes client commands."""
 
-    def __init__(self, backends, settings):
+    def __init__(self, backends, settings, config_path=None):
         self._backends = backends
+        self.config_path = config_path
         self._chan_map = ChannelMap(backends)
         self._lock = threading.RLock()          # guards devices + state
         self._control_lock = threading.Lock()   # serializes start/stop
@@ -467,6 +551,14 @@ class Controller:
         self.dsp_workers = settings.get('dsp', {}).get('workers', -1)
         self._pool = None
 
+        # Cross-device clock alignment. Rate tracking is always on (it is
+        # nearly free and its numbers are reported); resampling to a common
+        # grid is opt-in because it costs CPU.
+        self.resample_cfg = dict(settings.get('resample', {'enabled': False}))
+        self._trackers = {}         # dev_idx -> ClockTracker
+        self._resamplers = {}       # dev_idx -> Resampler (when enabled)
+        self._retune_at = {}        # dev_idx -> next retune time
+
         # Runtime state, rebuilt on start(): all keyed by device index or
         # global channel as noted.
         self._raw_buffers = {}      # dev_idx -> RawRingBuffer
@@ -481,6 +573,11 @@ class Controller:
         self._stop_event = threading.Event()
         self._scan_thread = None
         self._dump_id = 0           # sequence for get_raw dumps
+
+        # Rate tracking is always on, so the clock figures are available
+        # from the first handshake; start() rebuilds these for the rates the
+        # devices actually settle on.
+        self._build_clock_sync(verbose=False)
 
         # Apply initial IEPE + sensitivity so a fresh boot is calibrated.
         self._apply_static_config()
@@ -523,6 +620,17 @@ class Controller:
         return {str(g): ('Pa' if self.sensitivity.get(g, 1000.0) != 1000
                          else 'V') for g in self.channels}
 
+    def _rate(self, dev_idx):
+        """Rate of the data downstream of resampling.
+
+        With resampling on, every device's stream has been converted to the
+        common output rate, so ring buffers, DSP, metrics and get_raw all
+        use that instead of the device's own ADC rate.
+        """
+        if self._resamplers:
+            return float(self.resample_cfg.get('output_rate', 48000.0))
+        return self._backends[dev_idx].actual_rate
+
     def _ref_for(self, global_chan):
         return (20e-6 if self.sensitivity.get(global_chan, 1000.0) != 1000
                 else 1.0)
@@ -563,6 +671,17 @@ class Controller:
                 'level': {'enabled': self.level_enabled,
                           'output_rate': self.level_rate},
                 'storage': {'buffer_seconds': self.buffer_seconds},
+                'resample': {
+                    'enabled': bool(self._resamplers) or bool(
+                        self.resample_cfg.get('enabled')),
+                    'active': bool(self._resamplers),
+                    'output_rate': float(self.resample_cfg.get(
+                        'output_rate', 48000.0)),
+                    'taps': int(self.resample_cfg.get('taps', 32)),
+                    'phases': int(self.resample_cfg.get('phases', 4096)),
+                },
+                'clock': {str(i): t.state()
+                          for i, t in sorted(self._trackers.items())},
                 'dsp': dict({'workers_configured': self.dsp_workers},
                             **(self._pool.stats() if self._pool
                                else {'workers': 0, 'mode': 'inline'})),
@@ -730,14 +849,41 @@ class Controller:
         self._band_level = {}
         self._band_offset = {}
 
+        self._build_clock_sync()
         for dev_idx, backend in enumerate(self._backends):
             self._raw_buffers[dev_idx] = RawRingBuffer(
-                self.buffer_seconds, backend.num_channels, backend.actual_rate)
+                self.buffer_seconds, backend.num_channels, self._rate(dev_idx))
 
         if self.dsp_workers != 0 and self._build_pool():
             return          # the pool owns all filter state
 
         self._build_inline_processing()
+
+    def _build_clock_sync(self, verbose=True):
+        """Create the per-device clock trackers and (if enabled) resamplers."""
+        self._trackers = {}
+        self._resamplers = {}
+        self._retune_at = {}
+        try:
+            from clock_sync import ClockTracker, Resampler
+        except ImportError as err:
+            print('[clock] rate tracking disabled ({})'.format(err),
+                  flush=True)
+            return
+        for dev_idx, backend in enumerate(self._backends):
+            self._trackers[dev_idx] = ClockTracker(backend.actual_rate)
+        if not self.resample_cfg.get('enabled'):
+            return
+        out_rate = float(self.resample_cfg.get('output_rate', 48000.0))
+        for dev_idx, backend in enumerate(self._backends):
+            self._resamplers[dev_idx] = Resampler(
+                backend.actual_rate, out_rate, backend.num_channels,
+                n_taps=int(self.resample_cfg.get('taps', 32)),
+                n_phases=int(self.resample_cfg.get('phases', 4096)))
+            self._retune_at[dev_idx] = 0.0
+        if verbose:
+            print('[clock] resampling every device to {:g} Hz'.format(
+                out_rate), flush=True)
 
     def _band_output_mode(self):
         """'level', 'waveform', or None when band output is off."""
@@ -780,11 +926,12 @@ class Controller:
         }
         for spec in plan:
             backend = self._backends[spec['device']]
-            spec['rate'] = backend.actual_rate
+            spec['rate'] = self._rate(spec['device'])
             spec['refs'] = {g: self._ref_for(g) for g in spec['channels']}
 
         # One second of samples per slot is ample for any read block.
-        max_frames = int(max(b.actual_rate for b in self._backends))
+        max_frames = int(max(self._rate(i)
+                             for i in range(len(self._backends))))
         try:
             self._pool = dsp_pool.DspPool(plan, common, max_frames)
         except Exception as err:        # noqa: BLE001 - fall back safely
@@ -812,7 +959,7 @@ class Controller:
                 for dev_idx, backend in enumerate(self._backends):
                     cfg = self.band_config
                     self._band_banks[dev_idx] = BandFilterBank(
-                        backend.actual_rate,
+                        self._rate(dev_idx),
                         self._chan_map.globals_for_device(dev_idx),
                         f_min=cfg.get('f_min', 20.0),
                         f_max=cfg.get('f_max', 20000.0),
@@ -841,13 +988,13 @@ class Controller:
         if need_level:
             for dev_idx, backend in enumerate(self._backends):
                 self._wsos[dev_idx] = slm.design_weighting_sos(
-                    self.freq_weighting, backend.actual_rate)
+                    self.freq_weighting, self._rate(dev_idx))
                 n_sec = (self._wsos[dev_idx].shape[0]
                          if self._wsos[dev_idx] is not None else 0)
                 for g in self._chan_map.globals_for_device(dev_idx):
                     self._wzi[g] = np.zeros((n_sec, 2))
                     self._level[g] = slm.ExpLevel(
-                        backend.actual_rate, tau, self.level_rate,
+                        self._rate(dev_idx), tau, self.level_rate,
                         ref=self._ref_for(g))
         if need_band_level:
             for dev_idx, bank in self._band_banks.items():
@@ -877,6 +1024,7 @@ class Controller:
         try:
             while not self._stop_event.is_set():
                 got_any = False
+                now = monotonic()
                 for dev_idx, backend in enumerate(self._backends):
                     with self._lock:
                         data, overrun = backend.read_new()
@@ -898,6 +1046,23 @@ class Controller:
                             self._registry.broadcast_message(
                                 {'type': 'event', 'event': 'triggered',
                                  'device': dev_idx})
+                    # Track the device's true rate against the Pi clock, and
+                    # convert to the common grid if resampling is on. The
+                    # Pi's own clock error cancels in the ratio between two
+                    # devices, so this is what actually removes the drift.
+                    tracker = self._trackers.get(dev_idx)
+                    if tracker is not None:
+                        tracker.update(data.size // backend.num_channels)
+                    resampler = self._resamplers.get(dev_idx)
+                    if resampler is not None:
+                        if (tracker is not None and tracker.settled() and
+                                now >= self._retune_at.get(dev_idx, 0.0)):
+                            resampler.set_input_rate(tracker.measured_rate)
+                            self._retune_at[dev_idx] = now + 10.0
+                        data = resampler.process(data)
+                        if data.size == 0:
+                            continue
+
                     # The backend hands us a float64 array; the ring buffer,
                     # the DATA frame, and the DSP all share that one buffer.
                     self._raw_buffers[dev_idx].append(data)
@@ -1017,7 +1182,9 @@ class Controller:
         # the ring buffers (own lock) and run-frozen config, and can take
         # seconds on large windows -- run them without the device lock so
         # they never stall acquisition. Everything else runs under it.
-        if cmd in ('start', 'stop', 'get_raw', 'get_metrics'):
+        # calibrate bounces the scan (stop/start), so it must not hold the
+        # device lock either.
+        if cmd in ('start', 'stop', 'get_raw', 'get_metrics', 'calibrate'):
             return handler(self, request)
         with self._lock:
             return handler(self, request)
@@ -1035,6 +1202,9 @@ class Controller:
                 'devices': [{'index': i, 'type': b.name,
                              'running': b.running,
                              'actual_rate': b.actual_rate,
+                             'effective_rate': self._rate(i),
+                             'clock': (self._trackers[i].state()
+                                       if i in self._trackers else None),
                              'triggered': (b.has_triggered()
                                            if armed else None)}
                             for i, b in enumerate(self._backends)]}
@@ -1104,6 +1274,212 @@ class Controller:
         self.sensitivity[g] = value
         return {'channel': g, 'sensitivity': value,
                 'units': self._units().get(str(g))}
+
+    def _cmd_set_resample(self, req):
+        """Configure resampling of every device onto one common rate.
+
+        Fields: enabled (bool); output_rate (Hz); taps; phases. Applies
+        from the next start.
+        """
+        self._require_stopped()
+        cfg = self.resample_cfg
+        if 'enabled' in req:
+            cfg['enabled'] = bool(req['enabled'])
+        if 'output_rate' in req:
+            rate = float(req['output_rate'])
+            if not 1000.0 <= rate <= 200000.0:
+                raise CommandError('output_rate must be 1000..200000 Hz')
+            cfg['output_rate'] = rate
+        if 'taps' in req:
+            taps = int(req['taps'])
+            if not 8 <= taps <= 256 or taps % 2:
+                raise CommandError('taps must be even, 8..256')
+            cfg['taps'] = taps
+        if 'phases' in req:
+            phases = int(req['phases'])
+            if not 64 <= phases <= 65536:
+                raise CommandError('phases must be 64..65536')
+            cfg['phases'] = phases
+        return {'enabled': bool(cfg.get('enabled')),
+                'output_rate': float(cfg.get('output_rate', 48000.0)),
+                'taps': int(cfg.get('taps', 32)),
+                'phases': int(cfg.get('phases', 4096)),
+                'note': 'applies from the next start; device ADC rates are '
+                        'unchanged, the streams are converted to this grid'}
+
+    def _cmd_calibrate(self, req):
+        """Calibrate a channel against an acoustic calibrator.
+
+        Fit the calibrator, leave the scan running, and send this command.
+        It measures the buffered signal, derives the sensitivity that makes
+        that tone read the calibrator's level, and (by default) applies it.
+
+        Fields: channel (global); level_db (calibrator SPL, default 94);
+        seconds (measurement window, default 3); freq (calibrator tone,
+        default 1000); bandpass (reject background noise, default true);
+        apply (default true -- briefly stops the scan to write it).
+        """
+        import math
+        import numpy as np
+
+        g = int(req['channel'])
+        dev_idx, local = self._resolve(g)
+        backend = self._backends[dev_idx]
+        target_db = float(req.get('level_db', 94.0))
+        seconds = float(req.get('seconds', 3.0))
+        freq = float(req.get('freq', 1000.0))
+        use_bandpass = req.get('bandpass', True)
+        do_apply = req.get('apply', True)
+        if seconds <= 0:
+            raise CommandError('seconds must be > 0')
+
+        buffer_ = self._raw_buffers.get(dev_idx)
+        if buffer_ is None:
+            raise CommandError('no data buffered; start a scan first')
+        rate = self._rate(dev_idx)
+        flat = buffer_.get_recent(seconds, rate)
+        nch = backend.num_channels
+        # A calibrator tone needs only a fraction of a second for a stable
+        # RMS, so use whatever is buffered above that floor and report the
+        # duration actually used rather than failing on a short buffer.
+        min_frames = max(1, int(0.1 * rate))
+        if flat.size < nch * min_frames:
+            raise CommandError(
+                'not enough data buffered ({:.2f} s of {:.1f} s requested, '
+                '{:.2f} s minimum); let the scan run a moment first'.format(
+                    flat.size / nch / rate, seconds,
+                    min_frames / rate))
+        ci = backend.channels.index(local)
+        x = flat.reshape(-1, nch)[:, ci]
+
+        # A calibrator is a pure tone; a 1/3-octave band around it rejects
+        # background noise that would otherwise bias the RMS upward.
+        used_bandpass = False
+        if use_bandpass:
+            try:
+                from scipy import signal as _sig
+                edge = 2.0 ** (1.0 / 6.0)          # 1/3-octave half-width
+                lo, hi = freq / edge, freq * edge
+                nyq = rate / 2.0
+                if 0 < lo < hi < nyq:
+                    sos = _sig.butter(4, [lo, hi], btype='band',
+                                      fs=rate, output='sos')
+                    # Filter twice (forward/backward) for zero phase, and
+                    # drop the edges where the filter is still settling.
+                    y = _sig.sosfiltfilt(sos, x)
+                    skip = min(int(0.05 * rate), y.size // 4)
+                    x = y[skip:y.size - skip] if skip else y
+                    used_bandpass = True
+            except ImportError:
+                pass
+
+        measured_rms = float(np.sqrt(np.mean(np.square(x))))
+        if not measured_rms > 0:
+            raise CommandError('measured signal is silent; check the '
+                               'calibrator, the cable, and IEPE power')
+
+        old_sens = self.sensitivity.get(g, 1000.0)
+        # The reading is in Pa when calibrated, volts otherwise; either way
+        # the raw volts are measured_rms * old_sens / 1000, and we want the
+        # new sensitivity to turn those volts into the calibrator pressure.
+        target_pa = 20e-6 * (10.0 ** (target_db / 20.0))
+        new_sens = old_sens * measured_rms / target_pa
+        if not (0 < new_sens < 1e7):
+            raise CommandError(
+                'implausible sensitivity {:.4g} mV/Pa; check level_db and '
+                'that the calibrator is seated'.format(new_sens))
+        # Round once, here: the value reported is exactly the value applied
+        # and later saved, so a client can compare them.
+        new_sens = round(new_sens, 4)
+        change_db = 20.0 * math.log10(new_sens / old_sens)
+        # The level the CURRENT calibration reports for this tone: true SPL
+        # once the channel is calibrated (ref 20 uPa), dBV while it is not.
+        ref = self._ref_for(g)
+        measured_db = 20.0 * math.log10(measured_rms / ref)
+
+        result = {
+            'channel': g, 'device': dev_idx,
+            'target_level_db': target_db,
+            'measured_level_db': round(measured_db, 2),
+            'measured_units': 'dB re 20uPa' if ref != 1.0 else 'dBV',
+            'old_sensitivity': old_sens,
+            'new_sensitivity': new_sens,
+            'change_db': round(change_db, 2),
+            'seconds': round(x.size / rate, 3),
+            'freq': freq, 'bandpass': used_bandpass,
+            'applied': False,
+            'saved': False,
+        }
+        if not do_apply:
+            result['note'] = ('not applied; send set_sensitivity with '
+                              'new_sensitivity, or repeat with apply=true')
+            return result
+
+        # Sensitivity can only be written while stopped; bounce the scan.
+        was_running = self._running
+        if was_running:
+            self.stop()
+        self._backends[dev_idx].set_sensitivity(local, new_sens)
+        self.sensitivity[g] = new_sens
+        result['applied'] = True
+        result['units'] = self._units().get(str(g))
+        if was_running:
+            self.start()
+            result['restarted'] = True
+        result['note'] = ('applied to the running configuration only; send '
+                          'save_config to keep it across restarts')
+        return result
+
+    def _cmd_save_config(self, req):
+        """Write the current calibration (and optionally other runtime
+        settings) back to config.ini so they survive a restart."""
+        from datetime import datetime
+        path = req.get('path') or self.config_path
+        if not path:
+            raise CommandError('no config file path known')
+
+        values = {}
+        # Calibration: per-device sensitivity keys, using LOCAL channels.
+        for g in self.channels:
+            dev_idx, local = self._chan_map.resolve(g)
+            section = self._backends[dev_idx].name
+            values[(section, 'sensitivity_ch{}'.format(local))] = \
+                '{:g}'.format(self.sensitivity.get(g, 1000.0))
+
+        if req.get('include_settings'):
+            values.update({
+                ('acquisition', 'sample_rate'): '{:g}'.format(
+                    self.sample_rate),
+                ('acquisition', 'stream_raw'): str(self.stream_raw).lower(),
+                ('weighting', 'frequency'): self.freq_weighting,
+                ('weighting', 'time'): self.time_weighting,
+                ('level', 'enabled'): str(self.level_enabled).lower(),
+                ('level', 'output_rate'): '{:g}'.format(self.level_rate),
+                ('storage', 'buffer_seconds'): '{:g}'.format(
+                    self.buffer_seconds),
+                ('dsp', 'workers'): str(self.dsp_workers),
+                ('bands', 'enabled'): str(
+                    bool(self.band_config.get('enabled'))).lower(),
+                ('bands', 'output'): self.band_config.get('output', 'level'),
+                ('bands', 'f_min'): '{:g}'.format(
+                    self.band_config.get('f_min', 20.0)),
+                ('bands', 'f_max'): '{:g}'.format(
+                    self.band_config.get('f_max', 20000.0)),
+                ('trigger', 'sync_start'): str(
+                    bool(self.trigger_cfg.get('enabled'))).lower(),
+                ('trigger', 'gpio_pin'): str(
+                    self.trigger_cfg.get('gpio_pin', 17)),
+            })
+
+        stamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+        try:
+            written = update_ini(path, values, note='saved ' + stamp)
+        except OSError as err:
+            raise CommandError('could not write {}: {}'.format(path, err))
+        return {'path': path, 'saved': sorted(written), 'timestamp': stamp,
+                'sensitivity_mv_per_unit': {
+                    str(g): self.sensitivity.get(g, 1000.0)
+                    for g in self.channels}}
 
     def _cmd_set_iepe(self, req):
         self._require_stopped()
@@ -1227,7 +1603,7 @@ class Controller:
             table = []
             for dev_idx, backend in enumerate(self._backends):
                 bank = BandFilterBank(
-                    backend.actual_rate,
+                    self._rate(dev_idx),
                     self._chan_map.globals_for_device(dev_idx),
                     f_min=cfg.get('f_min', 20.0),
                     f_max=cfg.get('f_max', 20000.0),
@@ -1319,7 +1695,8 @@ class Controller:
             buffer_ = self._raw_buffers.get(dev_idx)
             if buffer_ is None:
                 continue
-            data = buffer_.get_recent(seconds, backend.actual_rate)
+            rate = self._rate(dev_idx)
+            data = buffer_.get_recent(seconds, rate)
             nch = backend.num_channels
             if len(data) < nch:
                 continue
@@ -1329,9 +1706,9 @@ class Controller:
                 'device': dev_idx,
                 'channels': self._chan_map.globals_for_device(dev_idx),
                 'num_channels': nch,
-                'sample_rate': backend.actual_rate,
+                'sample_rate': rate,
                 'samples_per_channel': len(data) // nch,
-                'seconds': round(len(data) / nch / backend.actual_rate, 3),
+                'seconds': round(len(data) / nch / rate, 3),
                 'total_chunks': total_chunks,
             })
         if not plan:
@@ -1384,7 +1761,7 @@ class Controller:
             buffer_ = self._raw_buffers.get(dev_idx)
             if buffer_ is None:
                 continue
-            flat = buffer_.get_recent(seconds, backend.actual_rate)
+            flat = buffer_.get_recent(seconds, self._rate(dev_idx))
             nch = backend.num_channels
             windows[dev_idx] = (flat.reshape(-1, nch)
                                 if flat.size >= nch else None)
@@ -1402,7 +1779,7 @@ class Controller:
                 continue
             ci = backend.channels.index(local)
             metrics = slm.window_metrics(
-                data[:, ci], backend.actual_rate, weighting=weighting,
+                data[:, ci], self._rate(dev_idx), weighting=weighting,
                 time_weighting=time_w, ref=self._ref_for(g),
                 percentiles=pct)
             metrics['units'] = self._units().get(str(g))
@@ -1410,7 +1787,7 @@ class Controller:
             metrics['device'] = dev_idx
             if req.get('include_bands') and self.band_config.get('enabled'):
                 metrics['bands'] = self._band_metrics(
-                    data[:, ci], backend.actual_rate, g, weighting)
+                    data[:, ci], self._rate(dev_idx), g, weighting)
             results[str(g)] = metrics
 
         if not results:
@@ -1491,6 +1868,9 @@ class Controller:
         'set_level': _cmd_set_level,
         'set_storage': _cmd_set_storage,
         'set_dsp': _cmd_set_dsp,
+        'set_resample': _cmd_set_resample,
+        'calibrate': _cmd_calibrate,
+        'save_config': _cmd_save_config,
         'get_metrics': _cmd_get_metrics,
         'get_raw': _cmd_get_raw,
         'calibration_write': _cmd_calibration_write,
@@ -1517,7 +1897,7 @@ def main():
         print('[dev] {}: {} ({} ch)'.format(i, backend.name,
                                             backend.num_channels), flush=True)
 
-    controller = Controller(backends, settings)
+    controller = Controller(backends, settings, config_path)
     registry = ClientRegistry(controller, settings['max_queue_blocks'])
     controller.attach_registry(registry)
 

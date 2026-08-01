@@ -7,6 +7,9 @@ channels streamed to a laptop as sound-level-meter data.
 Work through the sections in order. Sections 1–4 are hardware, 5–9 are
 software, 10–13 are configuration and commissioning.
 
+**Already booted and just want the commands?** §16 is the whole
+post-first-boot sequence in one block.
+
 ---
 
 ## 1. Bill of materials
@@ -104,17 +107,44 @@ GND (header pin 9) ------------+-- MCC 172 "GND"   (J5 pin 2)
 - Keep the trigger wire short and away from the microphone cables.
 
 > This aligns the **start** of the scans (≈±1 sample per device plus each
-> ADC's fixed group delay). It does **not** lock the ADC clocks, which still
-> drift a few ppm relative to each other — see §14.
+> ADC's fixed group delay). It does **not** lock the ADC clocks — for that,
+> enable the software clock alignment (`[resample]`, see §12 and the README),
+> which measures each device's true rate and resamples both onto one grid.
 
 ---
 
 ## 5. Operating system
 
+**Raspberry Pi OS (64-bit, Lite), Trixie.**
+
+- **Raspberry Pi OS**, not Ubuntu/DietPi: the daqhats installer calls
+  `raspi-config` directly to enable SPI and installs its dependencies with
+  `apt`. Other distributions break that step.
+- **64-bit**: faster numpy/scipy (this system is DSP-bound), and the RAM
+  ring buffer reaches ~740 MB for 6 channels at 300 s.
+- **Lite**: headless measurement node — no desktop background load. The
+  CLI tools (`daqhats_list_boards` etc.) are all still there.
+- **Trixie** ships **libgpiod v2** and **Python 3.13**. Both are supported:
+  daqhats picks its GPIO backend from `pkg-config --modversion libgpiod`
+  and builds `gpio_v2.c` for v2, and PiSLM's trigger tries libgpiod v2
+  before v1 and RPi.GPIO. Trixie support in daqhats is recent, so if
+  anything fails to build, Bookworm is the conservative fallback.
+
+Steps:
+
 1. Flash **Raspberry Pi OS (64-bit, Lite)** with Raspberry Pi Imager. In the
-   Imager's settings (gear icon) pre-configure: hostname `pislm`, your user,
-   SSH enabled, and locale. Lite (no desktop) is preferred — less background
-   load and lower power.
+   Imager's settings (gear icon) pre-configure hostname, username, SSH and
+   locale.
+
+   - **Hostname**: `pislm` for a single node; number them (`pislm-01`,
+     `pislm-02`, …) if you will ever run more than one — renaming later
+     breaks `.local` addresses and your records. Lower-case letters,
+     digits and hyphens only.
+   - **Username**: Raspberry Pi OS has **no default `pi` account** any
+     more, so you must choose one. Anything works; the rest of this manual
+     derives the paths from `$USER` and `$HOME`, and §13 generates the
+     systemd unit for whichever name you picked. Avoid `pi` itself — it is
+     the first name anything scanning the network will try.
 2. Boot the Pi, log in over SSH, and update:
 
    ```sh
@@ -126,14 +156,40 @@ GND (header pin 9) ------------+-- MCC 172 "GND"   (J5 pin 2)
    SPI HATs **will** break the MCC 172 — remove their overlays from
    `/boot/firmware/config.txt` if any were ever installed.
 
+4. Check what you actually got — the rest of the manual assumes these:
+
+   ```sh
+   cat /etc/os-release | head -2      # expect trixie
+   dpkg --print-architecture          # expect arm64
+   pkg-config --modversion libgpiod   # expect 2.x on Trixie
+   python3 --version                  # expect 3.13.x
+   ```
+
 ---
 
 ## 6. Install the daqhats library (MCC 172)
 
+Clone **the repository that contains PiSLM** — that is this fork, not the
+upstream `mccdaq/daqhats`, which does not carry `examples/python/mcc172/pislm`.
+Replace the URL with your own fork if it differs:
+
 ```sh
 cd ~
-git clone https://github.com/mccdaq/daqhats.git
+git clone https://github.com/yohan2256/daqhats.git
 cd daqhats
+```
+
+If PiSLM has not been merged to the default branch yet, check out its
+branch first:
+
+```sh
+git checkout claude/raspberry-pi-noise-measurement-6vllbo
+ls examples/python/mcc172/pislm     # should list pislm.py, config.ini, ...
+```
+
+Then build and install the C library and tools:
+
+```sh
 sudo ./install.sh
 ```
 
@@ -163,11 +219,22 @@ cd libuldaq-1.2.1
 ./configure && make
 sudo make install
 sudo ldconfig
-
-# Python binding
-sudo apt install -y python3-pip
-pip3 install uldaq --break-system-packages
 ```
+
+> **Trixie note.** This is the one build in the whole install that is not
+> maintained against Trixie, and it uses the distribution's compiler
+> (Trixie's GCC is much newer than what the release was written for). If
+> `make` stops on an error, the usual fix is to relax the new default
+> diagnostics:
+>
+> ```sh
+> make CFLAGS="-w -std=gnu11" CXXFLAGS="-w -std=gnu++14"
+> ```
+>
+> If it still will not build, that is the point to fall back to Bookworm —
+> everything else here works on either release.
+
+The Python binding is installed into the virtual environment in §8.
 
 Allow non-root USB access:
 
@@ -180,7 +247,9 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo usermod -aG plugdev "$USER"
 ```
 
-Log out and back in, then verify the device enumerates:
+The service runs as your login user, so that user needs USB access — that
+is what the `plugdev` group above is for. Log out and back in, then verify
+the device enumerates:
 
 ```sh
 lsusb | grep -i "data translation"
@@ -188,27 +257,51 @@ lsusb | grep -i "data translation"
 
 ---
 
-## 8. Install Python dependencies
+## 8. Python environment
+
+Install the heavy scientific packages from `apt` — Debian's builds are
+optimised for the platform, and letting `pip` compile numpy/scipy on a Pi is
+both slow and slower at runtime:
 
 ```sh
-sudo apt install -y python3-numpy python3-scipy python3-libgpiod
+sudo apt install -y python3-numpy python3-scipy python3-libgpiod python3-venv
 ```
 
-- `numpy` / `scipy` — required for levels, metrics, and band filtering.
-- `python3-libgpiod` — for the GPIO trigger (§4). PiSLM also accepts
-  libgpiod v1 or `RPi.GPIO`, whichever the OS provides.
+- `numpy` / `scipy` — levels, metrics, band filtering, resampling.
+- `python3-libgpiod` — on Trixie this is **libgpiod v2**; PiSLM's trigger
+  detects v2, v1, or `RPi.GPIO` automatically.
 
-Verify:
+Trixie enforces **PEP 668**, so system-wide `pip install` is refused. Create
+a virtual environment that can still see the apt packages, and install the
+device bindings into it:
 
 ```sh
-python3 -c "import numpy, scipy, gpiod; print('deps ok')"
+python3 -m venv --system-site-packages ~/pislm-venv
+~/pislm-venv/bin/pip install daqhats
+~/pislm-venv/bin/pip install uldaq        # only if using the DT9837A
 ```
+
+`--system-site-packages` is what makes the apt numpy/scipy visible inside
+the venv — without it, pip would try to build them from source.
+
+Verify everything imports together:
+
+```sh
+~/pislm-venv/bin/python -c "import numpy, scipy, gpiod, daqhats, uldaq; print('deps ok')"
+```
+
+(Drop `uldaq` from that line if you are not using the DT9837A.)
+
+> Prefer not to use a venv? `sudo pip install daqhats --break-system-packages`
+> works too, but the venv keeps the measurement system independent of OS
+> package updates — worth it on an instrument.
 
 ---
 
 ## 9. Install PiSLM
 
-PiSLM lives in the daqhats checkout from §6:
+PiSLM is already in the checkout from §6 (that is why §6 clones this fork
+rather than upstream):
 
 ```sh
 cd ~/daqhats/examples/python/mcc172/pislm
@@ -221,8 +314,18 @@ Nothing to build — it is plain Python.
 
 ## 10. Network setup
 
-For a direct Pi ↔ laptop link, give the Pi a static address on the wired
-interface:
+This sets a static IP on the Pi's **built-in wired Ethernet port** (`eth0`),
+for a direct Pi ↔ laptop cable — not Wi-Fi. Gigabit Ethernet carries the
+full raw stream (6 ch ≈ 20 Mbit/s) with room to spare, and keeps RF away
+from the microphone lines.
+
+> **If you are on SSH over this same wired port** (e.g. through a switch,
+> rather than sitting at the Pi with a keyboard), changing its IP mid-session
+> can drop your connection before the command finishes, and you may not be
+> able to reconnect at the old address. Either run this from the Pi's local
+> console, or be ready to reconnect at the new address (`192.168.50.1`)
+> immediately after. SSH over Wi-Fi (if enabled) is unaffected either way,
+> since only the wired interface is being reconfigured.
 
 ```sh
 sudo nmcli con mod "Wired connection 1" \
@@ -236,9 +339,6 @@ laptop:
 ```sh
 ping 192.168.50.1
 ```
-
-Gigabit Ethernet carries the full raw stream (6 ch ≈ 20 Mbit/s) with room to
-spare, and keeps RF away from the microphone lines.
 
 ---
 
@@ -291,26 +391,70 @@ Other settings worth reviewing (see the comments in the file): `sample_rate`,
 `[weighting] frequency/time`, `[level] output_rate`, `[storage]
 buffer_seconds`, `[bands]`, `[dsp] workers`, `[trigger] sync_start`.
 
-### Verify with an acoustic calibrator
+### Calibrate with an acoustic calibrator
 
-1. Start PiSLM by hand (§13, step 1).
-2. Fit the calibrator to the microphone and switch it on (94 dB @ 1 kHz).
-3. From the laptop, ask for the level:
+You do **not** have to know the sensitivity in advance, and you do not have
+to do the arithmetic — `calibrate` derives it from the calibrator tone. This
+is also how you calibrate later, in the field, without touching the Pi.
+
+1. Start PiSLM (§13) and let the scan run for a few seconds.
+2. Fit the calibrator to the microphone on channel 0 and switch it on
+   (94 dB @ 1 kHz).
+3. From the laptop, using [`pislm_test.py`](pislm_test.py) (§13):
+
+   ```
+   > calibrate 0 94
+   ```
+
+   or the same thing as a raw command, with any client:
 
    ```sh
-   printf '{"id":1,"cmd":"get_metrics","seconds":5,"channels":[0]}\n' \
+   printf '{"id":1,"cmd":"calibrate","channel":0,"level_db":94}\n' \
        | nc 192.168.50.1 5000
    ```
 
-4. `Leq` should read **94 dB ±0.5** (A-weighting is ≈0 dB at 1 kHz). If it is
-   off by a constant, correct `sensitivity_chN`:
+   The response reports `measured_level_db` (what the old calibration
+   thought the tone was), `new_sensitivity` in mV/Pa, and `change_db`. The
+   new value is applied immediately — the scan is briefly stopped and
+   restarted, which is normal.
+
+4. Move the calibrator to the next microphone, wait a couple of seconds for
+   the buffers to refill, and repeat with that channel number.
+5. **Persist it** — otherwise the values are lost on the next restart:
 
    ```
-   new_sensitivity = old_sensitivity × 10^((measured_dB − 94) / 20)
+   > save
+   ```
+   ```sh
+   printf '{"id":2,"cmd":"save_config"}\n' | nc 192.168.50.1 5000
    ```
 
-Repeat per channel. Record the final values — this is your calibration
-record.
+   This rewrites the `sensitivity_chN` values in `config.ini`, keeping the
+   file's comments and adding a `; saved <date>` marker per line.
+
+**Checking without changing anything** (drift check before a session):
+
+```sh
+printf '{"id":3,"cmd":"calibrate","channel":0,"level_db":94,"apply":false}\n' \
+    | nc 192.168.50.1 5000
+```
+
+`change_db` is how far the channel has drifted. A well-behaved chain should
+be within a few tenths of a dB; note the value in your measurement record.
+
+**Verify** afterwards with the calibrator still fitted:
+
+```sh
+printf '{"id":4,"cmd":"get_metrics","seconds":5,"channels":[0]}\n' \
+    | nc 192.168.50.1 5000
+```
+
+`Leq` should read **94 dB ±0.5** (A-weighting is ≈0 dB at 1 kHz).
+
+> If you already know the sensitivity from the microphone's certificate,
+> just put it in `config.ini` (§12) or send
+> `{"cmd":"set_sensitivity","channel":0,"value":50}` with the scan stopped —
+> `calibrate` is for deriving it from a calibrator instead.
 
 ---
 
@@ -320,24 +464,42 @@ record.
 
 ```sh
 cd ~/daqhats/examples/python/mcc172/pislm
-python3 pislm.py
+~/pislm-venv/bin/python pislm.py
 ```
 
 Expected output: each device detected, the DSP worker count, and the two
-listening ports. From the laptop:
+listening ports. From the laptop, copy `pislm_test.py` over (it needs
+nothing but Python 3 — no install) and run it for an interactive shell plus
+a live level meter:
+
+```sh
+python3 pislm_test.py --host 192.168.50.1
+```
+
+Or, for a one-line check without even that:
 
 ```sh
 printf '{"id":1,"cmd":"status"}\n' | nc 192.168.50.1 5000
 ```
 
-Stop with Ctrl-C.
+Stop the Pi side with Ctrl-C.
 
 **Step 2 — install the service:**
 
+The shipped unit uses `pi` as a placeholder, but Raspberry Pi OS has no
+default `pi` account any more. Generate the unit for whoever you actually
+created, straight from the current login:
+
 ```sh
 cd ~/daqhats/examples/python/mcc172/pislm
-sudo cp pislm.service /etc/systemd/system/
-sudoedit /etc/systemd/system/pislm.service   # fix User= and the paths
+sed -e "s|User=pi|User=$USER|" \
+    -e "s|/home/pi|$HOME|g" \
+    pislm.service | sudo tee /etc/systemd/system/pislm.service >/dev/null
+
+# Check it points at your user, your home, and the venv interpreter:
+grep -E "^(User|WorkingDirectory|ExecStart|Environment)=" \
+    /etc/systemd/system/pislm.service
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now pislm
 ```
@@ -365,10 +527,14 @@ Before each measurement session:
 - [ ] `buffer_seconds` long enough to cover your longest event
 - [ ] Laptop has disk space if recording raw (6 ch ≈ 8.8 GB/hour)
 
-**Remember:** the two devices' ADC clocks are independent (a few ppm apart).
-Per-channel levels and metrics are unaffected, but **cross-device phase or
-correlation analysis is not valid** — keep channel pairs that need phase
-coherence on the same device.
+**Cross-device phase.** The two ADC clocks are independent (±50 ppm each).
+Per-channel levels and metrics are unaffected either way, but for phase or
+correlation *between* devices you need both the GPIO trigger (§4, aligns the
+start) **and** `[resample] enabled = true` (aligns the rates). Check
+`clock` in `status`: each device's `settled` should be true and the run
+should be at least a minute old before you trust cross-device phase — the
+rate estimate reaches ~2 ppm at 60 s and ~0.15 ppm at 300 s. Without
+resampling, keep phase-coherent channel pairs on the same device.
 
 ---
 
@@ -378,17 +544,92 @@ coherence on the same device.
 |---------|-------------|
 | `daqhats_list_boards` finds nothing | HAT not fully seated, or another SPI device configured. Check `/boot/firmware/config.txt` for display/SPI overlays. |
 | `No DT9837A device found` | udev rule not applied, or user not in `plugdev`. Re-log in; check `lsusb`. |
-| `overrun` events, scan stops | The Pi cannot keep up. Lower `sample_rate`, lower `[bands] f_max`, or confirm `[dsp] workers` is `-1` (not `0`). |
+| `overrun` events, scan stops | The Pi cannot keep up. Lower `sample_rate`, lower `[bands] f_max`, turn off `[resample]`, or confirm `[dsp] workers` is `-1` (not `0`). |
+| Cross-device phase drifts over time | Enable `[resample]`; wait for `clock.settled` on both devices (~60 s). |
+| `clock.ppm` reads hundreds of ppm | Not a crystal error — usually a stalled or restarted scan. Restart and re-check; values beyond ±500 ppm are rejected as implausible. |
 | Levels ~0 dB or nonsense | IEPE off, or `sensitivity` left at 1000 (data in volts, not Pa). |
 | Level is off by a fixed amount | Recalibrate with the calibrator (§12). |
 | Hum / mains buzz | Ground loop. Use one PSU, bond DGND to earth for floating sources, keep cables away from mains. |
-| `trigger GPIO unavailable` | Missing `python3-libgpiod`, or the pin collides with the MCC 172 (§4). |
+| `trigger GPIO unavailable` | Missing `python3-libgpiod`, or the pin collides with the MCC 172 (§4). On Trixie this package is libgpiod v2, which PiSLM detects automatically. |
+| `error: externally-managed-environment` from pip | Trixie enforces PEP 668. Install into the venv (§8), or append `--break-system-packages`. |
+| `ModuleNotFoundError: daqhats` / `uldaq` under systemd but not by hand | The unit is running the system python. Point `ExecStart` at `~/pislm-venv/bin/python` (§13). |
+| uldaq `make` fails on Trixie | Newer GCC diagnostics; retry with `make CFLAGS="-w -std=gnu11" CXXFLAGS="-w -std=gnu++14"` (§7). |
 | Service dies at boot, works by hand | Wrong `User=`/paths in the unit, or it started before the HAT was ready — `Restart=always` retries; check `journalctl -u pislm`. |
 | Client cannot connect | Check the Pi's IP and that `config.ini` binds `host = 0.0.0.0`. |
 
 ---
 
-## 16. Next steps
+## 16. Quick reference — everything after the first boot
+
+The full sequence, condensed. Each block links back to the section that
+explains it. Run them in order on a freshly booted Pi.
+
+```sh
+# --- 5. update, then check what you got --------------------------------
+sudo apt update && sudo apt full-upgrade -y && sudo reboot
+# (log back in)
+cat /etc/os-release | head -2; dpkg --print-architecture
+pkg-config --modversion libgpiod; python3 --version
+
+# --- 6. daqhats (clone THIS fork -- upstream has no pislm/) ------------
+cd ~
+git clone https://github.com/yohan2256/daqhats.git
+cd daqhats
+git checkout claude/raspberry-pi-noise-measurement-6vllbo   # until merged
+sudo ./install.sh
+daqhats_list_boards                    # expect MCC 172 at address 0
+
+# --- 7. uldaq, only if using the DT9837A -------------------------------
+sudo apt install -y gcc g++ make libusb-1.0-0-dev
+cd ~ && wget https://github.com/mccdaq/uldaq/releases/download/v1.2.1/libuldaq-1.2.1.tar.bz2
+tar -xvjf libuldaq-1.2.1.tar.bz2 && cd libuldaq-1.2.1
+./configure && make && sudo make install && sudo ldconfig
+sudo tee /etc/udev/rules.d/99-dt9837a.rules >/dev/null <<'EOF'
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0a2d", MODE="0666", GROUP="plugdev"
+EOF
+sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo usermod -aG plugdev "$USER"       # log out and back in after this
+
+# --- 8. Python environment ---------------------------------------------
+sudo apt install -y python3-numpy python3-scipy python3-libgpiod python3-venv
+python3 -m venv --system-site-packages ~/pislm-venv
+~/pislm-venv/bin/pip install daqhats
+~/pislm-venv/bin/pip install uldaq     # DT9837A only
+~/pislm-venv/bin/python -c "import numpy, scipy, gpiod, daqhats; print('deps ok')"
+
+# --- 10. static IP for the direct laptop link --------------------------
+sudo nmcli con mod "Wired connection 1" \
+    ipv4.method manual ipv4.addresses 192.168.50.1/24
+sudo nmcli con up "Wired connection 1"
+
+# --- 11. low-power / low-noise (optional, recommended) -----------------
+sudo tee -a /boot/firmware/config.txt >/dev/null <<'EOF'
+
+# --- PiSLM: headless measurement node ---
+dtoverlay=disable-wifi
+dtoverlay=disable-bt
+EOF
+sudo systemctl disable --now bluetooth && sudo reboot
+
+# --- 12. configure, then 13. run by hand once --------------------------
+cd ~/daqhats/examples/python/mcc172/pislm
+nano config.ini                        # sensitivities, devices, ports
+~/pislm-venv/bin/python pislm.py       # Ctrl-C to stop
+
+# --- 13. install the service (rewrites user/paths for you) -------------
+sed -e "s|User=pi|User=$USER|" -e "s|/home/pi|$HOME|g" pislm.service \
+    | sudo tee /etc/systemd/system/pislm.service >/dev/null
+grep -E "^(User|WorkingDirectory|ExecStart|Environment)=" \
+    /etc/systemd/system/pislm.service
+sudo systemctl daemon-reload && sudo systemctl enable --now pislm
+systemctl status pislm
+```
+
+Then calibrate (§12) from the laptop and you are measuring.
+
+---
+
+## 17. Next steps
 
 - **Write your client** against [`PROTOCOL.md`](PROTOCOL.md) — the complete
   wire specification (both ports, frame types, every command).
