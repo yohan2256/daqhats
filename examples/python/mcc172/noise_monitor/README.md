@@ -169,11 +169,14 @@ What streams continuously, and what is computed on demand:
   weighting (A/C/Z) and time weighting (Fast/Slow/Impulse) and streams the
   broadband level in dB at `[level] output_rate` (default 10/s) — the live
   needle. A few hundred bytes per second.
-- **Raw ring buffer + `get_metrics`.** Raw samples are stored for
-  `[storage] buffer_seconds` (default 60 s). The `get_metrics` command
+- **Raw ring buffer + `get_metrics` + `get_raw`.** Raw samples are kept in
+  RAM only (`[storage] buffer_seconds`, default 300 s, packed 8 B/sample —
+  **nothing is ever written to the SD card**). The `get_metrics` command
   computes **Leq, Lmax, Lmin, Lpeak, LN (L10/L50/L90...)** over a requested
   window — while running or after a stop — optionally with per-band Leq
-  (`include_bands`).
+  (`include_bands`). The `get_raw` command dumps the buffered raw waveform
+  itself to the laptop (chunked `RAW_DUMP` frames, reliable delivery), so
+  after an event you can pull the last N seconds for post-analysis.
 - **1/3-octave spectrum (optional).** `[bands] enabled = true` adds per-band
   output. `output = level` (default) streams Fast time-weighted band levels
   in dB (`BAND_LEVEL` frames) — the octave-analyzer bar display, tiny
@@ -196,8 +199,16 @@ setup are all changeable at runtime (`set_weighting`, `set_level`,
 - **Calibration → SPL.** With `set_sensitivity` in mV/Pa the samples are in
   pascals; `SPL = 20*log10(Prms/20e-6)` dB. The stream is unweighted
   (Z-weighting); apply A-weighting on the client for dB(A).
+- **Storage-free operation.** With a wired-LAN Pi 4 the recommended workflow
+  needs no SSD/SD data storage at all: record live on the laptop
+  (`stream_raw` at ~0.82 MB/s per 2 ch is trivial for gigabit Ethernet), and
+  use `get_raw` to backfill any gap or grab the pre-event window from the
+  RAM buffer. RAM budget for the buffer: 2 ch ≈ 0.82 MB/s (300 s ≈ 246 MB),
+  6 ch ≈ 2.46 MB/s (300 s ≈ 740 MB — fine on a 4 GB Pi 4).
 - **Raspberry Pi Zero 2 W.** Streaming raw 2 ch × 51.2 kHz float64 is
   ~820 kB/s. That is fine over Wi-Fi/USB-ethernet, but if you see buffer
-  overruns lower the sample rate or use one channel.
+  overruns lower the sample rate or use one channel — and shorten
+  `buffer_seconds` to fit its 512 MB RAM.
 - **Backpressure.** A slow stream client never stalls acquisition: the
-  server drops its oldest DATA blocks (`[network] max_queue_blocks`).
+  server drops its oldest live frames (`[network] max_queue_blocks`).
+  `get_raw` dump chunks are the exception — they are delivered reliably.

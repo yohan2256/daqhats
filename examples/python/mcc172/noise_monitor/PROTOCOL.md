@@ -82,6 +82,7 @@ Everything the server sends here is a **typed, length-prefixed frame**:
 | `0x03` | BAND | Fractional-octave band **waveform** (decimated), see §2.2. |
 | `0x04` | LEVEL | Broadband time-weighted **level** (dB), see §2.3. |
 | `0x05` | BAND_LEVEL | Per-band time-weighted **level** (dB), see §2.4. |
+| `0x06` | RAW_DUMP | One chunk of an on-demand `get_raw` buffer dump, see §2.5. |
 
 **Reading loop (pseudocode):**
 
@@ -93,6 +94,7 @@ if type == 0x02: json                     = payload            # msg / event
 if type == 0x03: band_index,channel,float64[]  = payload       # band waveform
 if type == 0x04: channel,float64[]        = payload            # level dB
 if type == 0x05: band_index,channel,float64[]  = payload       # band level dB
+if type == 0x06: dump_id,device,chunk,is_last,float64[] = payload  # raw dump
 ```
 
 All `channel` fields are **global** channel numbers; `device` is the index
@@ -194,6 +196,38 @@ payload = [4-byte band_index uint32][4-byte channel uint32][level float64 sample
 
 - `band_index` maps to the handshake `band_table`; sample rate is
   `level.output_rate`. This is what you display as bars in an octave analyzer.
+
+### 2.5 RAW_DUMP frames (type `0x06`) — on-demand buffer dump
+
+Raw samples are kept only in RAM ring buffers (`[storage] buffer_seconds`
+per device; nothing is written to the SD card). The `get_raw` command (§4)
+dumps the most recent window of those buffers to **all connected stream
+clients** as a sequence of chunked frames:
+
+```
+payload = [4-byte dump_id uint32][4-byte device uint32]
+          [4-byte chunk_index uint32][4-byte is_last uint32]
+          [interleaved float64 samples...]
+```
+
+- `dump_id` matches the `get_raw` response, so concurrent dumps and live
+  frames can be demuxed. Chunks of one device arrive in `chunk_index` order;
+  `is_last = 1` marks that device's final chunk.
+- Sample layout inside a chunk is identical to DATA (§2.1): channel-fastest
+  across that device's channels. Chunk boundaries are **not** aligned to
+  frame boundaries — concatenate all chunks of a device first, then reshape.
+- The `get_raw` **response** (control port) carries the decode metadata per
+  device: `num_channels`, `sample_rate`, `samples_per_channel`,
+  `total_chunks`, plus `chunk_samples` (interleaved samples per full chunk).
+- **Delivery is reliable, not best-effort**: dump chunks are never dropped
+  by the backpressure mechanism (unlike live frames). A client that stalls
+  longer than ~30 s per chunk forfeits the remainder of that chunk's slot.
+- Live LEVEL/DATA frames continue during a dump and interleave with it;
+  demux by frame type.
+
+Typical SLM workflow: an event happens → the laptop sends
+`{"cmd": "get_raw", "seconds": 30}` → receives the last 30 s of raw
+waveform for post-analysis, while the live level stream continues unbroken.
 
 ---
 
@@ -385,6 +419,19 @@ result carries its `device` index. Example result:
               "4": {"Leq": 71.2, "device": 1, "...": "..."}}}
 ```
 
+### On-demand raw dump (anytime — pull the buffered waveform)
+
+| cmd | fields | result |
+|-----|--------|--------|
+| `get_raw` | optional `seconds` (default: full buffer), `devices` (list of device indexes, default: all) | `{"dump_id", "chunk_samples", "units", "devices": [{device, channels, num_channels, sample_rate, samples_per_channel, seconds, total_chunks}]}` |
+
+`get_raw` dumps the most recent `seconds` of the RAM ring buffers to every
+connected **stream** client as RAW_DUMP frames (§2.5) — connect to the
+stream port before sending it (the command errors if no stream client is
+connected). The response returns immediately with the decode metadata; the
+chunks follow asynchronously on the stream port, interleaved with live
+frames. Like `get_metrics`, it works while running and after `stop`.
+
 ### Controls (anytime)
 
 | cmd | fields | result |
@@ -466,10 +513,13 @@ Leq_T  = 10 * log10( mean(x^2 over T) / (20e-6)^2 )
 
 - **Backpressure:** the server keeps a bounded per-client send queue
   (`config.ini`, `[network] max_queue_blocks`). If a client cannot keep up,
-  the **oldest stream frames (DATA and BAND) are dropped** so a slow reader
-  never stalls acquisition or affects other clients. There is no guarantee
-  every frame is delivered; treat the stream as best-effort real-time. (A
-  dropped BAND frame leaves a gap in that band's decimated series.)
+  the **oldest live stream frames (DATA and BAND) are dropped** so a slow
+  reader never stalls acquisition or affects other clients. There is no
+  guarantee every live frame is delivered; treat the live stream as
+  best-effort real-time. (A dropped BAND frame leaves a gap in that band's
+  decimated series.) RAW_DUMP chunks are the exception — they block instead
+  of dropping (§2.5), so a `get_raw` after the fact is the reliable way to
+  recover a gap in a live recording.
 - **Ordering:** within a single connection, bytes are ordered (TCP). On the
   control port a command's `response` always follows the commands sent
   before it; an event may be interleaved (e.g. the `stopped` event can

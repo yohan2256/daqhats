@@ -39,6 +39,16 @@ Two separate TCP ports (see PROTOCOL.md for the full specification):
                        [4-byte GLOBAL channel] + float64 dB samples.
       type 0x05 BAND_LEVEL : per-band time-weighted level in dB.
                        [4-byte band index][4-byte GLOBAL channel] + float64.
+      type 0x06 RAW_DUMP : one chunk of an on-demand "get_raw" dump of the
+                       RAM ring buffer. [4-byte dump id][4-byte device index]
+                       [4-byte chunk index][4-byte is_last] + interleaved
+                       float64 (channel-fastest within the device). Chunks
+                       are delivered reliably (blocking, not dropped).
+
+Storage note: raw samples live only in RAM (packed float64 ring buffers,
+[storage] buffer_seconds each per device). Nothing is written to the SD
+card; the laptop records via stream_raw live streaming and/or pulls the
+buffered window with get_raw after an event.
 """
 from __future__ import print_function
 
@@ -68,11 +78,16 @@ TYPE_MSG = 0x02         # JSON handshake / events (and responses on ctrl port)
 TYPE_BAND = 0x03        # decimated fractional-octave band waveform
 TYPE_LEVEL = 0x04       # broadband time-weighted level (dB)
 TYPE_BAND_LEVEL = 0x05  # per-band time-weighted level (dB)
+TYPE_RAW_DUMP = 0x06    # on-demand chunked dump of the buffered raw samples
 FRAME_HEADER = struct.Struct('<BI')       # type byte + payload length
 DATA_HEADER = struct.Struct('<I')         # device index
 BAND_HEADER = struct.Struct('<II')        # band index + global channel
 LEVEL_HEADER = struct.Struct('<I')        # global channel
 BAND_LEVEL_HEADER = struct.Struct('<II')  # band index + global channel
+RAW_DUMP_HEADER = struct.Struct('<IIII')  # dump id, device, chunk idx, is_last
+
+# Interleaved samples per RAW_DUMP chunk (x8 bytes = 512 KiB per frame).
+RAW_DUMP_CHUNK = 65536
 
 
 class CommandError(Exception):
@@ -181,21 +196,37 @@ def band_level_frame(band_index, channel, sample_bytes):
         BAND_LEVEL_HEADER.pack(band_index, channel) + sample_bytes)
 
 
+def raw_dump_frame(dump_id, device_index, chunk_index, is_last, sample_bytes):
+    """A RAW_DUMP frame: one chunk of a get_raw buffer dump."""
+    return build_frame(
+        TYPE_RAW_DUMP,
+        RAW_DUMP_HEADER.pack(dump_id, device_index, chunk_index, is_last) +
+        sample_bytes)
+
+
 # --------------------------------------------------------------------------
 # Raw sample ring buffer -- per device; keeps the most recent N seconds so
 # the client can request Leq / Lmax / Lmin / LN over a window on demand.
 # --------------------------------------------------------------------------
 class RawRingBuffer:
-    """Rolling store of interleaved raw samples, trimmed to a max duration."""
+    """Rolling store of interleaved raw samples, trimmed to a max duration.
+
+    Blocks are stored as packed ``array('d')`` (8 bytes per sample), so the
+    RAM cost is the theoretical minimum -- e.g. 2 ch x 51.2 kHz for 300 s is
+    ~246 MB -- and blocks are never mutated after append, so readers can
+    snapshot the block list under the lock and copy outside it.
+    """
 
     def __init__(self, max_seconds, num_channels, sample_rate):
         self._num_channels = num_channels
         self._max_interleaved = int(max_seconds * sample_rate) * num_channels
-        self._blocks = []            # list of interleaved sample lists
+        self._blocks = []            # list of packed array('d') blocks
         self._count = 0              # total interleaved samples held
         self._lock = threading.Lock()
 
     def append(self, interleaved):
+        if not isinstance(interleaved, array):
+            interleaved = array('d', interleaved)
         with self._lock:
             self._blocks.append(interleaved)
             self._count += len(interleaved)
@@ -204,20 +235,20 @@ class RawRingBuffer:
                 self._count -= len(self._blocks.pop(0))
 
     def get_recent(self, seconds, sample_rate):
-        """Return the most recent ``seconds`` as a flat interleaved list."""
+        """Return the most recent ``seconds`` as one packed array('d')."""
         want = int(seconds * sample_rate) * self._num_channels
         with self._lock:
             blocks = list(self._blocks)
-        flat = []
+        picked = []
         total = 0
         for block in reversed(blocks):
-            flat.append(block)
+            picked.append(block)
             total += len(block)
             if total >= want:
                 break
-        flat.reverse()
-        data = []
-        for block in flat:
+        picked.reverse()
+        data = array('d')
+        for block in picked:
             data.extend(block)
         if want and len(data) > want:
             data = data[-want:]
@@ -276,6 +307,24 @@ class ClientRegistry:
             targets = list(self._clients.values())
         for kind, send_queue in targets:
             self._enqueue(send_queue, self._encode(kind, obj))
+
+    def stream_client_count(self):
+        with self._lock:
+            return sum(1 for (kind, _q) in self._clients.values()
+                       if kind == 'stream')
+
+    def send_stream_reliable(self, frame, timeout=30.0):
+        """Send a frame to stream clients WITHOUT dropping it when the queue
+        is full: block until there is room (or the per-client timeout runs
+        out). Used for get_raw dumps, where every chunk matters."""
+        with self._lock:
+            queues = [q for (kind, q) in self._clients.values()
+                      if kind == 'stream']
+        for send_queue in queues:
+            try:
+                send_queue.put(frame, timeout=timeout)
+            except queue.Full:
+                pass    # client stalled for the whole timeout; it loses this chunk
 
     @staticmethod
     def _enqueue(send_queue, frame, drop_oldest=False):
@@ -413,6 +462,7 @@ class Controller:
         self._running = False
         self._stop_event = threading.Event()
         self._scan_thread = None
+        self._dump_id = 0           # sequence for get_raw dumps
 
         # Apply initial IEPE + sensitivity so a fresh boot is calibrated.
         self._apply_static_config()
@@ -652,21 +702,23 @@ class Controller:
                     if not data:
                         continue
                     got_any = True
-                    self._raw_buffers[dev_idx].append(data)
+                    # Pack once; the buffer, DATA frame, and DSP all share it.
+                    block = array('d', data)
+                    self._raw_buffers[dev_idx].append(block)
                     if not self._registry:
                         continue
                     if self.stream_raw:
                         self._registry.broadcast_stream_frame(data_frame(
-                            dev_idx, array('d', data).tobytes()))
+                            dev_idx, block.tobytes()))
                     if self.level_enabled and self._level:
-                        self._emit_levels(dev_idx, backend, data)
+                        self._emit_levels(dev_idx, backend, block)
                     bank = self._band_banks.get(dev_idx)
                     if bank is not None:
                         if self.band_config.get('output', 'level') == \
                                 'waveform':
-                            self._emit_bands(bank, data)
+                            self._emit_bands(bank, block)
                         else:
-                            self._emit_band_levels(dev_idx, bank, data)
+                            self._emit_band_levels(dev_idx, bank, block)
                 if not got_any:
                     sleep(0.002)
         finally:
@@ -728,8 +780,11 @@ class Controller:
         if handler is None:
             raise CommandError('unknown command: {}'.format(cmd))
         # start/stop manage their own locking (they join the scan thread,
-        # which itself needs the device lock); everything else runs under it.
-        if cmd in ('start', 'stop'):
+        # which itself needs the device lock). get_raw/get_metrics only read
+        # the ring buffers (own lock) and run-frozen config, and can take
+        # seconds on large windows -- run them without the device lock so
+        # they never stall acquisition. Everything else runs under it.
+        if cmd in ('start', 'stop', 'get_raw', 'get_metrics'):
             return handler(self, request)
         with self._lock:
             return handler(self, request)
@@ -982,6 +1037,66 @@ class Controller:
             self._raw_buffers = {}
         return {'buffer_seconds': self.buffer_seconds}
 
+    def _cmd_get_raw(self, req):
+        """Dump the most recent buffered raw samples to the stream clients as
+        chunked RAW_DUMP frames. The copy and the send run outside the device
+        lock so a large dump can never stall acquisition."""
+        if not self._raw_buffers:
+            raise CommandError('no data buffered yet; start a scan first')
+        if self._registry is None or \
+                self._registry.stream_client_count() == 0:
+            raise CommandError(
+                'no stream client connected to receive the dump')
+        seconds = float(req.get('seconds', self.buffer_seconds))
+        if seconds <= 0:
+            raise CommandError('seconds must be > 0')
+        want_devices = req.get('devices')
+        if want_devices is not None:
+            want_devices = [int(d) for d in want_devices]
+
+        self._dump_id += 1
+        dump_id = self._dump_id
+        plan = []
+        info = []
+        for dev_idx, backend in enumerate(self._backends):
+            if want_devices is not None and dev_idx not in want_devices:
+                continue
+            buffer_ = self._raw_buffers.get(dev_idx)
+            if buffer_ is None:
+                continue
+            data = buffer_.get_recent(seconds, backend.actual_rate)
+            nch = backend.num_channels
+            if len(data) < nch:
+                continue
+            total_chunks = (len(data) + RAW_DUMP_CHUNK - 1) // RAW_DUMP_CHUNK
+            plan.append((dev_idx, data, total_chunks))
+            info.append({
+                'device': dev_idx,
+                'channels': self._chan_map.globals_for_device(dev_idx),
+                'num_channels': nch,
+                'sample_rate': backend.actual_rate,
+                'samples_per_channel': len(data) // nch,
+                'seconds': round(len(data) / nch / backend.actual_rate, 3),
+                'total_chunks': total_chunks,
+            })
+        if not plan:
+            raise CommandError('not enough data buffered')
+
+        registry = self._registry
+
+        def send_dump():
+            for dev_idx, dump_data, total_chunks in plan:
+                for i in range(total_chunks):
+                    chunk = dump_data[i * RAW_DUMP_CHUNK:
+                                      (i + 1) * RAW_DUMP_CHUNK]
+                    registry.send_stream_reliable(raw_dump_frame(
+                        dump_id, dev_idx, i,
+                        1 if i == total_chunks - 1 else 0, chunk.tobytes()))
+
+        threading.Thread(target=send_dump, daemon=True).start()
+        return {'dump_id': dump_id, 'chunk_samples': RAW_DUMP_CHUNK,
+                'units': self._units(), 'devices': info}
+
     def _cmd_get_metrics(self, req):
         """SLM metrics over the buffered raw data, per global channel."""
         if not self._raw_buffers:
@@ -1104,6 +1219,7 @@ class Controller:
         'set_level': _cmd_set_level,
         'set_storage': _cmd_set_storage,
         'get_metrics': _cmd_get_metrics,
+        'get_raw': _cmd_get_raw,
         'calibration_write': _cmd_calibration_write,
         'test_signals_write': _cmd_test_signals_write,
     }
