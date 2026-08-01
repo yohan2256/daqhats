@@ -1,0 +1,33 @@
+[Unit]
+Description=MCC 172 Noise Monitor (IEPE acquisition + TCP raw waveform stream)
+# Wait for the network so the TCP server can bind and be reachable at boot.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --- EDIT THESE THREE PATHS/USER FOR YOUR INSTALL ---------------------
+# Run as the login user that installed daqhats (usually "pi"), not root,
+# so the daqhats SPI/EEPROM access matches the interactive install.
+User=pi
+WorkingDirectory=/home/pi/daqhats/examples/python/mcc172/noise_monitor
+# Use the Python where daqhats is installed. If you installed daqhats into
+# a virtual environment, point this at that venv's python, e.g.
+#   /home/pi/daqhats/venv/bin/python
+ExecStart=/usr/bin/python3 /home/pi/daqhats/examples/python/mcc172/noise_monitor/noise_monitor.py
+# ---------------------------------------------------------------------
+
+# Location of config.ini (optional; defaults to the script's directory).
+Environment=NOISE_MONITOR_CONFIG=/home/pi/daqhats/examples/python/mcc172/noise_monitor/config.ini
+
+# Keep the monitor alive: if the HAT is not ready yet at boot, or the
+# process exits for any reason, systemd retries after 3 seconds.
+Restart=always
+RestartSec=3
+
+# Send stdout/stderr to the journal (view with: journalctl -u noise-monitor).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
