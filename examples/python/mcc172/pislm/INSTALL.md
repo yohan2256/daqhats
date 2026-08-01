@@ -130,8 +130,18 @@ GND (header pin 9) ------------+-- MCC 172 "GND"   (J5 pin 2)
 Steps:
 
 1. Flash **Raspberry Pi OS (64-bit, Lite)** with Raspberry Pi Imager. In the
-   Imager's settings (gear icon) pre-configure: hostname `pislm`, your user,
-   SSH enabled, and locale.
+   Imager's settings (gear icon) pre-configure hostname, username, SSH and
+   locale.
+
+   - **Hostname**: `pislm` for a single node; number them (`pislm-01`,
+     `pislm-02`, …) if you will ever run more than one — renaming later
+     breaks `.local` addresses and your records. Lower-case letters,
+     digits and hyphens only.
+   - **Username**: Raspberry Pi OS has **no default `pi` account** any
+     more, so you must choose one. Anything works; the rest of this manual
+     derives the paths from `$USER` and `$HOME`, and §13 generates the
+     systemd unit for whichever name you picked. Avoid `pi` itself — it is
+     the first name anything scanning the network will try.
 2. Boot the Pi, log in over SSH, and update:
 
    ```sh
@@ -217,7 +227,9 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo usermod -aG plugdev "$USER"
 ```
 
-Log out and back in, then verify the device enumerates:
+The service runs as your login user, so that user needs USB access — that
+is what the `plugdev` group above is for. Log out and back in, then verify
+the device enumerates:
 
 ```sh
 lsusb | grep -i "data translation"
@@ -429,13 +441,20 @@ Stop with Ctrl-C.
 
 **Step 2 — install the service:**
 
+The shipped unit uses `pi` as a placeholder, but Raspberry Pi OS has no
+default `pi` account any more. Generate the unit for whoever you actually
+created, straight from the current login:
+
 ```sh
 cd ~/daqhats/examples/python/mcc172/pislm
-sudo cp pislm.service /etc/systemd/system/
-sudoedit /etc/systemd/system/pislm.service   # fix User= and the paths
-# ExecStart must point at the venv interpreter, e.g.
-#   ExecStart=/home/pi/pislm-venv/bin/python \
-#             /home/pi/daqhats/examples/python/mcc172/pislm/pislm.py
+sed -e "s|User=pi|User=$USER|" \
+    -e "s|/home/pi|$HOME|g" \
+    pislm.service | sudo tee /etc/systemd/system/pislm.service >/dev/null
+
+# Check it points at your user, your home, and the venv interpreter:
+grep -E "^(User|WorkingDirectory|ExecStart|Environment)=" \
+    /etc/systemd/system/pislm.service
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now pislm
 ```

@@ -6,9 +6,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# --- EDIT THESE THREE PATHS/USER FOR YOUR INSTALL ---------------------
-# Run as the login user that installed daqhats (usually "pi"), not root,
-# so the daqhats SPI/EEPROM access matches the interactive install.
+# --- USER AND PATHS: see INSTALL.md section 13 ------------------------
+# Run as the login user that installed daqhats, not root, so the SPI /
+# EEPROM / USB access matches the interactive install. Raspberry Pi OS no
+# longer creates a default "pi" account, so the name and home below are
+# placeholders -- INSTALL.md section 13 rewrites them to your actual user.
 User=pi
 WorkingDirectory=/home/pi/daqhats/examples/python/mcc172/pislm
 # Point this at the interpreter that has daqhats/uldaq installed. On Trixie
