@@ -30,7 +30,33 @@ all commands and stream frames use global numbers.
 
 > **Clock sync caveat:** the two devices run separate, unsynchronized ADC
 > clocks. Per-channel levels/metrics are unaffected, but cross-channel
-> phase analysis is only valid within one device.
+> phase analysis is only valid within one device. The GPIO trigger below
+> aligns the scans' **start**; it does not lock the clocks.
+
+## Synchronized start (GPIO trigger)
+
+With `[trigger] sync_start = true`, `start` arms both devices to begin on a
+shared **rising edge** and the Pi then pulses a GPIO pin wired to both
+trigger inputs — so both scans start on the same pulse (±1 sample per
+device, plus each ADC's fixed group delay):
+
+```
+GPIO 17 (BCM) --+-- MCC 172 "TRIG" screw terminal (J5 pin 1)
+                +-- DT9837A "Ext Trigger" input
+GND -----------++-- MCC 172 "GND" (J5 pin 2) / DT9837A ground
+```
+
+- Rising edge only — the DT9837A's external digital trigger supports no
+  other edge. 3.3 V GPIO levels satisfy both inputs (MCC 172 V_IH 1.48 V,
+  DT9837A TTL).
+- The pin must avoid those used by the MCC 172 HAT (0, 1, 5, 6, 8–13, 16,
+  19, 20, 26); 17, 27, 22 are safe. Works with libgpiod v2/v1 or RPi.GPIO,
+  whichever the OS provides.
+- `source = external` instead arms the scans and waits for an edge you
+  supply (e.g. a measurement-chain sync pulse); a `triggered` event is
+  broadcast per device when its first samples arrive.
+- Runtime control: `set_trigger {"enable": true, "gpio_pin": 27}` etc.;
+  the `start` response reports per-device trigger status.
 
 ## Two ports
 
@@ -51,6 +77,7 @@ command list with request/response schemas, events, and examples).
 | `devices.py`           | Raspberry Pi | Device backends: MCC 172 (daqhats) and DT9837A (uldaq), plus the global channel map. |
 | `slm.py`               | Raspberry Pi | Sound-level-meter DSP: IEC 61672 A/C/Z weighting, Fast/Slow/Impulse time weighting, Leq/Lmax/Lmin/Lpeak/LN. |
 | `band_filter.py`       | Raspberry Pi | Fractional-octave (1/3-octave) decimating Butterworth filter bank. |
+| `gpio_trigger.py`      | Raspberry Pi | GPIO trigger-pulse output for the synchronized start (gpiod v2/v1 or RPi.GPIO). |
 | `config.ini`           | Raspberry Pi | Boot defaults: devices, channels, IEPE, sensitivity, sample rate, weighting, level rate, buffer, bands, ports. |
 | `noise-monitor.service`| Raspberry Pi | systemd unit for automatic start at boot. |
 | `PROTOCOL.md`          | —            | Communication protocol specification for your client. |

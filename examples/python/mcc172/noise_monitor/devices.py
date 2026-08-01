@@ -83,13 +83,31 @@ class Mcc172Backend:
     def set_iepe(self, chan, on):
         self._hat.iepe_config_write(chan, 1 if on else 0)
 
+    # -- triggered start --
+    def arm_trigger(self):
+        """Configure the TRIG input for a rising edge (call while stopped).
+        Rising is the common denominator: the DT9837A's external digital
+        trigger only supports rising edges."""
+        from daqhats import SourceType, TriggerModes
+        self._hat.trigger_config(SourceType.LOCAL, TriggerModes.RISING_EDGE)
+
+    def has_triggered(self):
+        """True once the armed scan has seen its trigger edge."""
+        try:
+            return bool(self._hat.a_in_scan_status().triggered)
+        except self._HatError:
+            return False
+
     # -- streaming --
-    def start(self):
+    def start(self, triggered=False):
         from daqhats import OptionFlags
         mask = 0
         for chan in self.channels:
             mask |= 1 << chan
-        self._hat.a_in_scan_start(mask, 0, OptionFlags.CONTINUOUS)
+        options = OptionFlags.CONTINUOUS
+        if triggered:
+            options |= OptionFlags.EXTTRIGGER
+        self._hat.a_in_scan_start(mask, 0, options)
         self.running = True
 
     def read_new(self):
@@ -215,18 +233,37 @@ class Dt9837aBackend:
         self._ai_config.set_chan_iepe_mode(
             chan, ul.IepeMode.ENABLED if on else ul.IepeMode.DISABLED)
 
+    # -- triggered start --
+    def arm_trigger(self):
+        """Arm the external digital trigger (rising edge -- the only edge the
+        DT9837A supports). Call while stopped, before start()."""
+        ul = self._ul
+        self._ai.set_trigger(ul.TriggerType.POS_EDGE, 0, 0.0, 0.0, 0)
+
+    def has_triggered(self):
+        """True once samples have started flowing (the DT9837A has no
+        explicit 'triggered' status; first data implies the edge arrived)."""
+        try:
+            _status, transfer = self._ai.get_scan_status()
+            return transfer.current_total_count > 0
+        except self._ul.ULException:
+            return False
+
     # -- streaming --
-    def start(self):
+    def start(self, triggered=False):
         ul = self._ul
         samples_per_chan = max(1000, int(self._requested_rate *
                                          self.BUFFER_SECONDS))
         self._buffer = ul.create_float_buffer(self.num_channels,
                                               samples_per_chan)
         self._last_total = 0
+        options = ul.ScanOption.CONTINUOUS
+        if triggered:
+            options |= ul.ScanOption.EXTTRIGGER
         self.actual_rate = self._ai.a_in_scan(
             0, self.num_channels - 1, self._input_mode(), self._range,
             samples_per_chan, self._requested_rate,
-            ul.ScanOption.CONTINUOUS, ul.AInScanFlag.DEFAULT, self._buffer)
+            options, ul.AInScanFlag.DEFAULT, self._buffer)
         self.running = True
 
     def read_new(self):
@@ -251,7 +288,9 @@ class Dt9837aBackend:
         else:
             data = list(self._buffer[start:]) + list(self._buffer[:end])
         self._last_total = total
-        if status != ul.ScanStatus.RUNNING and self.running:
+        # A non-RUNNING status is an error only once data has flowed; an
+        # armed scan waiting for its trigger edge must not be flagged.
+        if status != ul.ScanStatus.RUNNING and self.running and total > 0:
             overrun = True
         return data, overrun
 

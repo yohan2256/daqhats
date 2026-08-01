@@ -158,6 +158,13 @@ def load_config(path):
             'buffer_seconds': parser.getfloat('storage', 'buffer_seconds',
                                               fallback=60.0),
         },
+        'trigger': {
+            'enabled': parser.getboolean('trigger', 'sync_start',
+                                         fallback=False),
+            'source': parser.get('trigger', 'source', fallback='gpio'),
+            'gpio_pin': parser.getint('trigger', 'gpio_pin', fallback=17),
+            'pulse_ms': parser.getfloat('trigger', 'pulse_ms', fallback=10.0),
+        },
     }
 
 
@@ -435,9 +442,12 @@ class Controller:
                 self.sensitivity[g] = dev_cfg.get('sensitivity', {}).get(
                     local, 1000.0)
 
-        self.use_trigger = False
-        self.trigger_source = None
-        self.trigger_mode = None
+        # Synchronized start: arm every device on a shared rising edge.
+        # source 'gpio' = the Pi pulses trigger_gpio_pin itself; 'external'
+        # = the user supplies the edge and the scans wait for it.
+        self.trigger_cfg = dict(settings.get('trigger', {'enabled': False}))
+        self._gpio = None           # GpioTrigger, opened lazily
+        self._trigger_pending = set()   # dev_idx awaiting first data
 
         self.band_config = dict(settings.get('bands', {'enabled': False}))
         weighting = settings.get('weighting', {})
@@ -545,7 +555,16 @@ class Controller:
                 'level': {'enabled': self.level_enabled,
                           'output_rate': self.level_rate},
                 'storage': {'buffer_seconds': self.buffer_seconds},
-                'clock_sync_note': 'devices are not clock-synchronized',
+                'trigger': {
+                    'enabled': bool(self.trigger_cfg.get('enabled')),
+                    'source': self.trigger_cfg.get('source', 'gpio'),
+                    'gpio_pin': self.trigger_cfg.get('gpio_pin', 17),
+                    'pulse_ms': self.trigger_cfg.get('pulse_ms', 10.0),
+                    'mode': 'RISING_EDGE',
+                },
+                'clock_sync_note': ('shared-trigger start aligns scan start; '
+                                    'ADC clocks still drift (~ppm) between '
+                                    'devices'),
             }
 
     def handshake(self):
@@ -574,16 +593,22 @@ class Controller:
                         iepe_local[local] = self.iepe.get(g, 1)
                         sens_local[local] = self.sensitivity.get(g, 1000.0)
                     backend.configure(self.sample_rate, iepe_local, sens_local)
-                if self.use_trigger:
-                    self._mcc().trigger_config(self.trigger_source,
-                                               self.trigger_mode)
+
+                triggered = bool(self.trigger_cfg.get('enabled'))
+                use_gpio = (triggered and
+                            self.trigger_cfg.get('source', 'gpio') == 'gpio')
+                if use_gpio:
+                    # Fail fast (before arming scans) if GPIO is unusable.
+                    self._ensure_gpio()
 
                 self._build_processing()
 
                 started = []
                 try:
                     for backend in self._backends:
-                        backend.start()
+                        if triggered:
+                            backend.arm_trigger()
+                        backend.start(triggered=triggered)
                         started.append(backend)
                 except Exception:
                     for backend in started:
@@ -591,16 +616,70 @@ class Controller:
                     raise
                 self._running = True
                 self._stop_event.clear()
+                self._trigger_pending = (set(range(len(self._backends)))
+                                         if triggered else set())
 
             self._scan_thread = threading.Thread(
                 target=self._acquire, daemon=True)
             self._scan_thread.start()
+
+            # Broadcast 'started' BEFORE any trigger pulse so it always
+            # precedes the first data frames on the stream port.
             snapshot = self.handshake()
             snapshot['type'] = 'event'
             snapshot['event'] = 'started'
+            if triggered:
+                snapshot['trigger'] = {'armed': True, 'fired': False}
             if self._registry:
                 self._registry.broadcast_message(snapshot)
-            return self.config_snapshot()
+
+            trigger_result = None
+            if triggered:
+                if use_gpio:
+                    # Give the armed scans a moment to reach the wait state,
+                    # then fire one rising edge for all devices.
+                    sleep(0.25)
+                    self._gpio.pulse(
+                        self.trigger_cfg.get('pulse_ms', 10.0) / 1000.0)
+                    trigger_result = self._wait_for_trigger(timeout=2.0)
+                else:
+                    trigger_result = {'armed': True, 'fired': False,
+                                      'note': 'waiting for external edge'}
+
+            result = self.config_snapshot()
+            if trigger_result is not None:
+                result['trigger_start'] = trigger_result
+            return result
+
+    def _ensure_gpio(self):
+        """Open (or re-open) the trigger GPIO line for the configured pin."""
+        from gpio_trigger import GpioTrigger
+        pin = int(self.trigger_cfg.get('gpio_pin', 17))
+        if self._gpio is not None and self._gpio.pin != pin:
+            self._gpio.close()
+            self._gpio = None
+        if self._gpio is None:
+            try:
+                self._gpio = GpioTrigger(pin)
+            except (RuntimeError, ValueError) as err:
+                raise CommandError('trigger GPIO unavailable: {}'.format(err))
+        return self._gpio
+
+    def _wait_for_trigger(self, timeout):
+        """Poll the devices until they all report the trigger edge."""
+        deadline = 0.0
+        step = 0.05
+        status = {}
+        while deadline <= timeout:
+            with self._lock:
+                status = {i: b.has_triggered()
+                          for i, b in enumerate(self._backends)}
+            if all(status.values()):
+                break
+            sleep(step)
+            deadline += step
+        return {'armed': True, 'fired': all(status.values()),
+                'devices': {str(i): bool(v) for i, v in status.items()}}
 
     def _build_processing(self):
         """(Re)build ring buffers, band banks, weighting filters, and level
@@ -702,6 +781,13 @@ class Controller:
                     if not data:
                         continue
                     got_any = True
+                    if dev_idx in self._trigger_pending:
+                        # First samples after an armed start: edge arrived.
+                        self._trigger_pending.discard(dev_idx)
+                        if self._registry:
+                            self._registry.broadcast_message(
+                                {'type': 'event', 'event': 'triggered',
+                                 'device': dev_idx})
                     # Pack once; the buffer, DATA frame, and DSP all share it.
                     block = array('d', data)
                     self._raw_buffers[dev_idx].append(block)
@@ -797,10 +883,13 @@ class Controller:
         return self.config_snapshot()
 
     def _cmd_status(self, _req):
+        armed = bool(self.trigger_cfg.get('enabled')) and self._running
         return {'running': self._running,
                 'devices': [{'index': i, 'type': b.name,
                              'running': b.running,
-                             'actual_rate': b.actual_rate}
+                             'actual_rate': b.actual_rate,
+                             'triggered': (b.has_triggered()
+                                           if armed else None)}
                             for i, b in enumerate(self._backends)]}
 
     def _cmd_info(self, _req):
@@ -921,38 +1010,43 @@ class Controller:
                 'channel_map': self._chan_map.table(self._backends)}
 
     def _cmd_set_trigger(self, req):
+        """Configure the synchronized (shared rising-edge) start.
+
+        Fields: enable (bool); source 'gpio' (the Pi pulses gpio_pin on
+        start) or 'external' (the scans arm and wait for a user-supplied
+        edge); gpio_pin; pulse_ms. Applies from the next start.
+        """
+        from gpio_trigger import MCC172_RESERVED_PINS
         self._require_stopped()
-        from daqhats import SourceType, TriggerModes
-        sources = {'LOCAL': SourceType.LOCAL, 'MASTER': SourceType.MASTER,
-                   'SLAVE': SourceType.SLAVE}
-        modes = {'RISING_EDGE': TriggerModes.RISING_EDGE,
-                 'FALLING_EDGE': TriggerModes.FALLING_EDGE,
-                 'ACTIVE_HIGH': TriggerModes.ACTIVE_HIGH,
-                 'ACTIVE_LOW': TriggerModes.ACTIVE_LOW}
-        self._mcc()   # validate an MCC 172 is present
+        cfg = self.trigger_cfg
         enable = req.get('enable', True)
-        self.use_trigger = bool(enable) and enable not in ('false', 'off', 0)
+        cfg['enabled'] = bool(enable) and enable not in ('false', 'off', 0)
         if 'source' in req:
-            key = str(req['source']).upper()
-            if key not in sources:
-                raise CommandError('source must be one of {}'.format(
-                    list(sources)))
-            self.trigger_source = sources[key]
-        elif self.trigger_source is None:
-            self.trigger_source = SourceType.LOCAL
-        if 'mode' in req:
-            key = str(req['mode']).upper()
-            if key not in modes:
-                raise CommandError('mode must be one of {}'.format(
-                    list(modes)))
-            self.trigger_mode = modes[key]
-        elif self.trigger_mode is None:
-            self.trigger_mode = TriggerModes.RISING_EDGE
-        if self.use_trigger:
-            self._mcc().trigger_config(self.trigger_source, self.trigger_mode)
-        return {'enabled': self.use_trigger, 'device': 'mcc172',
-                'source': self.trigger_source.name,
-                'mode': self.trigger_mode.name}
+            source = str(req['source']).lower()
+            if source not in ('gpio', 'external'):
+                raise CommandError("source must be 'gpio' or 'external'")
+            cfg['source'] = source
+        if 'gpio_pin' in req:
+            pin = int(req['gpio_pin'])
+            if pin in MCC172_RESERVED_PINS:
+                raise CommandError(
+                    'GPIO {} is used by the MCC 172 HAT; choose another '
+                    'pin (e.g. 17, 27, 22)'.format(pin))
+            if not 0 <= pin <= 27:
+                raise CommandError('gpio_pin must be a BCM number 0..27')
+            cfg['gpio_pin'] = pin
+        if 'pulse_ms' in req:
+            pulse = float(req['pulse_ms'])
+            if pulse <= 0:
+                raise CommandError('pulse_ms must be > 0')
+            cfg['pulse_ms'] = pulse
+        return {'enabled': cfg['enabled'],
+                'source': cfg.get('source', 'gpio'),
+                'gpio_pin': cfg.get('gpio_pin', 17),
+                'pulse_ms': cfg.get('pulse_ms', 10.0),
+                'mode': 'RISING_EDGE',
+                'note': 'rising edge only (DT9837A external trigger '
+                        'supports rising edges only)'}
 
     def _cmd_set_options(self, req):
         self._require_stopped()
@@ -1314,6 +1408,8 @@ def main():
                 backend.close()
             except Exception:   # noqa: BLE001
                 pass
+        if controller._gpio is not None:
+            controller._gpio.close()
 
 
 if __name__ == '__main__':

@@ -273,7 +273,9 @@ The full configuration plus protocol metadata:
   "weighting": {"frequency": "A", "time": "Fast"},
   "level": {"enabled": true, "output_rate": 10.0},
   "storage": {"buffer_seconds": 60.0},
-  "clock_sync_note": "devices are not clock-synchronized",
+  "trigger": {"enabled": false, "source": "gpio", "gpio_pin": 17,
+              "pulse_ms": 10.0, "mode": "RISING_EDGE"},
+  "clock_sync_note": "shared-trigger start aligns scan start; ADC clocks still drift (~ppm) between devices",
   "dtype": "float64",
   "byte_order": "little",
   "interleave": "channel-fastest-per-device"
@@ -326,13 +328,15 @@ On failure:
 
 ```json
 {"type": "event", "event": "started", ...full handshake body incl. band_table...}
+{"type": "event", "event": "triggered", "device": 0}
 {"type": "event", "event": "overrun", "kind": "hardware"}
 {"type": "event", "event": "stopped"}
 ```
 
 | event | meaning |
 |-------|---------|
-| `started` | A scan has begun. Carries the full config (like the handshake), including `band_table` if band output is on — so clients connected before `start` learn the band layout. |
+| `started` | A scan has begun (or, with the sync trigger enabled, has been armed). Carries the full config (like the handshake), including `band_table` if band output is on, and `trigger` status when a synchronized start was used. |
+| `triggered` (`device`: index) | An armed device received its trigger edge and its first samples arrived. Mainly useful with `source: "external"`. |
 | `overrun` (`device`: index, `kind`: `hardware` \| `buffer`) | Data was lost on that device; the whole scan has stopped. Reconfigure/reduce rate and `start` again. |
 | `stopped` | The scan has ended (after `stop`, or after an overrun). No more DATA until the next `start`. |
 
@@ -379,7 +383,7 @@ All `channel` fields take **global** channel numbers.
 | `set_iepe` | `channel` (global), `mode` (`1`/`0`, or `"on"`/`"off"`) | `{"channel", "mode"}` |
 | `set_sample_rate` | `sample_rate` (Hz/ch, applied to every device) | `{"requested_rate", "devices": [... per-device actual_rate]}` |
 | `set_channels` | `device` (index), `channels` (that device's **local** channels; dt9837a must be contiguous from 0) | `{"device", "channels", "channel_map"}` — global numbering is rebuilt |
-| `set_trigger` | `enable` (bool); optional `mode`, `source` (**mcc172 only**) | `{"enabled", "device": "mcc172", "source", "mode"}` |
+| `set_trigger` | `enable` (bool); optional `source` (`"gpio"`\|`"external"`), `gpio_pin` (BCM), `pulse_ms` | `{"enabled", "source", "gpio_pin", "pulse_ms", "mode": "RISING_EDGE", "note"}` |
 | `set_options` | optional `stream_raw` (bool) | `{"stream_raw"}` |
 | `set_bands` | optional `enabled` (bool), `output` (`level`\|`waveform`), `f_min`, `f_max`, `fraction`, `order`, `margin` | `{"enabled", "output", ..., "band_table": [per-device]}` |
 | `set_weighting` | optional `frequency` (`A`\|`C`\|`Z`), `time` (`Fast`\|`Slow`\|`Impulse`) | `{"frequency", "time"}` |
@@ -395,6 +399,29 @@ per-band levels (`BAND_LEVEL`), `waveform` sends decimated band signals
 (`BAND`). `set_options stream_raw=false` stops raw `DATA` (levels still
 stream). After `set_channels` the global numbering changes — re-read the
 returned `channel_map`.
+
+#### Synchronized start (`set_trigger` + `start`)
+
+When the trigger is **enabled**, every device is armed to begin its scan on
+a shared **rising edge** (rising only — the DT9837A's external digital
+trigger supports no other edge), so all devices start on the same pulse:
+
+- `source: "gpio"` (default): on `start`, the Pi arms both scans, waits
+  ~0.25 s, then itself pulses BCM `gpio_pin` (default 17, high for
+  `pulse_ms`). The pin must be wired to the MCC 172 `TRIG` terminal **and**
+  the DT9837A `Ext Trigger` input, with a common ground. The `start`
+  response then contains
+  `"trigger_start": {"armed": true, "fired": true|false, "devices": {"0": true, ...}}`.
+- `source: "external"`: the scans arm and wait; you supply the edge. The
+  `start` response reports `{"armed": true, "fired": false}`, and a
+  `triggered` event (see §3) is broadcast per device when its first samples
+  arrive.
+
+`gpio_pin` is validated against the pins the MCC 172 HAT itself uses
+(0, 1, 5, 6, 8–13, 16, 19, 20, 26 are rejected; 17/27/22 are safe).
+Alignment note: a shared trigger aligns the **start** of the scans to about
+±1 sample per device plus each ADC's fixed group delay; it does **not** lock
+the ADC clocks, which still drift a few ppm relative to each other.
 
 ### On-demand metrics (anytime — the sound-level-meter statistics)
 
@@ -440,10 +467,9 @@ frames. Like `get_metrics`, it works while running and after `stop`.
 
 ### Enumerations
 
-- **Clock / trigger source** (`clock_source`, `source`): `"LOCAL"`,
-  `"MASTER"`, `"SLAVE"`. Integers `0/1/2` are also accepted.
-- **Trigger mode** (`mode`): `"RISING_EDGE"`, `"FALLING_EDGE"`,
-  `"ACTIVE_HIGH"`, `"ACTIVE_LOW"`. Integers `0..3` are also accepted.
+- **Trigger source** (`set_trigger` `source`): `"gpio"` (Pi pulses the pin)
+  or `"external"` (user-supplied edge). The trigger mode is always
+  `RISING_EDGE` — the DT9837A supports no other edge.
 
 ### `sample_rate` note
 
