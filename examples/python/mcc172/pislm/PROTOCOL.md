@@ -286,6 +286,7 @@ The full configuration plus protocol metadata:
                   "ppm": -50.0, "points": 5000, "elapsed": 250.0,
                   "settled": true}},
   "clock_sync_note": "shared-trigger start aligns scan start; ADC clocks still drift (~ppm) between devices",
+  "network": {"stream_clients": 1, "stream_frames_dropped": 0},
   "dtype": "float64",
   "byte_order": "little",
   "interleave": "channel-fastest-per-device"
@@ -314,6 +315,12 @@ BAND / BAND_LEVEL frames to its parameters at that device's rate:
 
 To interpret a BAND/BAND_LEVEL frame: map its global `channel` to a device
 via `channel_map`, then look `band_index` up in that device's table entry.
+
+`network.stream_frames_dropped` counts stream frames evicted because a
+stream client's send queue was full (a slow network link or a stalled
+client) — the oldest queued frame is dropped so acquisition never stalls
+(see §6). A rising count during a bandwidth test means the link cannot
+keep up with the current streaming mode; see §8 for how to measure this.
 
 ### Command response (control port only)
 
@@ -655,7 +662,10 @@ Leq_T  = 10 * log10( mean(x^2 over T) / (20e-6)^2 )
   best-effort real-time. (A dropped BAND frame leaves a gap in that band's
   decimated series.) RAW_DUMP chunks are the exception — they block instead
   of dropping (§2.5), so a `get_raw` after the fact is the reliable way to
-  recover a gap in a live recording.
+  recover a gap in a live recording. Every eviction increments
+  `network.stream_frames_dropped` in `status`/the handshake, so a client can
+  tell the difference between "quiet because nothing changed" and "quiet
+  because frames are being lost."
 - **Ordering:** within a single connection, bytes are ordered (TCP). On the
   control port a command's `response` always follows the commands sent
   before it; an event may be interleaved (e.g. the `stopped` event can
@@ -704,3 +714,44 @@ connect 5001
   ...
   <- MSG    {"type":"event","event":"stopped"}   (when the scan stops)
 ```
+
+---
+
+## 8. Bandwidth & performance testing
+
+Streaming cost depends entirely on which of the three payload types (§2)
+are switched on — the default SLM configuration (level-only) is tiny; raw
+waveform streaming is not:
+
+| Mode | Payload/sample | 6 ch @ 51.2 kHz | 6 ch @ 48 kHz (resampled) |
+|------|-----------------|-----------------|---------------------------|
+| Level-only (`stream_raw=false`, bands off) | one `float64` per channel per `[level] output_rate` tick | ≈ 1 KB/s (negligible) | same |
+| Raw waveform (`stream_raw=true`) | one `float64` per channel per sample | ≈ 2.34 MiB/s ≈ 19.7 Mbps | ≈ 2.20 MiB/s ≈ 18.4 Mbps |
+| Bands, `output=level` | one `float64` per band per channel per band's own decimated rate | a few KB/s to tens of KB/s, depends on `f_max`/`fraction` | — |
+| Bands, `output=waveform` | decimated `float64` waveform per band per channel | well under raw, but adds up with `f_max`; measure it | — |
+
+These are payload bytes; add ~5-10% for TCP/IP overhead. Numbers assume
+`float64` throughout (`dtype` in the handshake) — there is currently no
+option to stream a narrower type.
+
+**Measuring it for real**: theoretical numbers don't capture Wi-Fi
+retransmits, a busy switch, or a laptop CPU that can't keep up, so measure
+on the actual link. `pislm_test.py` has a `bench <seconds>` shorthand that
+counts received bytes/frames per frame type over a window and reports
+throughput (KB/s and Mbps) alongside `dsp.dropped_blocks` (device-side DSP
+overload) and `network.stream_frames_dropped` (§6, network-side backpressure)
+deltas from `status`:
+
+```
+> bench 15
+[bench] measuring for 15.0s ... control RTT ~2.1 ms
+  total: 2312.4 KB/s  (18.94 Mbps), 1583.2 frames/s
+  DATA        2312.4 KB/s   180.1 fps
+  dsp dropped_blocks: +0   stream frames dropped: +0
+```
+
+A non-zero `stream frames dropped` delta while `dropped_blocks` stays at 0
+means the **network**, not the Pi's DSP, is the bottleneck for the current
+mode — switch to Ethernet, lower `sample_rate`, enable `[resample]` to a
+lower common rate, or turn off `stream_raw` and rely on bands/levels plus
+on-demand `get_raw` instead.
