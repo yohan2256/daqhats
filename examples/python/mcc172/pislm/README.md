@@ -83,6 +83,7 @@ command list with request/response schemas, events, and examples).
 | `clock_sync.py`        | Raspberry Pi | Cross-device clock alignment: true-rate tracking and arbitrary-ratio resampling to a common grid. |
 | `config.ini`           | Raspberry Pi | Boot defaults: devices, channels, IEPE, sensitivity, sample rate, weighting, level rate, buffer, bands, ports. |
 | `pislm.service`| Raspberry Pi | systemd unit for automatic start at boot. |
+| `pislm_test.py`        | Laptop       | Simple stdlib-only test client: interactive shell + live level meter. |
 | `PROTOCOL.md`          | —            | Communication protocol specification for your client. |
 | `INSTALL.md`           | —            | Full field installation manual (parts, wiring, OS, drivers, calibration, service). |
 
@@ -170,17 +171,36 @@ cd ~/daqhats/examples/python/mcc172/pislm
 python3 pislm.py
 ```
 
-Quick smoke test from any machine (no custom client needed):
+On the laptop, `pislm_test.py` is a self-contained test client (stdlib
+only — no install step) that gives you an interactive shell plus a live
+per-channel level readout:
 
 ```sh
-# Control port: read the handshake, then request status.
-printf '{"id":1,"cmd":"status"}\n' | nc 192.168.1.50 5000
+python3 pislm_test.py --host 192.168.50.1
+```
+```
+> start
+[ok] {...}
+[level] ch0:  62.1 dB  ch1:  61.8 dB
+> metrics 5
+[ok] {"requested_seconds": 5.0, "channels": {...}}
+> calibrate 0 94
+[ok] {"applied": true, "new_sensitivity": 51.3, ...}
+> save
+> quit
 ```
 
-Then implement your client against [`PROTOCOL.md`](PROTOCOL.md): connect to
-the control port for commands (e.g. `set_sensitivity`, `set_sample_rate`,
-`start`, `stop`, `get_metrics`) and to the stream port for levels and
-waveforms. All channels are global (0–5 with both devices attached).
+Type `help` at its prompt for the full command list (`status`, `metrics`,
+`calibrate`, `sens`, `iepe`, `rate`, `raw` to dump buffered audio to a file,
+`send <json>` for anything not covered by a shortcut). It is meant for quick
+checks during commissioning, not as your production client — implement that
+against [`PROTOCOL.md`](PROTOCOL.md), which documents both ports in full.
+
+For a one-off check without even that:
+
+```sh
+printf '{"id":1,"cmd":"status"}\n' | nc 192.168.50.1 5000
+```
 
 ## 5. Start automatically at boot (systemd)
 

@@ -400,7 +400,13 @@ is also how you calibrate later, in the field, without touching the Pi.
 1. Start PiSLM (§13) and let the scan run for a few seconds.
 2. Fit the calibrator to the microphone on channel 0 and switch it on
    (94 dB @ 1 kHz).
-3. From the laptop:
+3. From the laptop, using [`pislm_test.py`](pislm_test.py) (§13):
+
+   ```
+   > calibrate 0 94
+   ```
+
+   or the same thing as a raw command, with any client:
 
    ```sh
    printf '{"id":1,"cmd":"calibrate","channel":0,"level_db":94}\n' \
@@ -416,6 +422,9 @@ is also how you calibrate later, in the field, without touching the Pi.
    the buffers to refill, and repeat with that channel number.
 5. **Persist it** — otherwise the values are lost on the next restart:
 
+   ```
+   > save
+   ```
    ```sh
    printf '{"id":2,"cmd":"save_config"}\n' | nc 192.168.50.1 5000
    ```
@@ -459,13 +468,21 @@ cd ~/daqhats/examples/python/mcc172/pislm
 ```
 
 Expected output: each device detected, the DSP worker count, and the two
-listening ports. From the laptop:
+listening ports. From the laptop, copy `pislm_test.py` over (it needs
+nothing but Python 3 — no install) and run it for an interactive shell plus
+a live level meter:
+
+```sh
+python3 pislm_test.py --host 192.168.50.1
+```
+
+Or, for a one-line check without even that:
 
 ```sh
 printf '{"id":1,"cmd":"status"}\n' | nc 192.168.50.1 5000
 ```
 
-Stop with Ctrl-C.
+Stop the Pi side with Ctrl-C.
 
 **Step 2 — install the service:**
 
