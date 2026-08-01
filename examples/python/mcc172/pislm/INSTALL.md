@@ -7,6 +7,9 @@ channels streamed to a laptop as sound-level-meter data.
 Work through the sections in order. Sections 1–4 are hardware, 5–9 are
 software, 10–13 are configuration and commissioning.
 
+**Already booted and just want the commands?** §16 is the whole
+post-first-boot sequence in one block.
+
 ---
 
 ## 1. Bill of materials
@@ -166,10 +169,27 @@ Steps:
 
 ## 6. Install the daqhats library (MCC 172)
 
+Clone **the repository that contains PiSLM** — that is this fork, not the
+upstream `mccdaq/daqhats`, which does not carry `examples/python/mcc172/pislm`.
+Replace the URL with your own fork if it differs:
+
 ```sh
 cd ~
-git clone https://github.com/mccdaq/daqhats.git
+git clone https://github.com/yohan2256/daqhats.git
 cd daqhats
+```
+
+If PiSLM has not been merged to the default branch yet, check out its
+branch first:
+
+```sh
+git checkout claude/raspberry-pi-noise-measurement-6vllbo
+ls examples/python/mcc172/pislm     # should list pislm.py, config.ini, ...
+```
+
+Then build and install the C library and tools:
+
+```sh
 sudo ./install.sh
 ```
 
@@ -280,7 +300,8 @@ Verify everything imports together:
 
 ## 9. Install PiSLM
 
-PiSLM lives in the daqhats checkout from §6:
+PiSLM is already in the checkout from §6 (that is why §6 clones this fork
+rather than upstream):
 
 ```sh
 cd ~/daqhats/examples/python/mcc172/pislm
@@ -514,7 +535,77 @@ resampling, keep phase-coherent channel pairs on the same device.
 
 ---
 
-## 16. Next steps
+## 16. Quick reference — everything after the first boot
+
+The full sequence, condensed. Each block links back to the section that
+explains it. Run them in order on a freshly booted Pi.
+
+```sh
+# --- 5. update, then check what you got --------------------------------
+sudo apt update && sudo apt full-upgrade -y && sudo reboot
+# (log back in)
+cat /etc/os-release | head -2; dpkg --print-architecture
+pkg-config --modversion libgpiod; python3 --version
+
+# --- 6. daqhats (clone THIS fork -- upstream has no pislm/) ------------
+cd ~
+git clone https://github.com/yohan2256/daqhats.git
+cd daqhats
+git checkout claude/raspberry-pi-noise-measurement-6vllbo   # until merged
+sudo ./install.sh
+daqhats_list_boards                    # expect MCC 172 at address 0
+
+# --- 7. uldaq, only if using the DT9837A -------------------------------
+sudo apt install -y gcc g++ make libusb-1.0-0-dev
+cd ~ && wget https://github.com/mccdaq/uldaq/releases/download/v1.2.1/libuldaq-1.2.1.tar.bz2
+tar -xvjf libuldaq-1.2.1.tar.bz2 && cd libuldaq-1.2.1
+./configure && make && sudo make install && sudo ldconfig
+sudo tee /etc/udev/rules.d/99-dt9837a.rules >/dev/null <<'EOF'
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0a2d", MODE="0666", GROUP="plugdev"
+EOF
+sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo usermod -aG plugdev "$USER"       # log out and back in after this
+
+# --- 8. Python environment ---------------------------------------------
+sudo apt install -y python3-numpy python3-scipy python3-libgpiod python3-venv
+python3 -m venv --system-site-packages ~/pislm-venv
+~/pislm-venv/bin/pip install daqhats
+~/pislm-venv/bin/pip install uldaq     # DT9837A only
+~/pislm-venv/bin/python -c "import numpy, scipy, gpiod, daqhats; print('deps ok')"
+
+# --- 10. static IP for the direct laptop link --------------------------
+sudo nmcli con mod "Wired connection 1" \
+    ipv4.method manual ipv4.addresses 192.168.50.1/24
+sudo nmcli con up "Wired connection 1"
+
+# --- 11. low-power / low-noise (optional, recommended) -----------------
+sudo tee -a /boot/firmware/config.txt >/dev/null <<'EOF'
+
+# --- PiSLM: headless measurement node ---
+dtoverlay=disable-wifi
+dtoverlay=disable-bt
+EOF
+sudo systemctl disable --now bluetooth && sudo reboot
+
+# --- 12. configure, then 13. run by hand once --------------------------
+cd ~/daqhats/examples/python/mcc172/pislm
+nano config.ini                        # sensitivities, devices, ports
+~/pislm-venv/bin/python pislm.py       # Ctrl-C to stop
+
+# --- 13. install the service (rewrites user/paths for you) -------------
+sed -e "s|User=pi|User=$USER|" -e "s|/home/pi|$HOME|g" pislm.service \
+    | sudo tee /etc/systemd/system/pislm.service >/dev/null
+grep -E "^(User|WorkingDirectory|ExecStart|Environment)=" \
+    /etc/systemd/system/pislm.service
+sudo systemctl daemon-reload && sudo systemctl enable --now pislm
+systemctl status pislm
+```
+
+Then calibrate (§12) from the laptop and you are measuring.
+
+---
+
+## 17. Next steps
 
 - **Write your client** against [`PROTOCOL.md`](PROTOCOL.md) — the complete
   wire specification (both ports, frame types, every command).
