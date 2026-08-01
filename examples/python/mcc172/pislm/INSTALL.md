@@ -291,26 +291,61 @@ Other settings worth reviewing (see the comments in the file): `sample_rate`,
 `[weighting] frequency/time`, `[level] output_rate`, `[storage]
 buffer_seconds`, `[bands]`, `[dsp] workers`, `[trigger] sync_start`.
 
-### Verify with an acoustic calibrator
+### Calibrate with an acoustic calibrator
 
-1. Start PiSLM by hand (§13, step 1).
-2. Fit the calibrator to the microphone and switch it on (94 dB @ 1 kHz).
-3. From the laptop, ask for the level:
+You do **not** have to know the sensitivity in advance, and you do not have
+to do the arithmetic — `calibrate` derives it from the calibrator tone. This
+is also how you calibrate later, in the field, without touching the Pi.
+
+1. Start PiSLM (§13) and let the scan run for a few seconds.
+2. Fit the calibrator to the microphone on channel 0 and switch it on
+   (94 dB @ 1 kHz).
+3. From the laptop:
 
    ```sh
-   printf '{"id":1,"cmd":"get_metrics","seconds":5,"channels":[0]}\n' \
+   printf '{"id":1,"cmd":"calibrate","channel":0,"level_db":94}\n' \
        | nc 192.168.50.1 5000
    ```
 
-4. `Leq` should read **94 dB ±0.5** (A-weighting is ≈0 dB at 1 kHz). If it is
-   off by a constant, correct `sensitivity_chN`:
+   The response reports `measured_level_db` (what the old calibration
+   thought the tone was), `new_sensitivity` in mV/Pa, and `change_db`. The
+   new value is applied immediately — the scan is briefly stopped and
+   restarted, which is normal.
 
-   ```
-   new_sensitivity = old_sensitivity × 10^((measured_dB − 94) / 20)
+4. Move the calibrator to the next microphone, wait a couple of seconds for
+   the buffers to refill, and repeat with that channel number.
+5. **Persist it** — otherwise the values are lost on the next restart:
+
+   ```sh
+   printf '{"id":2,"cmd":"save_config"}\n' | nc 192.168.50.1 5000
    ```
 
-Repeat per channel. Record the final values — this is your calibration
-record.
+   This rewrites the `sensitivity_chN` values in `config.ini`, keeping the
+   file's comments and adding a `; saved <date>` marker per line.
+
+**Checking without changing anything** (drift check before a session):
+
+```sh
+printf '{"id":3,"cmd":"calibrate","channel":0,"level_db":94,"apply":false}\n' \
+    | nc 192.168.50.1 5000
+```
+
+`change_db` is how far the channel has drifted. A well-behaved chain should
+be within a few tenths of a dB; note the value in your measurement record.
+
+**Verify** afterwards with the calibrator still fitted:
+
+```sh
+printf '{"id":4,"cmd":"get_metrics","seconds":5,"channels":[0]}\n' \
+    | nc 192.168.50.1 5000
+```
+
+`Leq` should read **94 dB ±0.5** (A-weighting is ≈0 dB at 1 kHz).
+
+> If you already know the sensitivity from the microphone's certificate,
+> just put it in `config.ini` (§12) or send
+> `{"cmd":"set_sensitivity","channel":0,"value":50}` with the scan stopped —
+> `calibrate` is for deriving it from a calibrator instead.
 
 ---
 

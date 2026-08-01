@@ -225,6 +225,29 @@ Frequency weighting, time weighting, level rate, buffer length, and band
 setup are all changeable at runtime (`set_weighting`, `set_level`,
 `set_storage`, `set_bands`) — stop the scan, set, start.
 
+## Calibration from the laptop
+
+Calibration is a runtime command — no SSH, no editing files on the Pi, and
+no arithmetic. Fit an acoustic calibrator, leave the scan running, and:
+
+```json
+{"cmd": "calibrate", "channel": 0, "level_db": 94}
+```
+
+The Pi measures the tone (1/3-octave bandpass around it, so background noise
+does not bias the result), derives the sensitivity in mV/Pa that makes it
+read 94 dB, and applies it. Add `"apply": false` to measure only — useful as
+a drift check before a session, since `change_db` tells you how far the
+channel has moved.
+
+Applied values are runtime state; `{"cmd": "save_config"}` writes them into
+`config.ini` so they survive a restart, preserving the file's comments and
+tagging each line with the save date. Field sequence: `calibrate` per
+channel, then one `save_config`.
+
+You can still set a known sensitivity directly with `set_sensitivity` (scan
+stopped), or put it in `config.ini` before boot.
+
 ## Multi-core DSP
 
 The level/band computation is the only heavy work, and it parallelizes by

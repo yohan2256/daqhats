@@ -392,6 +392,7 @@ All `channel` fields take **global** channel numbers.
 | `set_level` | optional `enabled` (bool), `output_rate` (Hz) | `{"enabled", "output_rate"}` |
 | `set_storage` | `buffer_seconds` (raw ring-buffer length) | `{"buffer_seconds"}` |
 | `set_dsp` | `workers` (`-1` auto, `0` inline, `N` cap) | `{"workers_configured", "cpu_count", "note"}` |
+| `save_config` | optional `path`, `include_settings` (bool) | `{"path", "saved": [...], "timestamp", "sensitivity_mv_per_unit"}` |
 | `calibration_write` | `channel`, `slope`, `offset` (**mcc172 channels only**) | `{"channel", "slope", "offset"}` |
 | `test_signals_write` | `mode` (int); optional `clock`, `sync` (**mcc172 only**) | `{"mode", "clock", "sync"}` |
 
@@ -448,6 +449,58 @@ result carries its `device` index. Example result:
                     "window_seconds": 10.0, "n_samples": 512000},
               "4": {"Leq": 71.2, "device": 1, "...": "..."}}}
 ```
+
+### Calibration (anytime — the scan may stay running)
+
+| cmd | fields | result |
+|-----|--------|--------|
+| `calibrate` | `channel` (global); optional `level_db` (default 94), `seconds` (3), `freq` (1000), `bandpass` (true), `apply` (true) | `{"channel", "device", "target_level_db", "measured_level_db", "measured_units", "old_sensitivity", "new_sensitivity", "change_db", "seconds", "freq", "bandpass", "applied", "restarted", "note"}` |
+
+Field calibration without arithmetic: fit an acoustic calibrator to the
+microphone, leave the scan running, and send `calibrate`. The Pi measures the
+buffered signal, derives the sensitivity that makes that tone read
+`level_db`, and applies it.
+
+- **`bandpass`** (default on) filters a 1/3-octave band around `freq` before
+  the RMS, so background noise does not inflate the result. Set it to
+  `false` for a quiet lab or a non-tonal reference.
+- **`apply: false`** measures and reports only — nothing is changed. Use it
+  to check drift, or to review the number before committing.
+- Applying briefly **stops and restarts the scan** (sensitivity is a
+  stopped-only device setting); `restarted: true` says it came back up. The
+  ring buffers start empty again, so let the scan run a moment before
+  calibrating another channel.
+- `measured_level_db` is what the **current** calibration reports for the
+  tone: true SPL once the channel is calibrated, dBV while it is not (see
+  `measured_units`). After a successful calibration it reads `level_db`.
+- The change is **runtime only** — follow with `save_config` to keep it.
+
+```json
+{"id": 7, "cmd": "calibrate", "channel": 0, "level_db": 94}
+```
+```json
+{"type": "response", "id": 7, "ok": true, "cmd": "calibrate",
+ "result": {"channel": 0, "device": 0, "target_level_db": 94.0,
+            "measured_level_db": 117.02, "measured_units": "dB re 20uPa",
+            "old_sensitivity": 50.0, "new_sensitivity": 705.432,
+            "change_db": 23.0, "seconds": 2.9, "freq": 1000.0,
+            "bandpass": true, "applied": true, "restarted": true,
+            "units": "Pa", "saved": false,
+            "note": "applied to the running configuration only; send save_config to keep it across restarts"}}
+```
+
+### Persisting settings
+
+`save_config` writes the current **calibration** (every channel's
+sensitivity) back to `config.ini`, so it survives a service restart or
+reboot. Comments and layout in the file are preserved — only the affected
+values are rewritten, with an inline `; saved <date>` marker.
+
+- `include_settings: true` also persists sample rate, weighting, level rate,
+  buffer length, band setup, DSP workers, and trigger settings.
+- `path` writes somewhere else (e.g. to keep a dated calibration record).
+
+Typical field sequence: `calibrate` each channel, then one `save_config`.
 
 ### On-demand raw dump (anytime — pull the buffered waveform)
 
