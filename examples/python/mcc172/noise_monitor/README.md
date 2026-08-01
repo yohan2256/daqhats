@@ -30,7 +30,7 @@ to **51.2 kHz per channel**.
 | Port | Default | Direction | Content |
 |------|:-------:|-----------|---------|
 | **Control** | 5000 | both ways | Newline-delimited JSON commands, responses, and events. No binary. |
-| **Stream**  | 5001 | Pi → client | Typed length-prefixed frames: a JSON handshake, then the raw waveform (`float64`), plus events. |
+| **Stream**  | 5001 | Pi → client | Typed length-prefixed frames: a JSON handshake, then the raw waveform (`float64`), optional 1/3-octave band output, plus events. |
 
 The client is yours to write — see **[`PROTOCOL.md`](PROTOCOL.md)** for the
 complete, language-agnostic wire specification (framing, handshake, the full
@@ -40,8 +40,9 @@ command list with request/response schemas, events, and examples).
 
 | File | Runs on | Purpose |
 |------|---------|---------|
-| `noise_monitor.py`     | Raspberry Pi | IEPE + calibration + continuous scan; control-port command server and stream-port raw-waveform server. |
-| `config.ini`           | Raspberry Pi | Boot defaults: sample rate, channels, IEPE, sensitivity, ports, autostart. |
+| `noise_monitor.py`     | Raspberry Pi | IEPE + calibration + continuous scan; control-port command server and stream-port waveform/band server. |
+| `band_filter.py`       | Raspberry Pi | Fractional-octave (1/3-octave) decimating Butterworth filter bank (needs numpy/scipy; only used when band output is on). |
+| `config.ini`           | Raspberry Pi | Boot defaults: sample rate, channels, IEPE, sensitivity, ports, autostart, bands. |
 | `noise-monitor.service`| Raspberry Pi | systemd unit for automatic start at boot. |
 | `PROTOCOL.md`          | —            | Communication protocol specification for your client. |
 
@@ -127,6 +128,39 @@ After editing `config.ini`, apply changes with:
 ```sh
 sudo systemctl restart noise-monitor
 ```
+
+## 1/3-octave band output (optional)
+
+The Pi can additionally stream fractional-octave (1/3-octave by default)
+band-filtered audio: each band is a real-time Butterworth band-pass filter,
+**decimated per band** to just above twice its upper edge, sent as `BAND`
+frames on the stream port. The laptop then does time-weighting
+(Fast/Slow/Impulse), Leq, band SPL, A/C-weighting, etc. (see PROTOCOL.md §5.1).
+
+Enable it in `config.ini` (`[bands] enabled = true`) or at runtime with the
+`set_bands` command. It needs numpy + scipy on the Pi:
+
+```sh
+sudo apt install python3-numpy python3-scipy
+```
+
+**Bandwidth — read this before enabling the full range.** High 1/3-octave
+bands are wide in absolute Hz, so they barely decimate. For two channels at
+51.2 kHz:
+
+| Band range | Approx. band-output rate (2 ch) |
+|------------|--------------------------------:|
+| 20 Hz – 20 kHz (31 bands) | ~36 Mbit/s (≈5× the raw stream) |
+| 20 Hz – 5 kHz (25 bands)  | ~7 Mbit/s |
+| 20 Hz – 1 kHz (18 bands)  | ~1 Mbit/s |
+
+The top few bands dominate, so **lowering `f_max` is the most effective way to
+fit a Wi-Fi link.** Using one channel, or `stream_raw = false` (send only
+band frames, no raw), also helps. CPU cost is modest — the full 31-band ×
+2-channel bank is roughly one-third to one-half of one Pi Zero 2 W core.
+
+For a broadband (overall) Leq or time-weighting, don't use bands at all — the
+raw DATA stream is far lighter and the laptop can compute it directly.
 
 ## Notes & tips
 

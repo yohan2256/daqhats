@@ -26,6 +26,11 @@ Two separate TCP ports (see PROTOCOL.md for the full specification):
                        channel-fastest: ch0[n], ch1[n], ch0[n+1], ...
       type 0x02 MSG  : payload = UTF-8 JSON (handshake on connect, then
                        events). Upstream bytes on this port are ignored.
+      type 0x03 BAND : optional fractional-octave (e.g. 1/3-octave) output.
+                       payload = [4-byte band index][4-byte channel] then
+                       decimated little-endian float64 samples for that band.
+                       The handshake's "band_table" maps index -> center
+                       frequency and decimated rate.
 """
 from __future__ import print_function
 
@@ -53,7 +58,9 @@ READ_ALL_AVAILABLE = -1
 # Downstream frame types.
 TYPE_DATA = 0x01
 TYPE_MSG = 0x02
+TYPE_BAND = 0x03
 FRAME_HEADER = struct.Struct('<BI')   # type byte + payload length
+BAND_HEADER = struct.Struct('<II')    # band index + channel, precede samples
 
 # Name <-> value maps so the laptop can use readable strings in commands.
 SOURCE_TYPES = {'LOCAL': SourceType.LOCAL, 'MASTER': SourceType.MASTER,
@@ -86,6 +93,8 @@ def load_config(path):
         'channels': channels,
         'sample_rate': parser.getfloat('acquisition', 'sample_rate'),
         'iepe_enable': parser.getboolean('acquisition', 'iepe_enable'),
+        'stream_raw': parser.getboolean('acquisition', 'stream_raw',
+                                        fallback=True),
         'sensitivity': {
             0: parser.getfloat('calibration', 'sensitivity_ch0'),
             1: parser.getfloat('calibration', 'sensitivity_ch1'),
@@ -95,6 +104,15 @@ def load_config(path):
         'stream_port': parser.getint('network', 'stream_port'),
         'max_queue_blocks': parser.getint('network', 'max_queue_blocks'),
         'autostart': parser.getboolean('control', 'autostart', fallback=True),
+        'bands': {
+            'enabled': parser.getboolean('bands', 'enabled', fallback=False),
+            'f_min': parser.getfloat('bands', 'f_min', fallback=20.0),
+            'f_max': parser.getfloat('bands', 'f_max', fallback=20000.0),
+            'fraction': parser.getint('bands', 'fraction', fallback=3),
+            'order': parser.getint('bands', 'order', fallback=6),
+            'margin': parser.getfloat('bands', 'decimation_margin',
+                                      fallback=1.0),
+        },
     }
 
 
@@ -119,6 +137,12 @@ def data_frame(payload_bytes):
 
 def msg_frame(obj):
     return build_frame(TYPE_MSG, json.dumps(obj).encode('utf-8'))
+
+
+def band_frame(band_index, channel, sample_bytes):
+    """A BAND frame: [band_index][channel] header, then decimated float64."""
+    return build_frame(TYPE_BAND,
+                       BAND_HEADER.pack(band_index, channel) + sample_bytes)
 
 
 # --------------------------------------------------------------------------
@@ -157,14 +181,18 @@ class ClientRegistry:
                       self._encode(kind, self._controller.handshake()))
         print('[net] {} client connected: {}'.format(kind, addr), flush=True)
 
-    def broadcast_data(self, payload_bytes):
-        """Send a DATA frame to stream clients, dropping oldest on overflow."""
-        frame = data_frame(payload_bytes)
+    def broadcast_stream_frame(self, frame):
+        """Send a prebuilt frame to stream clients, dropping oldest on
+        overflow (so a slow client never stalls acquisition)."""
         with self._lock:
             queues = [q for (kind, q) in self._clients.values()
                       if kind == 'stream']
         for send_queue in queues:
             self._enqueue(send_queue, frame, drop_oldest=True)
+
+    def broadcast_data(self, payload_bytes):
+        """Send a DATA frame to stream clients."""
+        self.broadcast_stream_frame(data_frame(payload_bytes))
 
     def broadcast_message(self, obj):
         """Send a MSG/event to every client, encoded per client kind."""
@@ -280,6 +308,11 @@ class Controller:
         self.use_trigger = False
         self.continuous = True
         self.ext_clock = False
+        self.stream_raw = settings.get('stream_raw', True)
+
+        # Fractional-octave band-filter output (optional; needs numpy/scipy).
+        self.band_config = dict(settings.get('bands', {'enabled': False}))
+        self._band_bank = None      # active BandFilterBank while running
 
         self._running = False
         self._stop_event = threading.Event()
@@ -330,6 +363,12 @@ class Controller:
                             'mode': self.trigger_mode.name},
                 'options': {'continuous': self.continuous,
                             'ext_clock': self.ext_clock},
+                'stream_raw': self.stream_raw,
+                'bands': {'enabled': bool(self.band_config.get('enabled')),
+                          'fraction': self.band_config.get('fraction', 3),
+                          'order': self.band_config.get('order', 6),
+                          'f_min': self.band_config.get('f_min', 20.0),
+                          'f_max': self.band_config.get('f_max', 20000.0)},
             }
 
     def handshake(self):
@@ -339,6 +378,10 @@ class Controller:
                      'dtype': 'float64', 'byte_order': 'little',
                      'interleave': 'channel-fastest',
                      'num_channels': len(self.channels)})
+        # When a scan with band output is active, include the full band table
+        # (center frequencies + decimated rates) so the client can demux it.
+        if self._band_bank is not None:
+            snap['band_table'] = self._band_bank.metadata()
         return snap
 
     # -- streaming lifecycle ----------------------------------------------
@@ -367,6 +410,8 @@ class Controller:
                 if self.use_trigger:
                     options |= OptionFlags.EXTTRIGGER
 
+                self._band_bank = self._build_band_bank()
+
                 self._hat.a_in_scan_start(
                     channels_to_mask(self.channels), 0, options)
                 self._running = True
@@ -375,7 +420,33 @@ class Controller:
             self._scan_thread = threading.Thread(
                 target=self._acquire, daemon=True)
             self._scan_thread.start()
+            snapshot = self.handshake()
+            snapshot['type'] = 'event'
+            snapshot['event'] = 'started'
+            if self._registry:
+                self._registry.broadcast_message(snapshot)
             return self.config_snapshot()
+
+    def _build_band_bank(self):
+        """Create the band-filter bank for the current rate/channels, or None
+        if band output is disabled. Import errors disable the feature."""
+        cfg = self.band_config
+        if not cfg.get('enabled'):
+            return None
+        try:
+            from band_filter import BandFilterBank
+        except ImportError as err:
+            print('[bands] disabled (missing dependency: {})'.format(err),
+                  flush=True)
+            return None
+        bank = BandFilterBank(
+            self.actual_rate, self.channels,
+            f_min=cfg.get('f_min', 20.0), f_max=cfg.get('f_max', 20000.0),
+            fraction=cfg.get('fraction', 3), order=cfg.get('order', 6),
+            margin=cfg.get('margin', 1.0))
+        print('[bands] {} bands, {} .. {} Hz'.format(
+            len(bank.bands), cfg.get('f_min'), cfg.get('f_max')), flush=True)
+        return bank
 
     def stop(self):
         with self._control_lock:
@@ -387,6 +458,14 @@ class Controller:
         if thread is not None:
             thread.join(timeout=5.0)
         return {'running': self.running}
+
+    def _emit_bands(self, raw_data):
+        """Filter + decimate the raw block and send BAND frames to stream
+        clients (one frame per band/channel that produced samples)."""
+        for band_index, channel, samples in self._band_bank.process(raw_data):
+            frame = band_frame(band_index, channel,
+                               samples.astype('<f8').tobytes())
+            self._registry.broadcast_stream_frame(frame)
 
     def _wait_for_sync_locked(self):
         synced = False
@@ -415,9 +494,12 @@ class Controller:
                     break
 
                 if result.data:
-                    payload = array('d', result.data).tobytes()
                     if self._registry:
-                        self._registry.broadcast_data(payload)
+                        if self.stream_raw:
+                            self._registry.broadcast_data(
+                                array('d', result.data).tobytes())
+                        if self._band_bank is not None:
+                            self._emit_bands(result.data)
                 else:
                     sleep(0.002)
         finally:
@@ -430,6 +512,7 @@ class Controller:
                     self._hat.a_in_scan_cleanup()
                 except HatError:
                     pass
+                self._band_bank = None
                 self._running = False
             print('[scan] stopped', flush=True)
             if self._registry:
@@ -573,7 +656,44 @@ class Controller:
             self.continuous = bool(req['continuous'])
         if 'ext_clock' in req:
             self.ext_clock = bool(req['ext_clock'])
-        return {'continuous': self.continuous, 'ext_clock': self.ext_clock}
+        if 'stream_raw' in req:
+            self.stream_raw = bool(req['stream_raw'])
+        return {'continuous': self.continuous, 'ext_clock': self.ext_clock,
+                'stream_raw': self.stream_raw}
+
+    def _cmd_set_bands(self, req):
+        self._require_stopped()
+        cfg = self.band_config
+        if 'enabled' in req:
+            cfg['enabled'] = bool(req['enabled'])
+        for key in ('f_min', 'f_max', 'margin'):
+            if key in req:
+                cfg[key] = float(req[key])
+        for key in ('fraction', 'order'):
+            if key in req:
+                cfg[key] = int(req[key])
+        # Build a throwaway bank to validate settings and report the resulting
+        # band table (also surfaces a missing numpy/scipy immediately).
+        table = None
+        if cfg.get('enabled'):
+            try:
+                from band_filter import BandFilterBank
+            except ImportError as err:
+                raise CommandError(
+                    'band output needs numpy + scipy on the Pi ({})'.format(
+                        err))
+            bank = BandFilterBank(
+                self.actual_rate, self.channels,
+                f_min=cfg.get('f_min', 20.0), f_max=cfg.get('f_max', 20000.0),
+                fraction=cfg.get('fraction', 3), order=cfg.get('order', 6),
+                margin=cfg.get('margin', 1.0))
+            table = bank.metadata()
+        return {'enabled': bool(cfg.get('enabled')),
+                'fraction': cfg.get('fraction', 3),
+                'order': cfg.get('order', 6),
+                'f_min': cfg.get('f_min', 20.0),
+                'f_max': cfg.get('f_max', 20000.0),
+                'band_table': table}
 
     def _cmd_calibration_write(self, req):
         self._require_stopped()
@@ -641,6 +761,7 @@ class Controller:
         'set_channels': _cmd_set_channels,
         'set_trigger': _cmd_set_trigger,
         'set_options': _cmd_set_options,
+        'set_bands': _cmd_set_bands,
         'calibration_write': _cmd_calibration_write,
         'test_signals_write': _cmd_test_signals_write,
     }

@@ -70,6 +70,7 @@ Everything the server sends here is a **typed, length-prefixed frame**:
 |:----:|------|---------|
 | `0x01` | DATA | Raw waveform: interleaved `float64` (8 bytes each), little-endian. |
 | `0x02` | MSG  | A UTF-8 JSON object (handshake on connect, then events). |
+| `0x03` | BAND | Optional fractional-octave band output (see §2.2). |
 
 **Reading loop (pseudocode):**
 
@@ -78,6 +79,7 @@ read 5 bytes -> (type, length)
 read `length` bytes -> payload
 if type == 0x01: decode payload as float64[]
 if type == 0x02: parse payload as JSON
+if type == 0x03: band_index,channel = payload[:8]; float64[] = payload[8:]
 ```
 
 ### DATA payload layout
@@ -96,6 +98,40 @@ ch0[n], ch1[n], ch0[n+1], ch1[n+1], ...        (when scanning channels 0 and 1)
 
 DATA frames are only sent while a scan is running (after `start`). The stream
 port ignores anything the client sends to it.
+
+### 2.2 BAND frames (type `0x03`) — fractional-octave output
+
+Optional. When band output is enabled (`set_bands` / `[bands]` in
+`config.ini`), the Pi runs a Butterworth band-pass filter per fractional-
+octave band (1/3-octave by default) in real time, **decimates** each band to
+just above twice its upper edge, and sends the result as BAND frames — one
+frame per band per channel per block:
+
+```
+payload = [4-byte band_index uint32][4-byte channel uint32][decimated float64 samples...]
+          |------------- 8-byte header ---------------|
+```
+
+- `band_index` maps to the `band_table` in the handshake (§3), which gives
+  each band's center frequency, edges, decimation factor, and **decimated
+  sample rate**. Each band streams at its own rate, so demux by `band_index`.
+- `channel` is the MCC 172 channel number (0 or 1).
+- Sample count in a frame = `(length - 8) / 8`.
+- Low-frequency bands decimate heavily and therefore emit frames
+  infrequently; high bands emit often. Frames with zero samples are not sent.
+- The band samples are in the same units as the raw stream (Pa when the
+  channel is calibrated, else V). The laptop applies time-weighting
+  (Fast/Slow/Impulse), Leq, band SPL, A/C-weighting, etc.
+
+Filtering is continuous across blocks (IIR state and decimation phase are
+carried), so concatenating a band's frames reconstructs a single, gap-free
+decimated time series for that band.
+
+**Bandwidth:** high fractional-octave bands are wide in absolute Hz and
+barely decimate, so the full 20 Hz–20 kHz set at 51.2 kHz is roughly **5× the
+raw stream** for two channels (~36 Mbit/s) — marginal on Wi-Fi. Lower `f_max`
+(the top bands dominate), use one channel, or set `stream_raw = false` to
+drop the raw stream. See §5.1.
 
 ---
 
@@ -124,9 +160,29 @@ The full configuration plus protocol metadata:
   "units": {"0": "Pa", "1": "V"},
   "trigger": {"enabled": false, "source": "LOCAL", "mode": "RISING_EDGE"},
   "options": {"continuous": true, "ext_clock": false},
+  "stream_raw": true,
+  "bands": {"enabled": true, "fraction": 3, "order": 6,
+            "f_min": 20.0, "f_max": 20000.0},
   "dtype": "float64",
   "byte_order": "little",
   "interleave": "channel-fastest"
+}
+```
+
+When band output is **active** (i.e. during a running scan with bands
+enabled, or in a `started` event), the handshake also carries a `band_table`
+mapping each `band_index` used by BAND frames (§2.2) to its parameters:
+
+```json
+"band_table": {
+  "fraction": 3, "order": 6, "input_rate": 51200.0, "channels": [0, 1],
+  "bands": [
+    {"index": 0, "center": 19.7, "f_lo": 17.5, "f_hi": 22.1,
+     "decimation": 1158, "decimated_rate": 44.2},
+    {"index": 1, "center": 24.8, "f_lo": 22.1, "f_hi": 27.8,
+     "decimation": 919,  "decimated_rate": 55.7}
+    /* ... */
+  ]
 }
 ```
 
@@ -152,12 +208,14 @@ On failure:
 ### Events (unsolicited, broadcast to all clients on both ports)
 
 ```json
+{"type": "event", "event": "started", ...full handshake body incl. band_table...}
 {"type": "event", "event": "overrun", "kind": "hardware"}
 {"type": "event", "event": "stopped"}
 ```
 
 | event | meaning |
 |-------|---------|
+| `started` | A scan has begun. Carries the full config (like the handshake), including `band_table` if band output is on — so clients connected before `start` learn the band layout. |
 | `overrun` (`kind`: `hardware` \| `buffer`) | Data was lost; the scan has stopped. Reconfigure/reduce rate and `start` again. |
 | `stopped` | The scan has ended (after `stop`, or after an overrun). No more DATA until the next `start`. |
 
@@ -203,9 +261,15 @@ configuration changes during an active scan, so the server returns an error
 | `set_sample_rate` | `sample_rate` (Hz/ch); optional `clock_source` | `{"requested_rate", "actual_rate", "clock_source"}` |
 | `set_channels` | `channels` (list, subset of `[0,1]`) | `{"channels"}` |
 | `set_trigger` | `enable` (bool); optional `mode`, `source` | `{"enabled", "source", "mode"}` |
-| `set_options` | optional `continuous` (bool), `ext_clock` (bool) | `{"continuous", "ext_clock"}` |
+| `set_options` | optional `continuous` (bool), `ext_clock` (bool), `stream_raw` (bool) | `{"continuous", "ext_clock", "stream_raw"}` |
+| `set_bands` | optional `enabled` (bool), `f_min`, `f_max`, `fraction`, `order`, `margin` | `{"enabled", "fraction", "order", "f_min", "f_max", "band_table"}` |
 | `calibration_write` | `channel`, `slope`, `offset` (overrides factory ADC cal) | `{"channel", "slope", "offset"}` |
 | `test_signals_write` | `mode` (int); optional `clock`, `sync` (int) | `{"mode", "clock", "sync"}` |
+
+`set_bands` validates the settings immediately (building the filter bank) and
+returns the resulting `band_table`; it errors if `numpy`/`scipy` are not
+installed on the Pi. `set_options stream_raw=false` streams only BAND frames
+(no raw DATA).
 
 ### Controls (anytime)
 
@@ -248,15 +312,39 @@ SPL  = 20 * log10(Prms / 20e-6)      # dB
 The stream is unweighted (Z-weighting). Apply an A-weighting filter on your
 side if you need dB(A).
 
+### 5.1 Band levels, time-weighting, and Leq (laptop side)
+
+BAND frames (§2.2) give you each fractional-octave band as a continuous,
+decimated time series in Pa. From those the laptop computes the usual
+metrics — the Pi deliberately does none of this so it stays light:
+
+```
+# per band b, per channel, over its decimated stream x_b[n] (in Pa):
+
+# Time-weighted level (Fast tau=0.125 s, Slow tau=1 s, Impulse tau=0.035 s):
+#   exponential moving average of the squared signal, then to dB
+a      = dt / tau                       # dt = 1 / decimated_rate[b]
+ms[n]  = ms[n-1] + a * (x_b[n]^2 - ms[n-1])
+L_tw   = 10 * log10(ms[n] / (20e-6)^2)
+
+# Equivalent continuous level over T seconds (energy average):
+Leq_T  = 10 * log10( mean(x_b^2 over T) / (20e-6)^2 )
+```
+
+Choosing `f_max` sets the highest band and therefore most of the bandwidth
+(the top bands barely decimate). For overall (broadband) Leq/time-weighting,
+use the raw DATA stream instead — it is far lighter than the full band set.
+
 ---
 
 ## 6. Reliability notes
 
 - **Backpressure:** the server keeps a bounded per-client send queue
   (`config.ini`, `[network] max_queue_blocks`). If a client cannot keep up,
-  the **oldest DATA blocks are dropped** so a slow reader never stalls
-  acquisition or affects other clients. There is no guarantee every DATA
-  frame is delivered; treat the stream as best-effort real-time.
+  the **oldest stream frames (DATA and BAND) are dropped** so a slow reader
+  never stalls acquisition or affects other clients. There is no guarantee
+  every frame is delivered; treat the stream as best-effort real-time. (A
+  dropped BAND frame leaves a gap in that band's decimated series.)
 - **Ordering:** within a single connection, bytes are ordered (TCP). On the
   control port a command's `response` always follows the commands sent
   before it; an event may be interleaved (e.g. the `stopped` event can
