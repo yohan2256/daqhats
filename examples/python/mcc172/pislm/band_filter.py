@@ -2,7 +2,7 @@
 #  -*- coding: utf-8 -*-
 """
 Fractional-octave (default 1/3-octave) real-time band filter bank for the
-MCC 172 noise monitor.
+MCC 172 PiSLM.
 
 Each band is a Butterworth band-pass filter applied to the full-rate signal
 with its IIR state carried across blocks (so filtering is continuous in real

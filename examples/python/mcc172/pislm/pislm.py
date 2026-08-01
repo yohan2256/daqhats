@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #  -*- coding: utf-8 -*-
 """
-Multi-device noise monitor -- Raspberry Pi side.
+PiSLM -- multi-device sound level meter -- Raspberry Pi side.
 
 Runs on a headless Raspberry Pi and behaves like a networked sound level
 meter across up to two IEPE acquisition devices:
@@ -20,7 +20,7 @@ only valid within one device.
 It streams Fast/Slow/Impulse time-weighted levels continuously, keeps raw
 samples in per-device ring buffers, and computes Leq / Lmax / Lmin / Lpeak /
 LN over a window on the "get_metrics" command. Designed to be launched at
-boot by systemd (see noise-monitor.service).
+boot by systemd (see pislm.service).
 
 Two separate TCP ports (see PROTOCOL.md for the full specification):
 
@@ -69,7 +69,7 @@ except ImportError:  # pragma: no cover - Python 2 fallback
 
 from devices import open_backends, ChannelMap, Mcc172Backend
 
-PROTOCOL_VERSION = 'noise-monitor/3'
+PROTOCOL_VERSION = 'pislm/3'
 
 # Downstream frame types.
 TYPE_DATA = 0x01        # raw interleaved waveform (per device)
@@ -1503,7 +1503,7 @@ class Controller:
 # --------------------------------------------------------------------------
 def main():
     config_path = os.environ.get(
-        'NOISE_MONITOR_CONFIG',
+        'PISLM_CONFIG',
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini'))
     settings = load_config(config_path)
 

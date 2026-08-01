@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #  -*- coding: utf-8 -*-
 """
-Sound-level-meter DSP for the MCC 172 noise monitor.
+Sound-level-meter DSP for the MCC 172 PiSLM.
 
 Provides the pieces needed to behave like a class sound level meter:
 

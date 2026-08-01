@@ -1,4 +1,4 @@
-# Noise Monitor (MCC 172 + DT9837A)
+# PiSLM — Raspberry Pi Sound Level Meter
 
 A headless setup that turns a Raspberry Pi with an **MCC 172** DAQ HAT and
 (optionally) a **Data Translation DT9837A** USB module into a network
@@ -13,7 +13,7 @@ configurable feature of both devices.
 ```
 [IEPE mics] --2mA--> [MCC 172 HAT] ---SPI--> [Raspberry Pi]
                        (2 ch, global 0-1)          |  (systemd @ boot)
-[IEPE mics] --4mA--> [DT9837A USB] ---USB--> ...   |  noise_monitor.py
+[IEPE mics] --4mA--> [DT9837A USB] ---USB--> ...   |  pislm.py
                        (4 ch, global 2-5)          |  + raw ring buffers
                                   control port 5000 <-> commands / metrics
                                   stream  port 5001  -> levels (+ raw/bands)
@@ -73,15 +73,16 @@ command list with request/response schemas, events, and examples).
 
 | File | Runs on | Purpose |
 |------|---------|---------|
-| `noise_monitor.py`     | Raspberry Pi | Multi-device acquisition; level streaming, raw ring buffers + on-demand metrics; control/stream servers. |
+| `pislm.py`     | Raspberry Pi | Multi-device acquisition; level streaming, raw ring buffers + on-demand metrics; control/stream servers. |
 | `devices.py`           | Raspberry Pi | Device backends: MCC 172 (daqhats) and DT9837A (uldaq), plus the global channel map. |
 | `slm.py`               | Raspberry Pi | Sound-level-meter DSP: IEC 61672 A/C/Z weighting, Fast/Slow/Impulse time weighting, Leq/Lmax/Lmin/Lpeak/LN. |
 | `band_filter.py`       | Raspberry Pi | Fractional-octave (1/3-octave) decimating Butterworth filter bank. |
 | `dsp_pool.py`          | Raspberry Pi | Multi-core DSP: worker processes + shared memory for the level/band computation. |
 | `gpio_trigger.py`      | Raspberry Pi | GPIO trigger-pulse output for the synchronized start (gpiod v2/v1 or RPi.GPIO). |
 | `config.ini`           | Raspberry Pi | Boot defaults: devices, channels, IEPE, sensitivity, sample rate, weighting, level rate, buffer, bands, ports. |
-| `noise-monitor.service`| Raspberry Pi | systemd unit for automatic start at boot. |
+| `pislm.service`| Raspberry Pi | systemd unit for automatic start at boot. |
 | `PROTOCOL.md`          | —            | Communication protocol specification for your client. |
+| `INSTALL.md`           | —            | Full field installation manual (parts, wiring, OS, drivers, calibration, service). |
 
 Python dependencies on the Pi (for the level/metrics DSP):
 
@@ -100,6 +101,11 @@ pip3 install uldaq
 
 A device listed in `config.ini` but not attached is skipped at startup with
 a log message — the monitor runs with whatever is present.
+
+> **New build?** Follow **[`INSTALL.md`](INSTALL.md)** — the complete field
+> installation manual (bill of materials, wiring, grounding, OS and driver
+> setup, calibration with an acoustic calibrator, and commissioning). The
+> quick steps below assume the hardware is already assembled.
 
 ## 1. Hardware
 
@@ -150,8 +156,8 @@ client can change most of them live afterwards over the control port.
 On the Pi:
 
 ```sh
-cd ~/daqhats/examples/python/mcc172/noise_monitor
-python3 noise_monitor.py
+cd ~/daqhats/examples/python/mcc172/pislm
+python3 pislm.py
 ```
 
 Quick smoke test from any machine (no custom client needed):
@@ -168,25 +174,25 @@ waveforms. All channels are global (0–5 with both devices attached).
 
 ## 5. Start automatically at boot (systemd)
 
-Edit `noise-monitor.service` if your username/paths differ from `pi`, then:
+Edit `pislm.service` if your username/paths differ from `pi`, then:
 
 ```sh
-sudo cp noise-monitor.service /etc/systemd/system/
+sudo cp pislm.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now noise-monitor
+sudo systemctl enable --now pislm
 ```
 
 Check status and logs:
 
 ```sh
-systemctl status noise-monitor
-journalctl -u noise-monitor -f
+systemctl status pislm
+journalctl -u pislm -f
 ```
 
 After editing `config.ini`, apply changes with:
 
 ```sh
-sudo systemctl restart noise-monitor
+sudo systemctl restart pislm
 ```
 
 ## Sound-level-meter behavior

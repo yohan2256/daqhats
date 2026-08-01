@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #  -*- coding: utf-8 -*-
 """
-Multi-core DSP pool for the noise monitor.
+Multi-core DSP pool for the PiSLM.
 
 The level/band DSP is the monitor's only heavy computation, and it is pure
 per-channel filtering, so it parallelizes cleanly by channel group. Threads

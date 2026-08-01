@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #  -*- coding: utf-8 -*-
 """
-Acquisition-device backends for the noise monitor.
+Acquisition-device backends for the PiSLM.
 
 Two backends behind one small interface, so the monitor can run an MCC 172
 DAQ HAT (2 IEPE channels, daqhats library) and a Data Translation DT9837A
