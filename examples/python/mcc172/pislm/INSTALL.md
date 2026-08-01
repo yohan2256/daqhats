@@ -314,8 +314,18 @@ Nothing to build — it is plain Python.
 
 ## 10. Network setup
 
-For a direct Pi ↔ laptop link, give the Pi a static address on the wired
-interface:
+This sets a static IP on the Pi's **built-in wired Ethernet port** (`eth0`),
+for a direct Pi ↔ laptop cable — not Wi-Fi. Gigabit Ethernet carries the
+full raw stream (6 ch ≈ 20 Mbit/s) with room to spare, and keeps RF away
+from the microphone lines.
+
+> **If you are on SSH over this same wired port** (e.g. through a switch,
+> rather than sitting at the Pi with a keyboard), changing its IP mid-session
+> can drop your connection before the command finishes, and you may not be
+> able to reconnect at the old address. Either run this from the Pi's local
+> console, or be ready to reconnect at the new address (`192.168.50.1`)
+> immediately after. SSH over Wi-Fi (if enabled) is unaffected either way,
+> since only the wired interface is being reconfigured.
 
 ```sh
 sudo nmcli con mod "Wired connection 1" \
@@ -329,9 +339,6 @@ laptop:
 ```sh
 ping 192.168.50.1
 ```
-
-Gigabit Ethernet carries the full raw stream (6 ch ≈ 20 Mbit/s) with room to
-spare, and keeps RF away from the microphone lines.
 
 ---
 
