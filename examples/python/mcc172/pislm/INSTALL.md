@@ -104,8 +104,9 @@ GND (header pin 9) ------------+-- MCC 172 "GND"   (J5 pin 2)
 - Keep the trigger wire short and away from the microphone cables.
 
 > This aligns the **start** of the scans (≈±1 sample per device plus each
-> ADC's fixed group delay). It does **not** lock the ADC clocks, which still
-> drift a few ppm relative to each other — see §14.
+> ADC's fixed group delay). It does **not** lock the ADC clocks — for that,
+> enable the software clock alignment (`[resample]`, see §12 and the README),
+> which measures each device's true rate and resamples both onto one grid.
 
 ---
 
@@ -400,10 +401,14 @@ Before each measurement session:
 - [ ] `buffer_seconds` long enough to cover your longest event
 - [ ] Laptop has disk space if recording raw (6 ch ≈ 8.8 GB/hour)
 
-**Remember:** the two devices' ADC clocks are independent (a few ppm apart).
-Per-channel levels and metrics are unaffected, but **cross-device phase or
-correlation analysis is not valid** — keep channel pairs that need phase
-coherence on the same device.
+**Cross-device phase.** The two ADC clocks are independent (±50 ppm each).
+Per-channel levels and metrics are unaffected either way, but for phase or
+correlation *between* devices you need both the GPIO trigger (§4, aligns the
+start) **and** `[resample] enabled = true` (aligns the rates). Check
+`clock` in `status`: each device's `settled` should be true and the run
+should be at least a minute old before you trust cross-device phase — the
+rate estimate reaches ~2 ppm at 60 s and ~0.15 ppm at 300 s. Without
+resampling, keep phase-coherent channel pairs on the same device.
 
 ---
 
@@ -413,7 +418,9 @@ coherence on the same device.
 |---------|-------------|
 | `daqhats_list_boards` finds nothing | HAT not fully seated, or another SPI device configured. Check `/boot/firmware/config.txt` for display/SPI overlays. |
 | `No DT9837A device found` | udev rule not applied, or user not in `plugdev`. Re-log in; check `lsusb`. |
-| `overrun` events, scan stops | The Pi cannot keep up. Lower `sample_rate`, lower `[bands] f_max`, or confirm `[dsp] workers` is `-1` (not `0`). |
+| `overrun` events, scan stops | The Pi cannot keep up. Lower `sample_rate`, lower `[bands] f_max`, turn off `[resample]`, or confirm `[dsp] workers` is `-1` (not `0`). |
+| Cross-device phase drifts over time | Enable `[resample]`; wait for `clock.settled` on both devices (~60 s). |
+| `clock.ppm` reads hundreds of ppm | Not a crystal error — usually a stalled or restarted scan. Restart and re-check; values beyond ±500 ppm are rejected as implausible. |
 | Levels ~0 dB or nonsense | IEPE off, or `sensitivity` left at 1000 (data in volts, not Pa). |
 | Level is off by a fixed amount | Recalibrate with the calibrator (§12). |
 | Hum / mains buzz | Ground loop. Use one PSU, bond DGND to earth for floating sources, keep cables away from mains. |
