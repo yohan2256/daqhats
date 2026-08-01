@@ -83,8 +83,13 @@ def read_frame(sock):
 # --------------------------------------------------------------------------
 class ControlClient:
     def __init__(self, host, port):
+        # timeout=10.0 only bounds the initial TCP handshake, so we fail
+        # fast if the host is unreachable. Once connected, the reader
+        # thread blocks on recv() indefinitely -- events and responses are
+        # irregular, and a bare read timeout must not be mistaken for the
+        # connection being closed (see ReaderThread._read_line).
         self.sock = socket.create_connection((host, port), timeout=10.0)
-        self.sock.settimeout(10.0)
+        self.sock.settimeout(None)
         self._buf = b''
         self._id = 0
         self._lock = threading.Lock()
@@ -191,8 +196,11 @@ def _print_async(text):
 class StreamReader(threading.Thread):
     def __init__(self, host, port, meter_interval=0.5):
         super(StreamReader, self).__init__(daemon=True)
+        # Same reasoning as ControlClient: bound only the initial connect,
+        # then block indefinitely -- e.g. while the scan is stopped, no
+        # frames arrive at all, and that must not look like a disconnect.
         self.sock = socket.create_connection((host, port), timeout=10.0)
-        self.sock.settimeout(10.0)
+        self.sock.settimeout(None)
         self.meter_interval = meter_interval
         self.show_meter = True
         self.channel_map = {}       # global channel -> device_type/local
