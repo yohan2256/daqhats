@@ -1,10 +1,19 @@
-# MCC 172 Noise Monitor — Communication Protocol
+# Noise Monitor — Communication Protocol
 
 Wire specification for talking to `noise_monitor.py` running on the
 Raspberry Pi. It is language-agnostic: any TCP client that follows this
-document can receive the raw waveform and control the MCC 172.
+document can receive levels/waveforms and control the acquisition devices.
 
-- **Protocol version:** `mcc172-noise-monitor/2` (see the handshake).
+- **Protocol version:** `noise-monitor/3` (see the handshake).
+- **Devices:** up to two IEPE acquisition devices — an MCC 172 DAQ HAT
+  (2 channels) and a Data Translation DT9837A (4 channels) — for **6
+  channels total**. Channels are numbered **globally** in device order
+  (default: 0–1 = MCC 172, 2–5 = DT9837A); the handshake's `channel_map`
+  gives the exact mapping. All frames and commands use global channel
+  numbers.
+- **Clocks are not synchronized between devices.** Each device runs its own
+  ADC clock. Per-channel levels/metrics are unaffected; cross-channel phase
+  analysis is only valid within one device.
 - **Transport:** TCP. The Pi is the **server**; clients connect to it.
 - **Two separate ports** (both configurable in `config.ini`, `[network]`):
   - **Control port** — default `5000`. Newline-delimited UTF-8 JSON, both
@@ -68,7 +77,7 @@ Everything the server sends here is a **typed, length-prefixed frame**:
 
 | type | name | payload |
 |:----:|------|---------|
-| `0x01` | DATA | Raw waveform: interleaved `float64` (8 bytes each), little-endian. |
+| `0x01` | DATA | `[4-byte device index]` + raw interleaved `float64` for that device, see §2.1. |
 | `0x02` | MSG  | A UTF-8 JSON object (handshake on connect, then events). |
 | `0x03` | BAND | Fractional-octave band **waveform** (decimated), see §2.2. |
 | `0x04` | LEVEL | Broadband time-weighted **level** (dB), see §2.3. |
@@ -79,12 +88,15 @@ Everything the server sends here is a **typed, length-prefixed frame**:
 ```
 read 5 bytes -> (type, length)
 read `length` bytes -> payload
-if type == 0x01: float64[]                = payload            # raw waveform
+if type == 0x01: device,float64[]         = payload            # raw waveform
 if type == 0x02: json                     = payload            # msg / event
 if type == 0x03: band_index,channel,float64[]  = payload       # band waveform
 if type == 0x04: channel,float64[]        = payload            # level dB
 if type == 0x05: band_index,channel,float64[]  = payload       # band level dB
 ```
+
+All `channel` fields are **global** channel numbers; `device` is the index
+into the handshake's `devices` list.
 
 **Which frames you get depends on configuration.** By default the monitor
 behaves like a sound level meter: it sends `LEVEL` frames (and `BAND_LEVEL`
@@ -92,22 +104,31 @@ if bands are enabled) and keeps raw samples buffered for `get_metrics`
 (§4). Raw `DATA` is sent only when `stream_raw` is on; `BAND` (waveform)
 frames only when band output mode is `waveform`.
 
-### DATA payload layout
-
-The payload is a flat array of `float64` samples, **channel-fastest**
-(the same order the MCC 172 returns):
+### 2.1 DATA payload layout
 
 ```
-ch0[n], ch1[n], ch0[n+1], ch1[n+1], ...        (when scanning channels 0 and 1)
+payload = [4-byte device uint32][interleaved float64 samples...]
 ```
 
-- Number of active channels = `num_channels` from the handshake / `get_config`.
-- Samples per channel in a frame = `length / 8 / num_channels`.
+Each DATA frame carries one **device's** block. The samples are
+channel-fastest across that device's scanned channels:
+
+```
+chA[n], chB[n], chA[n+1], chB[n+1], ...
+```
+
+where `chA, chB, ...` are the device's channels in ascending order — their
+**global** numbers are `devices[device].channels` in the handshake.
+
+- Channels in the frame = `len(devices[device].channels)`.
+- Samples per channel in a frame = `(length - 4) / 8 / num_device_channels`.
+- Devices produce independent DATA frames (their clocks are not synced).
 - Sample **value units** depend on calibration (see §5): volts (`V`) when the
   channel's sensitivity is `1000`, pascals (`Pa`) otherwise.
 
-DATA frames are only sent while a scan is running (after `start`). The stream
-port ignores anything the client sends to it.
+DATA frames are only sent while a scan is running (after `start`) and only
+when `stream_raw` is enabled. The stream port ignores anything the client
+sends to it.
 
 ### 2.2 BAND frames (type `0x03`) — fractional-octave output
 
@@ -122,10 +143,11 @@ payload = [4-byte band_index uint32][4-byte channel uint32][decimated float64 sa
           |------------- 8-byte header ---------------|
 ```
 
-- `band_index` maps to the `band_table` in the handshake (§3), which gives
-  each band's center frequency, edges, decimation factor, and **decimated
-  sample rate**. Each band streams at its own rate, so demux by `band_index`.
-- `channel` is the MCC 172 channel number (0 or 1).
+- `band_index` maps to the `band_table` in the handshake (§3). The table is
+  a **list with one entry per device** (band rates depend on each device's
+  actual sample rate); resolve the channel's device via `channel_map`, then
+  look the band up in that device's table entry.
+- `channel` is the **global** channel number.
 - Sample count in a frame = `(length - 8) / 8`.
 - Low-frequency bands decimate heavily and therefore emit frames
   infrequently; high bands emit often. Frames with zero samples are not sent.
@@ -188,46 +210,64 @@ The full configuration plus protocol metadata:
 ```json
 {
   "type": "handshake",
-  "protocol": "mcc172-noise-monitor/2",
+  "protocol": "noise-monitor/3",
   "running": false,
-  "channels": [0, 1],
-  "num_channels": 2,
+  "channels": [0, 1, 2, 3, 4, 5],
+  "num_channels": 6,
+  "channel_map": [
+    {"global": 0, "device": 0, "device_type": "mcc172",  "local": 0},
+    {"global": 1, "device": 0, "device_type": "mcc172",  "local": 1},
+    {"global": 2, "device": 1, "device_type": "dt9837a", "local": 0},
+    {"global": 3, "device": 1, "device_type": "dt9837a", "local": 1},
+    {"global": 4, "device": 1, "device_type": "dt9837a", "local": 2},
+    {"global": 5, "device": 1, "device_type": "dt9837a", "local": 3}
+  ],
+  "devices": [
+    {"index": 0, "type": "mcc172",  "channels": [0, 1],
+     "actual_rate": 51200.0},
+    {"index": 1, "type": "dt9837a", "channels": [2, 3, 4, 5],
+     "actual_rate": 51200.0}
+  ],
   "sample_rate": 51200.0,
-  "actual_rate": 51200.0,
-  "clock_source": "LOCAL",
-  "iepe": {"0": 1, "1": 1},
-  "sensitivity_mv_per_unit": {"0": 50.0, "1": 1000.0},
-  "units": {"0": "Pa", "1": "V"},
-  "trigger": {"enabled": false, "source": "LOCAL", "mode": "RISING_EDGE"},
-  "options": {"continuous": true, "ext_clock": false},
+  "iepe": {"0": 1, "1": 1, "2": 1, "3": 1, "4": 1, "5": 1},
+  "sensitivity_mv_per_unit": {"0": 50.0, "1": 1000.0, "2": 50.0,
+                              "3": 50.0, "4": 50.0, "5": 50.0},
+  "units": {"0": "Pa", "1": "V", "2": "Pa", "3": "Pa", "4": "Pa", "5": "Pa"},
   "stream_raw": false,
   "bands": {"enabled": true, "output": "level", "fraction": 3, "order": 6,
             "f_min": 20.0, "f_max": 20000.0},
   "weighting": {"frequency": "A", "time": "Fast"},
   "level": {"enabled": true, "output_rate": 10.0},
   "storage": {"buffer_seconds": 60.0},
+  "clock_sync_note": "devices are not clock-synchronized",
   "dtype": "float64",
   "byte_order": "little",
-  "interleave": "channel-fastest"
+  "interleave": "channel-fastest-per-device"
 }
 ```
 
 When band output is **active** (i.e. during a running scan with bands
-enabled, or in a `started` event), the handshake also carries a `band_table`
-mapping each `band_index` used by BAND frames (§2.2) to its parameters:
+enabled, or in a `started` event), the handshake also carries a `band_table`:
+a **list with one entry per device**, mapping each `band_index` used by
+BAND / BAND_LEVEL frames to its parameters at that device's rate:
 
 ```json
-"band_table": {
-  "fraction": 3, "order": 6, "input_rate": 51200.0, "channels": [0, 1],
-  "bands": [
-    {"index": 0, "center": 19.7, "f_lo": 17.5, "f_hi": 22.1,
-     "decimation": 1158, "decimated_rate": 44.2},
-    {"index": 1, "center": 24.8, "f_lo": 22.1, "f_hi": 27.8,
-     "decimation": 919,  "decimated_rate": 55.7}
-    /* ... */
-  ]
-}
+"band_table": [
+  {"device": 0, "fraction": 3, "order": 6, "input_rate": 51200.0,
+   "channels": [0, 1],
+   "bands": [
+     {"index": 0, "center": 19.7, "f_lo": 17.5, "f_hi": 22.1,
+      "decimation": 1158, "decimated_rate": 44.2}
+     /* ... */
+   ]},
+  {"device": 1, "fraction": 3, "order": 6, "input_rate": 51200.0,
+   "channels": [2, 3, 4, 5],
+   "bands": [ /* ... */ ]}
+]
 ```
+
+To interpret a BAND/BAND_LEVEL frame: map its global `channel` to a device
+via `channel_map`, then look `band_index` up in that device's table entry.
 
 ### Command response (control port only)
 
@@ -259,7 +299,7 @@ On failure:
 | event | meaning |
 |-------|---------|
 | `started` | A scan has begun. Carries the full config (like the handshake), including `band_table` if band output is on — so clients connected before `start` learn the band layout. |
-| `overrun` (`kind`: `hardware` \| `buffer`) | Data was lost; the scan has stopped. Reconfigure/reduce rate and `start` again. |
+| `overrun` (`device`: index, `kind`: `hardware` \| `buffer`) | Data was lost on that device; the whole scan has stopped. Reconfigure/reduce rate and `start` again. |
 | `stopped` | The scan has ended (after `stop`, or after an overrun). No more DATA until the next `start`. |
 
 **Distinguishing message kinds:** switch on the `type` field — `handshake`,
@@ -284,39 +324,43 @@ configuration changes during an active scan, so the server returns an error
 
 ### Queries (anytime)
 
+All `channel` fields take **global** channel numbers.
+
 | cmd | fields | result |
 |-----|--------|--------|
 | `ping` | — | `{"pong": true}` |
 | `get_config` | — | full config snapshot (handshake body without the metadata fields) |
-| `status` | — | `{"running": bool}`; while running also `hardware_overrun`, `buffer_overrun`, `triggered` (bool), `samples_available` (int), `buffer_size` (int) |
-| `info` | — | `{"address", "product_name", "firmware_version", "serial", "calibration_date", "num_ai_channels", "ai_min_voltage", "ai_max_voltage"}` |
+| `status` | — | `{"running", "devices": [{"index", "type", "running", "actual_rate"}]}` |
+| `info` | — | `{"devices": [per-device info + "index" + global "channels"], "channel_map", "num_channels"}` |
 | `get_sensitivity` | `channel` | `{"channel", "sensitivity"}` (mV/unit) |
 | `get_iepe` | `channel` | `{"channel", "mode"}` (mode 0/1) |
-| `get_clock` | — | `{"clock_source", "sample_rate", "synced"}` |
-| `calibration_read` | `channel` | `{"channel", "slope", "offset"}` |
+| `get_clock` | — | `{"requested_rate", "devices": [{"index", "type", "actual_rate"}], "synchronized": false}` |
+| `calibration_read` | `channel` (**mcc172 channels only**) | `{"channel", "slope", "offset"}` |
 
 ### Configuration (require stop)
 
 | cmd | fields | result |
 |-----|--------|--------|
-| `set_sensitivity` | `channel` (0/1), `value` (mV per unit; e.g. 50 for a 50 mV/Pa mic; 1000 = no scaling/volts) | `{"channel", "sensitivity", "units"}` |
-| `set_iepe` | `channel`, `mode` (`1`/`0`, or `"on"`/`"off"`) | `{"channel", "mode"}` |
-| `set_sample_rate` | `sample_rate` (Hz/ch); optional `clock_source` | `{"requested_rate", "actual_rate", "clock_source"}` |
-| `set_channels` | `channels` (list, subset of `[0,1]`) | `{"channels"}` |
-| `set_trigger` | `enable` (bool); optional `mode`, `source` | `{"enabled", "source", "mode"}` |
-| `set_options` | optional `continuous` (bool), `ext_clock` (bool), `stream_raw` (bool) | `{"continuous", "ext_clock", "stream_raw"}` |
-| `set_bands` | optional `enabled` (bool), `output` (`level`\|`waveform`), `f_min`, `f_max`, `fraction`, `order`, `margin` | `{"enabled", "output", "fraction", "order", "f_min", "f_max", "band_table"}` |
+| `set_sensitivity` | `channel` (global), `value` (mV per unit; e.g. 50 for a 50 mV/Pa mic; 1000 = no scaling/volts) | `{"channel", "sensitivity", "units"}` |
+| `set_iepe` | `channel` (global), `mode` (`1`/`0`, or `"on"`/`"off"`) | `{"channel", "mode"}` |
+| `set_sample_rate` | `sample_rate` (Hz/ch, applied to every device) | `{"requested_rate", "devices": [... per-device actual_rate]}` |
+| `set_channels` | `device` (index), `channels` (that device's **local** channels; dt9837a must be contiguous from 0) | `{"device", "channels", "channel_map"}` — global numbering is rebuilt |
+| `set_trigger` | `enable` (bool); optional `mode`, `source` (**mcc172 only**) | `{"enabled", "device": "mcc172", "source", "mode"}` |
+| `set_options` | optional `stream_raw` (bool) | `{"stream_raw"}` |
+| `set_bands` | optional `enabled` (bool), `output` (`level`\|`waveform`), `f_min`, `f_max`, `fraction`, `order`, `margin` | `{"enabled", "output", ..., "band_table": [per-device]}` |
 | `set_weighting` | optional `frequency` (`A`\|`C`\|`Z`), `time` (`Fast`\|`Slow`\|`Impulse`) | `{"frequency", "time"}` |
 | `set_level` | optional `enabled` (bool), `output_rate` (Hz) | `{"enabled", "output_rate"}` |
 | `set_storage` | `buffer_seconds` (raw ring-buffer length) | `{"buffer_seconds"}` |
-| `calibration_write` | `channel`, `slope`, `offset` (overrides factory ADC cal) | `{"channel", "slope", "offset"}` |
-| `test_signals_write` | `mode` (int); optional `clock`, `sync` (int) | `{"mode", "clock", "sync"}` |
+| `calibration_write` | `channel`, `slope`, `offset` (**mcc172 channels only**) | `{"channel", "slope", "offset"}` |
+| `test_signals_write` | `mode` (int); optional `clock`, `sync` (**mcc172 only**) | `{"mode", "clock", "sync"}` |
 
-`set_bands` validates the settings immediately (building the filter bank) and
-returns the resulting `band_table`; it errors if `numpy`/`scipy` are not
-installed on the Pi. `set_bands output=level` sends per-band levels
-(`BAND_LEVEL`), `waveform` sends decimated band signals (`BAND`).
-`set_options stream_raw=false` stops raw `DATA` (levels still stream).
+`set_bands` validates the settings immediately (building a filter bank per
+device) and returns the resulting per-device `band_table`; it errors if
+`numpy`/`scipy` are not installed on the Pi. `set_bands output=level` sends
+per-band levels (`BAND_LEVEL`), `waveform` sends decimated band signals
+(`BAND`). `set_options stream_raw=false` stops raw `DATA` (levels still
+stream). After `set_channels` the global numbering changes — re-read the
+returned `channel_map`.
 
 ### On-demand metrics (anytime — the sound-level-meter statistics)
 
@@ -325,24 +369,27 @@ installed on the Pi. `set_bands output=level` sends per-band levels
 | `get_metrics` | optional `seconds`, `weighting`, `time_weighting`, `percentiles` (list), `channels` (list), `include_bands` (bool) | per-channel `{Leq, Lmax, Lmin, Lpeak, LN:{L10,...}, units, calibrated, window_seconds, n_samples[, bands]}` |
 
 `get_metrics` computes over the most-recent buffered raw samples (kept
-`buffer_seconds` long), so it works while running **and** after `stop`. The
+`buffer_seconds` long, per device), so it works while running **and** after
+`stop`. `channels` selects global channels (default: all). The
 `weighting`/`time_weighting` fields override the current settings for that
-one calculation. `include_bands` adds a per-band `Leq` list. Example result:
+one calculation. `include_bands` adds a per-band `Leq` list. Each channel's
+result carries its `device` index. Example result:
 
 ```json
-{"sample_rate": 51200.0, "requested_seconds": 10,
+{"requested_seconds": 10,
  "channels": {"0": {"Leq": 74.8, "Lmax": 88.1, "Lmin": 61.2, "Lpeak": 96.0,
                     "LN": {"L10": 78.9, "L50": 72.5, "L90": 64.1},
                     "weighting": "A", "time_weighting": "Fast",
-                    "units": "Pa", "calibrated": true,
-                    "window_seconds": 10.0, "n_samples": 512000}}}
+                    "units": "Pa", "calibrated": true, "device": 0,
+                    "window_seconds": 10.0, "n_samples": 512000},
+              "4": {"Leq": 71.2, "device": 1, "...": "..."}}}
 ```
 
 ### Controls (anytime)
 
 | cmd | fields | result |
 |-----|--------|--------|
-| `blink_led` | `count` (0 = blink until next call) | `{"count"}` |
+| `blink_led` | `count` (0 = blink until next call); optional `device` index | `{"count", "devices": [indexes blinked]}` |
 
 ### Enumerations
 
@@ -353,9 +400,16 @@ one calculation. `include_bands` adds a per-band `Leq` list. Example result:
 
 ### `sample_rate` note
 
-The MCC 172 generates `51200 / N` Hz (`N` = 1..256). A requested rate is
-rounded to the nearest achievable value; read the real rate from
-`actual_rate` (in the `set_sample_rate` result, or `get_config`).
+The requested rate applies to every device; each rounds independently:
+
+- **MCC 172** generates `51200 / N` Hz (`N` = 1..256).
+- **DT9837A** supports nearly arbitrary rates up to 52.734 kHz; the exact
+  achieved rate is reported when the scan starts.
+
+Read the per-device real rates from the `set_sample_rate` result,
+`get_clock`, or the handshake `devices` list. Because the devices round
+differently and run separate clocks, do not assume their sample streams
+align.
 
 ---
 
@@ -436,27 +490,31 @@ Control port (5000) — JSON lines both ways:
 
 ```
 connect 5000
-  <- {"type":"handshake", "protocol":"mcc172-noise-monitor/2", "running":false, ...}
+  <- {"type":"handshake", "protocol":"noise-monitor/3", "num_channels":6, ...}
   -> {"id":1,"cmd":"stop"}                       (ignore error if already stopped)
-  -> {"id":2,"cmd":"set_sensitivity","channel":0,"value":50}
-  <- {"type":"response","id":2,"ok":true,"result":{"channel":0,"sensitivity":50.0,"units":"Pa"}}
+  -> {"id":2,"cmd":"set_sensitivity","channel":3,"value":50}     (global ch 3 = DT9837A ch 1)
+  <- {"type":"response","id":2,"ok":true,"result":{"channel":3,"sensitivity":50.0,"units":"Pa"}}
   -> {"id":3,"cmd":"set_sample_rate","sample_rate":25600}
-  <- {"type":"response","id":3,"ok":true,"result":{"requested_rate":25600.0,"actual_rate":25600.0,"clock_source":"LOCAL"}}
+  <- {"type":"response","id":3,"ok":true,"result":{"requested_rate":25600.0,"devices":[...]}}
   -> {"id":4,"cmd":"start"}
   <- {"type":"response","id":4,"ok":true,"result":{...config...}}
   ...
-  -> {"id":5,"cmd":"stop"}
+  -> {"id":5,"cmd":"get_metrics","seconds":10,"channels":[0,3]}
+  <- {"type":"response","id":5,"ok":true,"result":{"channels":{"0":{...},"3":{...}}}}
+  -> {"id":6,"cmd":"stop"}
   <- {"type":"event","event":"stopped"}          (may precede the response)
-  <- {"type":"response","id":5,"ok":true,"result":{"running":false}}
+  <- {"type":"response","id":6,"ok":true,"result":{"running":false}}
 ```
 
-Stream port (5001) — typed frames, Pi → client:
+Stream port (5001) — typed frames, Pi → client (default SLM configuration):
 
 ```
 connect 5001
-  <- MSG  {"type":"handshake", "protocol":"mcc172-noise-monitor/2", ...}
-  <- DATA <interleaved float64 samples>          (repeats continuously while running)
-  <- DATA <interleaved float64 samples>
+  <- MSG    {"type":"handshake", "protocol":"noise-monitor/3", ...}
+  <- LEVEL  ch0 <dB samples>                     (repeats for every channel
+  <- LEVEL  ch2 <dB samples>                      at the level output rate)
+  <- BAND_LEVEL band 12, ch 0 <dB samples>       (if bands enabled)
+  <- DATA   device 0 <interleaved float64>       (only if stream_raw is on)
   ...
-  <- MSG  {"type":"event","event":"stopped"}     (when the scan stops)
+  <- MSG    {"type":"event","event":"stopped"}   (when the scan stops)
 ```

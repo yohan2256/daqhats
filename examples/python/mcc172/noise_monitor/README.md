@@ -1,32 +1,36 @@
-# MCC 172 Noise Monitor
+# Noise Monitor (MCC 172 + DT9837A)
 
-A headless setup that turns a Raspberry Pi + **MCC 172** DAQ HAT into a
-network **sound level meter** you control from a laptop. On boot the Pi
-powers an IEPE microphone, applies your calibration, and streams the
-**Fast time-weighted, A-weighted level** (the SLM "needle") continuously.
-Raw samples are kept in a ring buffer on the Pi, and on request it computes
-**Leq, Lmax, Lmin, Lpeak, and LN percentiles** over a window — like a class
-sound level meter. A separate control port drives every configurable
-feature of the MCC 172.
+A headless setup that turns a Raspberry Pi with an **MCC 172** DAQ HAT and
+(optionally) a **Data Translation DT9837A** USB module into a network
+**sound level meter** you control from a laptop — up to **6 IEPE channels**.
+On boot the Pi powers the IEPE microphones, applies your calibration, and
+streams the **Fast time-weighted, A-weighted level** (the SLM "needle")
+continuously. Raw samples are kept in ring buffers on the Pi, and on request
+it computes **Leq, Lmax, Lmin, Lpeak, and LN percentiles** over a window —
+like a class sound level meter. A separate control port drives every
+configurable feature of both devices.
 
 ```
-[IEPE mic] --2 mA IEPE--> [MCC 172 HAT] --SPI--> [Raspberry Pi]
-                                                       |  (systemd @ boot)
-                                                       |  noise_monitor.py
-                                                       |  + raw ring buffer
-                                    control port 5000  <->  commands / metrics
-                                    stream  port 5001   ->  levels (+ raw/bands)
-                                                    Wi-Fi / USB-ethernet
+[IEPE mics] --2mA--> [MCC 172 HAT] ---SPI--> [Raspberry Pi]
+                       (2 ch, global 0-1)          |  (systemd @ boot)
+[IEPE mics] --4mA--> [DT9837A USB] ---USB--> ...   |  noise_monitor.py
+                       (4 ch, global 2-5)          |  + raw ring buffers
+                                  control port 5000 <-> commands / metrics
+                                  stream  port 5001  -> levels (+ raw/bands)
+                                                Wi-Fi / USB-ethernet
                                                        v
                                                    [Laptop]
                                             (your own TCP client)
 ```
 
-The MCC 172 is the only DAQ HAT in this library with built-in **IEPE
-constant-current excitation** (2 mA) and per-channel **sensitivity
-scaling**, which is what makes it suitable for calibrated sound pressure
-measurement. It provides 2 channels of 24-bit simultaneous sampling at up
-to **51.2 kHz per channel**.
+Both devices provide 24-bit simultaneous IEPE sampling: the MCC 172 at up
+to 51.2 kHz/ch (2 ch), the DT9837A at up to 52.7 kHz/ch (4 ch). Channels
+are numbered **globally** in device order (0–1 = MCC 172, 2–5 = DT9837A);
+all commands and stream frames use global numbers.
+
+> **Clock sync caveat:** the two devices run separate, unsynchronized ADC
+> clocks. Per-channel levels/metrics are unaffected, but cross-channel
+> phase analysis is only valid within one device.
 
 ## Two ports
 
@@ -43,10 +47,11 @@ command list with request/response schemas, events, and examples).
 
 | File | Runs on | Purpose |
 |------|---------|---------|
-| `noise_monitor.py`     | Raspberry Pi | IEPE + calibration + continuous scan; level streaming, raw ring buffer + on-demand metrics; control/stream servers. |
+| `noise_monitor.py`     | Raspberry Pi | Multi-device acquisition; level streaming, raw ring buffers + on-demand metrics; control/stream servers. |
+| `devices.py`           | Raspberry Pi | Device backends: MCC 172 (daqhats) and DT9837A (uldaq), plus the global channel map. |
 | `slm.py`               | Raspberry Pi | Sound-level-meter DSP: IEC 61672 A/C/Z weighting, Fast/Slow/Impulse time weighting, Leq/Lmax/Lmin/Lpeak/LN. |
 | `band_filter.py`       | Raspberry Pi | Fractional-octave (1/3-octave) decimating Butterworth filter bank. |
-| `config.ini`           | Raspberry Pi | Boot defaults: sample rate, channels, IEPE, sensitivity, weighting, level rate, buffer, bands, ports. |
+| `config.ini`           | Raspberry Pi | Boot defaults: devices, channels, IEPE, sensitivity, sample rate, weighting, level rate, buffer, bands, ports. |
 | `noise-monitor.service`| Raspberry Pi | systemd unit for automatic start at boot. |
 | `PROTOCOL.md`          | —            | Communication protocol specification for your client. |
 
@@ -56,12 +61,26 @@ Python dependencies on the Pi (for the level/metrics DSP):
 sudo apt install python3-numpy python3-scipy
 ```
 
+For the DT9837A, additionally build/install the **uldaq** C library and its
+Python binding (https://github.com/mccdaq/uldaq):
+
+```sh
+sudo apt install gcc g++ make libusb-1.0-0-dev
+# build & install the C library from the uldaq release tarball, then:
+pip3 install uldaq
+```
+
+A device listed in `config.ini` but not attached is skipped at startup with
+a log message — the monitor runs with whatever is present.
+
 ## 1. Hardware
 
 1. Power off the Pi, seat the MCC 172 on the 40-pin header (single board =
    address 0, all address jumpers removed).
-2. Connect the IEPE microphone to a channel input (e.g. CH0).
-3. Power on the Pi.
+2. Connect the DT9837A to a USB port (a powered hub is recommended on a
+   Pi Zero 2 W — the DT9837A is USB-powered and drives 4 IEPE supplies).
+3. Connect the IEPE microphones to the BNC inputs.
+4. Power on the Pi.
 
 ## 2. Install the daqhats library on the Pi
 
@@ -85,13 +104,15 @@ daqhats_list_boards
 Edit `config.ini`. These are the initial settings the Pi boots with; a
 client can change most of them live afterwards over the control port.
 
-- **`sample_rate`** — 51200 gives the full audio bandwidth (~25 kHz). Lower
-  it (e.g. 25600, 10240) to reduce data volume if you don't need it.
-- **`sensitivity_ch0` / `sensitivity_ch1`** — your microphone's calibrated
-  sensitivity in **mV/Pa**.
-  - Leave at `1000` (the default = no scaling) and the stream is in **volts**.
-  - Set it to your mic's value (e.g. `50` for 50 mV/Pa) and the stream is in
-    **pascals**, so SPL in dB (re 20 µPa) can be computed from the samples.
+- **`[devices] enabled`** — which devices to open (`mcc172, dt9837a`), in
+  order. Global channel numbers follow this order.
+- **`[mcc172]` / `[dt9837a]`** — per-device local channels, IEPE on/off, and
+  per-channel **sensitivity in mV/Pa**.
+  - Leave at `1000` (the default = no scaling) and the data is in **volts**.
+  - Set it to your mic's value (e.g. `50` for 50 mV/Pa) and the data is in
+    **pascals**, so levels and metrics are true SPL (re 20 µPa).
+- **`sample_rate`** (`[acquisition]`) — requested rate for every device;
+  51200 gives the full audio bandwidth (~25 kHz).
 - **`control_port` / `stream_port`** — the two TCP ports.
 - **`autostart`** (`[control]`) — `true` starts streaming at boot; `false`
   boots idle and waits for a `start` command.
@@ -114,7 +135,8 @@ printf '{"id":1,"cmd":"status"}\n' | nc 192.168.1.50 5000
 
 Then implement your client against [`PROTOCOL.md`](PROTOCOL.md): connect to
 the control port for commands (e.g. `set_sensitivity`, `set_sample_rate`,
-`start`, `stop`) and to the stream port to receive the raw waveform.
+`start`, `stop`, `get_metrics`) and to the stream port for levels and
+waveforms. All channels are global (0–5 with both devices attached).
 
 ## 5. Start automatically at boot (systemd)
 

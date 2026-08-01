@@ -1,47 +1,44 @@
 #!/usr/bin/env python3
 #  -*- coding: utf-8 -*-
 """
-MCC 172 Noise Monitor -- Raspberry Pi side (bidirectional control).
+Multi-device noise monitor -- Raspberry Pi side.
 
-Runs on a headless Raspberry Pi with an MCC 172 DAQ HAT. It acquires the
-raw waveform from an IEPE microphone/accelerometer and serves it over TCP,
-while also accepting control commands so a laptop can drive every
-configurable feature of the MCC 172 (sensitivity, sample rate, IEPE power,
-trigger, calibration, LED, test signals, ...) and start/stop streaming on
-demand. Designed to be launched automatically at boot by systemd (see
-noise-monitor.service).
+Runs on a headless Raspberry Pi and behaves like a networked sound level
+meter across up to two IEPE acquisition devices:
+
+    * MCC 172 DAQ HAT (daqhats library)  -- 2 IEPE channels
+    * Data Translation DT9837A (uldaq)   -- 4 IEPE channels
+
+for a total of 6 channels, numbered globally in device order (mcc172 first
+by default: global 0-1 = MCC 172, global 2-5 = DT9837A). All streaming and
+commands use global channel numbers.
+
+NOTE -- the two devices run separate, unsynchronized ADC clocks. Levels and
+metrics per channel are unaffected, but cross-channel phase comparisons are
+only valid within one device.
+
+It streams Fast/Slow/Impulse time-weighted levels continuously, keeps raw
+samples in per-device ring buffers, and computes Leq / Lmax / Lmin / Lpeak /
+LN over a window on the "get_metrics" command. Designed to be launched at
+boot by systemd (see noise-monitor.service).
 
 Two separate TCP ports (see PROTOCOL.md for the full specification):
 
   Control port (default 5000) -- newline-delimited UTF-8 JSON, both ways.
-      On connect the server sends a handshake JSON line describing the
-      current configuration. The client then sends command lines, e.g.
-          {"id": 4, "cmd": "set_sensitivity", "channel": 0, "value": 50}
-      and receives response lines and event lines. The optional "id" is
-      echoed back so replies can be matched.
+      Handshake on connect, then commands / responses / events.
 
   Streaming port (default 5001) -- typed, length-prefixed binary frames:
           [1-byte type][4-byte little-endian uint32 length][payload]
-      type 0x01 DATA : payload = interleaved little-endian float64 samples,
-                       channel-fastest: ch0[n], ch1[n], ch0[n+1], ...
-      type 0x02 MSG  : payload = UTF-8 JSON (handshake on connect, then
-                       events). Upstream bytes on this port are ignored.
-      type 0x03 BAND : optional fractional-octave band WAVEFORM output.
-                       payload = [4-byte band index][4-byte channel] then
-                       decimated little-endian float64 samples for that band.
-                       The handshake's "band_table" maps index -> center
-                       frequency and decimated rate.
-      type 0x04 LEVEL: broadband time-weighted level (Fast/Slow/Impulse) in
-                       dB. payload = [4-byte channel] then float64 dB samples
-                       at the level output rate.
-      type 0x05 BAND_LEVEL : per-band time-weighted level in dB (with the
-                       A/C frequency-weighting offset applied per band).
-                       payload = [4-byte band index][4-byte channel] then
-                       float64 dB samples.
-
-This behaves like a sound level meter: it streams Fast time-weighted levels
-continuously (light), keeps recent raw samples in a ring buffer, and computes
-Leq / Lmax / Lmin / Lpeak / LN over a window on the "get_metrics" command.
+      type 0x01 DATA : [4-byte device index] then interleaved little-endian
+                       float64 samples for that device's channels
+                       (channel-fastest within the device).
+      type 0x02 MSG  : UTF-8 JSON (handshake on connect, then events).
+      type 0x03 BAND : fractional-octave band waveform.
+                       [4-byte band index][4-byte GLOBAL channel] + float64.
+      type 0x04 LEVEL: broadband time-weighted level in dB.
+                       [4-byte GLOBAL channel] + float64 dB samples.
+      type 0x05 BAND_LEVEL : per-band time-weighted level in dB.
+                       [4-byte band index][4-byte GLOBAL channel] + float64.
 """
 from __future__ import print_function
 
@@ -61,29 +58,21 @@ try:
 except ImportError:  # pragma: no cover - Python 2 fallback
     import Queue as queue
 
-from daqhats import (mcc172, OptionFlags, SourceType, TriggerModes, HatIDs,
-                     HatError, hat_list)
+from devices import open_backends, ChannelMap, Mcc172Backend
 
-READ_ALL_AVAILABLE = -1
+PROTOCOL_VERSION = 'noise-monitor/3'
 
 # Downstream frame types.
-TYPE_DATA = 0x01        # raw interleaved waveform
+TYPE_DATA = 0x01        # raw interleaved waveform (per device)
 TYPE_MSG = 0x02         # JSON handshake / events (and responses on ctrl port)
 TYPE_BAND = 0x03        # decimated fractional-octave band waveform
 TYPE_LEVEL = 0x04       # broadband time-weighted level (dB)
 TYPE_BAND_LEVEL = 0x05  # per-band time-weighted level (dB)
-FRAME_HEADER = struct.Struct('<BI')    # type byte + payload length
-BAND_HEADER = struct.Struct('<II')     # band index + channel
-LEVEL_HEADER = struct.Struct('<I')     # channel
-BAND_LEVEL_HEADER = struct.Struct('<II')  # band index + channel
-
-# Name <-> value maps so the laptop can use readable strings in commands.
-SOURCE_TYPES = {'LOCAL': SourceType.LOCAL, 'MASTER': SourceType.MASTER,
-                'SLAVE': SourceType.SLAVE}
-TRIGGER_MODES = {'RISING_EDGE': TriggerModes.RISING_EDGE,
-                 'FALLING_EDGE': TriggerModes.FALLING_EDGE,
-                 'ACTIVE_HIGH': TriggerModes.ACTIVE_HIGH,
-                 'ACTIVE_LOW': TriggerModes.ACTIVE_LOW}
+FRAME_HEADER = struct.Struct('<BI')       # type byte + payload length
+DATA_HEADER = struct.Struct('<I')         # device index
+BAND_HEADER = struct.Struct('<II')        # band index + global channel
+LEVEL_HEADER = struct.Struct('<I')        # global channel
+BAND_LEVEL_HEADER = struct.Struct('<II')  # band index + global channel
 
 
 class CommandError(Exception):
@@ -93,27 +82,39 @@ class CommandError(Exception):
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
+def _channel_list(text):
+    return [int(c) for c in text.split(',') if c.strip() != '']
+
+
 def load_config(path):
-    """Load config.ini into a plain settings dict (the initial device state)."""
+    """Load config.ini into a plain settings dict (the initial state)."""
     parser = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
     if not parser.read(path):
         raise RuntimeError('Could not read configuration file: {}'.format(path))
 
-    channels = [int(c) for c in parser.get('acquisition', 'channels').split(',')
-                if c.strip() != '']
-    if not channels or any(c not in (0, 1) for c in channels):
-        raise ValueError('channels must be a subset of 0, 1')
+    device_names = [n.strip() for n in parser.get(
+        'devices', 'enabled', fallback='mcc172').split(',') if n.strip()]
+    devices = []
+    for name in device_names:
+        section = name
+        channels = None
+        if parser.has_option(section, 'channels'):
+            channels = _channel_list(parser.get(section, 'channels'))
+        devices.append({'type': name, 'channels': channels,
+                        'iepe_enable': parser.getboolean(
+                            section, 'iepe_enable', fallback=True),
+                        'sensitivity': {
+                            ch: parser.getfloat(
+                                section, 'sensitivity_ch{}'.format(ch),
+                                fallback=1000.0)
+                            for ch in range(8)}})
 
     return {
-        'channels': channels,
-        'sample_rate': parser.getfloat('acquisition', 'sample_rate'),
-        'iepe_enable': parser.getboolean('acquisition', 'iepe_enable'),
+        'devices': devices,
+        'sample_rate': parser.getfloat('acquisition', 'sample_rate',
+                                       fallback=51200.0),
         'stream_raw': parser.getboolean('acquisition', 'stream_raw',
                                         fallback=False),
-        'sensitivity': {
-            0: parser.getfloat('calibration', 'sensitivity_ch0'),
-            1: parser.getfloat('calibration', 'sensitivity_ch1'),
-        },
         'host': parser.get('network', 'host'),
         'control_port': parser.getint('network', 'control_port'),
         'stream_port': parser.getint('network', 'stream_port'),
@@ -145,14 +146,6 @@ def load_config(path):
     }
 
 
-def channels_to_mask(channels):
-    """Convert a list of channel numbers to an MCC 172 channel mask."""
-    mask = 0
-    for chan in channels:
-        mask |= 0x01 << chan
-    return mask
-
-
 # --------------------------------------------------------------------------
 # Framing helpers
 # --------------------------------------------------------------------------
@@ -160,8 +153,10 @@ def build_frame(frame_type, payload):
     return FRAME_HEADER.pack(frame_type, len(payload)) + payload
 
 
-def data_frame(payload_bytes):
-    return build_frame(TYPE_DATA, payload_bytes)
+def data_frame(device_index, payload_bytes):
+    """A DATA frame: [device index] then that device's interleaved float64."""
+    return build_frame(TYPE_DATA,
+                       DATA_HEADER.pack(device_index) + payload_bytes)
 
 
 def msg_frame(obj):
@@ -169,26 +164,26 @@ def msg_frame(obj):
 
 
 def band_frame(band_index, channel, sample_bytes):
-    """A BAND frame: [band_index][channel] header, then decimated float64."""
+    """A BAND frame: [band_index][global channel], then decimated float64."""
     return build_frame(TYPE_BAND,
                        BAND_HEADER.pack(band_index, channel) + sample_bytes)
 
 
 def level_frame(channel, sample_bytes):
-    """A LEVEL frame: [channel] header, then float64 level(dB) samples."""
+    """A LEVEL frame: [global channel], then float64 level(dB) samples."""
     return build_frame(TYPE_LEVEL, LEVEL_HEADER.pack(channel) + sample_bytes)
 
 
 def band_level_frame(band_index, channel, sample_bytes):
-    """A BAND_LEVEL frame: [band_index][channel] header, then float64 dB."""
+    """A BAND_LEVEL frame: [band_index][global channel], then float64 dB."""
     return build_frame(
         TYPE_BAND_LEVEL,
         BAND_LEVEL_HEADER.pack(band_index, channel) + sample_bytes)
 
 
 # --------------------------------------------------------------------------
-# Raw sample ring buffer -- keeps the most recent N seconds so the client can
-# request Leq / Lmax / Lmin / LN over a window on demand (like an SLM).
+# Raw sample ring buffer -- per device; keeps the most recent N seconds so
+# the client can request Leq / Lmax / Lmin / LN over a window on demand.
 # --------------------------------------------------------------------------
 class RawRingBuffer:
     """Rolling store of interleaved raw samples, trimmed to a max duration."""
@@ -196,7 +191,7 @@ class RawRingBuffer:
     def __init__(self, max_seconds, num_channels, sample_rate):
         self._num_channels = num_channels
         self._max_interleaved = int(max_seconds * sample_rate) * num_channels
-        self._blocks = []            # list of interleaved sample lists/arrays
+        self._blocks = []            # list of interleaved sample lists
         self._count = 0              # total interleaved samples held
         self._lock = threading.Lock()
 
@@ -214,9 +209,11 @@ class RawRingBuffer:
         with self._lock:
             blocks = list(self._blocks)
         flat = []
+        total = 0
         for block in reversed(blocks):
             flat.append(block)
-            if sum(len(b) for b in flat) >= want:
+            total += len(block)
+            if total >= want:
                 break
         flat.reverse()
         data = []
@@ -224,7 +221,6 @@ class RawRingBuffer:
             data.extend(block)
         if want and len(data) > want:
             data = data[-want:]
-        # Trim to a whole number of frames.
         extra = len(data) % self._num_channels
         return data[extra:] if extra else data
 
@@ -273,10 +269,6 @@ class ClientRegistry:
                       if kind == 'stream']
         for send_queue in queues:
             self._enqueue(send_queue, frame, drop_oldest=True)
-
-    def broadcast_data(self, payload_bytes):
-        """Send a DATA frame to stream clients."""
-        self.broadcast_stream_frame(data_frame(payload_bytes))
 
     def broadcast_message(self, obj):
         """Send a MSG/event to every client, encoded per client kind."""
@@ -357,48 +349,48 @@ class ClientRegistry:
         except CommandError as err:
             reply = {'type': 'response', 'id': cmd_id, 'ok': False,
                      'error': str(err)}
-        except HatError as err:
-            reply = {'type': 'response', 'id': cmd_id, 'ok': False,
-                     'error': 'HatError: {}'.format(err)}
         except (ValueError, KeyError, TypeError) as err:
+            reply = {'type': 'response', 'id': cmd_id, 'ok': False,
+                     'error': '{}: {}'.format(type(err).__name__, err)}
+        except Exception as err:    # noqa: BLE001 - device library errors
             reply = {'type': 'response', 'id': cmd_id, 'ok': False,
                      'error': '{}: {}'.format(type(err).__name__, err)}
         self._enqueue(send_queue, self._encode('control', reply))
 
 
 # --------------------------------------------------------------------------
-# Device controller: owns the MCC 172 and all its configurable state
+# Controller: owns the acquisition devices and all configurable state
 # --------------------------------------------------------------------------
 class Controller:
-    """Serializes access to the MCC 172 and executes laptop commands."""
+    """Serializes access to the devices and executes client commands."""
 
-    def __init__(self, hat, settings, product_name='MCC 172'):
-        self._hat = hat
-        self._product_name = product_name
-        self._lock = threading.RLock()          # guards device + state
+    def __init__(self, backends, settings):
+        self._backends = backends
+        self._chan_map = ChannelMap(backends)
+        self._lock = threading.RLock()          # guards devices + state
         self._control_lock = threading.Lock()   # serializes start/stop
         self._registry = None
 
-        # Mutable device state (the authoritative configuration).
-        self.channels = list(settings['channels'])
+        # Global mutable state, keyed by GLOBAL channel where per-channel.
         self.sample_rate = settings['sample_rate']
-        self.actual_rate = settings['sample_rate']
-        self.clock_source = SourceType.LOCAL
-        self.iepe = {0: 1 if settings['iepe_enable'] else 0,
-                     1: 1 if settings['iepe_enable'] else 0}
-        self.sensitivity = dict(settings['sensitivity'])
-        self.trigger_source = SourceType.LOCAL
-        self.trigger_mode = TriggerModes.RISING_EDGE
-        self.use_trigger = False
-        self.continuous = True
-        self.ext_clock = False
         self.stream_raw = settings.get('stream_raw', False)
+        self.iepe = {}
+        self.sensitivity = {}
+        for dev_cfg_idx, dev_cfg in enumerate(settings['devices']):
+            if dev_cfg_idx >= len(backends):
+                break
+            backend = backends[dev_cfg_idx]
+            for g in self._chan_map.globals_for_device(dev_cfg_idx):
+                _d, local = self._chan_map.resolve(g)
+                self.iepe[g] = 1 if dev_cfg.get('iepe_enable', True) else 0
+                self.sensitivity[g] = dev_cfg.get('sensitivity', {}).get(
+                    local, 1000.0)
 
-        # Fractional-octave band-filter output (optional; needs numpy/scipy).
+        self.use_trigger = False
+        self.trigger_source = None
+        self.trigger_mode = None
+
         self.band_config = dict(settings.get('bands', {'enabled': False}))
-        self._band_bank = None      # active BandFilterBank while running
-
-        # Sound-level-meter processing (frequency + time weighting, storage).
         weighting = settings.get('weighting', {})
         self.freq_weighting = weighting.get('frequency', 'A')
         self.time_weighting = weighting.get('time', 'Fast')
@@ -408,20 +400,21 @@ class Controller:
         storage = settings.get('storage', {})
         self.buffer_seconds = storage.get('buffer_seconds', 60.0)
 
-        # Runtime SLM state, built on start():
-        self._raw_buffer = None
-        self._wsos = None           # broadband frequency-weighting SOS
-        self._wzi = {}              # per-channel weighting filter state
-        self._level = {}            # per-channel ExpLevel (broadband)
-        self._band_level = {}       # (band_index, channel) -> ExpLevel
-        self._band_offset = {}      # band_index -> A/C weighting offset (dB)
+        # Runtime state, rebuilt on start(): all keyed by device index or
+        # global channel as noted.
+        self._raw_buffers = {}      # dev_idx -> RawRingBuffer
+        self._band_banks = {}       # dev_idx -> BandFilterBank
+        self._wsos = {}             # dev_idx -> weighting SOS (rate-specific)
+        self._wzi = {}              # global chan -> filter state
+        self._level = {}            # global chan -> ExpLevel
+        self._band_level = {}       # (dev_idx, band_index, global) -> ExpLevel
+        self._band_offset = {}      # (dev_idx, band_index) -> dB offset
 
         self._running = False
         self._stop_event = threading.Event()
         self._scan_thread = None
 
-        # Apply the initial IEPE + sensitivity so a fresh boot is calibrated
-        # even before the first "start".
+        # Apply initial IEPE + sensitivity so a fresh boot is calibrated.
         self._apply_static_config()
 
     def attach_registry(self, registry):
@@ -433,38 +426,63 @@ class Controller:
         with self._lock:
             return self._running
 
+    @property
+    def channels(self):
+        return list(range(len(self._chan_map)))
+
     def _apply_static_config(self):
-        """Write IEPE + sensitivity to the device (valid only while stopped)."""
         with self._lock:
-            for chan in (0, 1):
-                self._hat.iepe_config_write(chan, self.iepe[chan])
-                self._hat.a_in_sensitivity_write(chan, self.sensitivity[chan])
+            for dev_idx, backend in enumerate(self._backends):
+                iepe_local = {}
+                sens_local = {}
+                for g in self._chan_map.globals_for_device(dev_idx):
+                    _d, local = self._chan_map.resolve(g)
+                    iepe_local[local] = self.iepe.get(g, 1)
+                    sens_local[local] = self.sensitivity.get(g, 1000.0)
+                backend.configure(self.sample_rate, iepe_local, sens_local)
 
     def _require_stopped(self):
         if self._running:
             raise CommandError('a scan is active; send "stop" first')
 
+    def _resolve(self, global_chan):
+        try:
+            return self._chan_map.resolve(int(global_chan))
+        except ValueError as err:
+            raise CommandError(str(err))
+
     def _units(self):
-        return {str(c): ('Pa' if self.sensitivity[c] != 1000 else 'V')
-                for c in self.channels}
+        return {str(g): ('Pa' if self.sensitivity.get(g, 1000.0) != 1000
+                         else 'V') for g in self.channels}
+
+    def _ref_for(self, global_chan):
+        return (20e-6 if self.sensitivity.get(global_chan, 1000.0) != 1000
+                else 1.0)
+
+    def _mcc(self):
+        """First MCC 172 backend, for HAT-specific commands."""
+        for backend in self._backends:
+            if isinstance(backend, Mcc172Backend):
+                return backend
+        raise CommandError('no mcc172 device present')
 
     def config_snapshot(self):
         with self._lock:
             return {
                 'running': self._running,
-                'channels': list(self.channels),
+                'channels': self.channels,
+                'num_channels': len(self._chan_map),
+                'channel_map': self._chan_map.table(self._backends),
+                'devices': [{'index': i, 'type': b.name,
+                             'channels': self._chan_map.globals_for_device(i),
+                             'actual_rate': b.actual_rate}
+                            for i, b in enumerate(self._backends)],
                 'sample_rate': self.sample_rate,
-                'actual_rate': self.actual_rate,
-                'clock_source': self.clock_source.name,
-                'iepe': {str(c): self.iepe[c] for c in self.channels},
-                'sensitivity_mv_per_unit': {str(c): self.sensitivity[c]
-                                            for c in self.channels},
+                'iepe': {str(g): self.iepe.get(g, 0) for g in self.channels},
+                'sensitivity_mv_per_unit': {
+                    str(g): self.sensitivity.get(g, 1000.0)
+                    for g in self.channels},
                 'units': self._units(),
-                'trigger': {'enabled': self.use_trigger,
-                            'source': self.trigger_source.name,
-                            'mode': self.trigger_mode.name},
-                'options': {'continuous': self.continuous,
-                            'ext_clock': self.ext_clock},
                 'stream_raw': self.stream_raw,
                 'bands': {'enabled': bool(self.band_config.get('enabled')),
                           'output': self.band_config.get('output', 'level'),
@@ -477,19 +495,19 @@ class Controller:
                 'level': {'enabled': self.level_enabled,
                           'output_rate': self.level_rate},
                 'storage': {'buffer_seconds': self.buffer_seconds},
+                'clock_sync_note': 'devices are not clock-synchronized',
             }
 
     def handshake(self):
         snap = self.config_snapshot()
         snap.update({'type': 'handshake',
-                     'protocol': 'mcc172-noise-monitor/2',
+                     'protocol': PROTOCOL_VERSION,
                      'dtype': 'float64', 'byte_order': 'little',
-                     'interleave': 'channel-fastest',
-                     'num_channels': len(self.channels)})
-        # When a scan with band output is active, include the full band table
-        # (center frequencies + decimated rates) so the client can demux it.
-        if self._band_bank is not None:
-            snap['band_table'] = self._band_bank.metadata()
+                     'interleave': 'channel-fastest-per-device'})
+        if self._band_banks:
+            snap['band_table'] = [
+                dict(self._band_banks[i].metadata(), device=i)
+                for i in sorted(self._band_banks)]
         return snap
 
     # -- streaming lifecycle ----------------------------------------------
@@ -498,31 +516,29 @@ class Controller:
             with self._lock:
                 if self._running:
                     raise CommandError('already running')
-                # Re-apply the full configuration to the hardware.
-                for chan in (0, 1):
-                    self._hat.iepe_config_write(chan, self.iepe[chan])
-                    self._hat.a_in_sensitivity_write(
-                        chan, self.sensitivity[chan])
-                self._hat.a_in_clock_config_write(
-                    self.clock_source, self.sample_rate)
-                self._wait_for_sync_locked()
+                for dev_idx, backend in enumerate(self._backends):
+                    iepe_local = {}
+                    sens_local = {}
+                    for g in self._chan_map.globals_for_device(dev_idx):
+                        _d, local = self._chan_map.resolve(g)
+                        iepe_local[local] = self.iepe.get(g, 1)
+                        sens_local[local] = self.sensitivity.get(g, 1000.0)
+                    backend.configure(self.sample_rate, iepe_local, sens_local)
                 if self.use_trigger:
-                    self._hat.trigger_config(
-                        self.trigger_source, self.trigger_mode)
+                    self._mcc().trigger_config(self.trigger_source,
+                                               self.trigger_mode)
 
-                options = OptionFlags.DEFAULT
-                if self.continuous:
-                    options |= OptionFlags.CONTINUOUS
-                if self.ext_clock:
-                    options |= OptionFlags.EXTCLOCK
-                if self.use_trigger:
-                    options |= OptionFlags.EXTTRIGGER
+                self._build_processing()
 
-                self._band_bank = self._build_band_bank()
-                self._build_slm()
-
-                self._hat.a_in_scan_start(
-                    channels_to_mask(self.channels), 0, options)
+                started = []
+                try:
+                    for backend in self._backends:
+                        backend.start()
+                        started.append(backend)
+                except Exception:
+                    for backend in started:
+                        backend.stop()
+                    raise
                 self._running = True
                 self._stop_event.clear()
 
@@ -536,51 +552,46 @@ class Controller:
                 self._registry.broadcast_message(snapshot)
             return self.config_snapshot()
 
-    def _build_band_bank(self):
-        """Create the band-filter bank for the current rate/channels, or None
-        if band output is disabled. Import errors disable the feature."""
-        cfg = self.band_config
-        if not cfg.get('enabled'):
-            return None
-        try:
-            from band_filter import BandFilterBank
-        except ImportError as err:
-            print('[bands] disabled (missing dependency: {})'.format(err),
-                  flush=True)
-            return None
-        bank = BandFilterBank(
-            self.actual_rate, self.channels,
-            f_min=cfg.get('f_min', 20.0), f_max=cfg.get('f_max', 20000.0),
-            fraction=cfg.get('fraction', 3), order=cfg.get('order', 6),
-            margin=cfg.get('margin', 1.0))
-        print('[bands] {} bands, {} .. {} Hz'.format(
-            len(bank.bands), cfg.get('f_min'), cfg.get('f_max')), flush=True)
-        return bank
-
-    def _ref_for(self, channel):
-        """SPL reference: 20 uPa when the channel is calibrated to Pa, else 1."""
-        return 20e-6 if self.sensitivity[channel] != 1000 else 1.0
-
-    def _build_slm(self):
-        """Build the sound-level-meter processing state (raw buffer, weighting
-        filters, and time-weighted level integrators) for the current rate."""
-        num_channels = len(self.channels)
-        self._raw_buffer = RawRingBuffer(
-            self.buffer_seconds, num_channels, self.actual_rate)
-        self._wsos = None
+    def _build_processing(self):
+        """(Re)build ring buffers, band banks, weighting filters, and level
+        integrators for the devices' current actual rates."""
+        self._raw_buffers = {}
+        self._band_banks = {}
+        self._wsos = {}
         self._wzi = {}
         self._level = {}
         self._band_level = {}
         self._band_offset = {}
 
+        for dev_idx, backend in enumerate(self._backends):
+            self._raw_buffers[dev_idx] = RawRingBuffer(
+                self.buffer_seconds, backend.num_channels, backend.actual_rate)
+
+        if self.band_config.get('enabled'):
+            try:
+                from band_filter import BandFilterBank
+                for dev_idx, backend in enumerate(self._backends):
+                    cfg = self.band_config
+                    self._band_banks[dev_idx] = BandFilterBank(
+                        backend.actual_rate,
+                        self._chan_map.globals_for_device(dev_idx),
+                        f_min=cfg.get('f_min', 20.0),
+                        f_max=cfg.get('f_max', 20000.0),
+                        fraction=cfg.get('fraction', 3),
+                        order=cfg.get('order', 6),
+                        margin=cfg.get('margin', 1.0))
+            except ImportError as err:
+                print('[bands] disabled (missing dependency: {})'.format(err),
+                      flush=True)
+
         need_level = self.level_enabled
-        need_band_level = (self._band_bank is not None and
+        need_band_level = (self._band_banks and
                            self.band_config.get('output', 'level') == 'level')
         if not (need_level or need_band_level):
             return
         try:
+            import numpy as np
             import slm
-            from scipy import signal as _sig  # noqa: F401 (ensures scipy)
         except ImportError as err:
             print('[slm] level output disabled (missing dependency: {})'
                   .format(err), flush=True)
@@ -589,23 +600,27 @@ class Controller:
 
         tau = slm.tau_for(self.time_weighting)
         if need_level:
-            self._wsos = slm.design_weighting_sos(
-                self.freq_weighting, self.actual_rate)
-            n_sec = self._wsos.shape[0] if self._wsos is not None else 0
-            import numpy as _np
-            for chan in self.channels:
-                self._wzi[chan] = _np.zeros((n_sec, 2))
-                self._level[chan] = slm.ExpLevel(
-                    self.actual_rate, tau, self.level_rate,
-                    ref=self._ref_for(chan))
+            for dev_idx, backend in enumerate(self._backends):
+                self._wsos[dev_idx] = slm.design_weighting_sos(
+                    self.freq_weighting, backend.actual_rate)
+                n_sec = (self._wsos[dev_idx].shape[0]
+                         if self._wsos[dev_idx] is not None else 0)
+                for g in self._chan_map.globals_for_device(dev_idx):
+                    self._wzi[g] = np.zeros((n_sec, 2))
+                    self._level[g] = slm.ExpLevel(
+                        backend.actual_rate, tau, self.level_rate,
+                        ref=self._ref_for(g))
         if need_band_level:
-            for band in self._band_bank.bands:
-                self._band_offset[band['index']] = slm.weighting_offset_db(
-                    self.freq_weighting, band['center'])
-                for chan in self.channels:
-                    self._band_level[(band['index'], chan)] = slm.ExpLevel(
-                        band['decimated_rate'], tau, self.level_rate,
-                        ref=self._ref_for(chan))
+            for dev_idx, bank in self._band_banks.items():
+                for band in bank.bands:
+                    self._band_offset[(dev_idx, band['index'])] = \
+                        slm.weighting_offset_db(
+                            self.freq_weighting, band['center'])
+                    for g in self._chan_map.globals_for_device(dev_idx):
+                        self._band_level[(dev_idx, band['index'], g)] = \
+                            slm.ExpLevel(band['decimated_rate'], tau,
+                                         self.level_rate,
+                                         ref=self._ref_for(g))
 
     def stop(self):
         with self._control_lock:
@@ -618,106 +633,91 @@ class Controller:
             thread.join(timeout=5.0)
         return {'running': self.running}
 
-    def _emit_bands(self, raw_data):
-        """Filter + decimate the raw block and send BAND (waveform) frames."""
-        for band_index, channel, samples in self._band_bank.process(raw_data):
-            frame = band_frame(band_index, channel,
-                               samples.astype('<f8').tobytes())
-            self._registry.broadcast_stream_frame(frame)
-
-    def _emit_levels(self, raw_data):
-        """Apply frequency + Fast time weighting to the broadband signal and
-        send LEVEL frames (time-weighted level in dB)."""
-        import numpy as np
-        from scipy import signal
-        num_channels = len(self.channels)
-        data = np.asarray(raw_data, dtype=np.float64).reshape(-1, num_channels)
-        for ci, chan in enumerate(self.channels):
-            x = data[:, ci]
-            if self._wsos is not None:
-                x, self._wzi[chan] = signal.sosfilt(
-                    self._wsos, x, zi=self._wzi[chan])
-            levels = self._level[chan].process(x)
-            if levels.size:
-                self._registry.broadcast_stream_frame(
-                    level_frame(chan, levels.astype('<f8').tobytes()))
-
-    def _emit_band_levels(self, raw_data):
-        """Time-weight each decimated band and send BAND_LEVEL frames (dB),
-        with the A/C frequency-weighting offset applied per band center."""
-        for band_index, channel, samples in self._band_bank.process(raw_data):
-            integrator = self._band_level.get((band_index, channel))
-            if integrator is None:
-                continue
-            levels = integrator.process(samples)
-            if levels.size:
-                levels = levels + self._band_offset.get(band_index, 0.0)
-                self._registry.broadcast_stream_frame(
-                    band_level_frame(band_index, channel,
-                                     levels.astype('<f8').tobytes()))
-
-    def _wait_for_sync_locked(self):
-        synced = False
-        while not synced:
-            _source, self.actual_rate, synced = \
-                self._hat.a_in_clock_config_read()
-            if not synced:
-                sleep(0.005)
-
     def _acquire(self):
-        """Background scan loop: read blocks and broadcast DATA frames."""
-        num_channels = len(self.channels)
+        """Poll every device for new samples; store, process, broadcast."""
         try:
             while not self._stop_event.is_set():
-                with self._lock:
-                    result = self._hat.a_in_scan_read(READ_ALL_AVAILABLE, 0)
-
-                if result.hardware_overrun or result.buffer_overrun:
-                    kind = ('hardware' if result.hardware_overrun
-                            else 'buffer')
-                    print('[scan] {} overrun'.format(kind), flush=True)
-                    if self._registry:
-                        self._registry.broadcast_message(
-                            {'type': 'event', 'event': 'overrun',
-                             'kind': kind})
-                    break
-
-                if result.data:
-                    # Always store raw for on-demand Leq/Lmax/Lmin/LN metrics.
-                    if self._raw_buffer is not None:
-                        self._raw_buffer.append(result.data)
-                    if self._registry:
-                        if self.stream_raw:
-                            self._registry.broadcast_data(
-                                array('d', result.data).tobytes())
-                        if self.level_enabled and self._level:
-                            self._emit_levels(result.data)
-                        if self._band_bank is not None:
-                            # The band bank is stateful: consume it exactly once
-                            # per block, as waveform OR levels (not both).
-                            if self.band_config.get('output', 'level') == \
-                                    'waveform':
-                                self._emit_bands(result.data)
-                            else:
-                                self._emit_band_levels(result.data)
-                else:
+                got_any = False
+                for dev_idx, backend in enumerate(self._backends):
+                    with self._lock:
+                        data, overrun = backend.read_new()
+                    if overrun:
+                        print('[scan] overrun on device {} ({})'.format(
+                            dev_idx, backend.name), flush=True)
+                        if self._registry:
+                            self._registry.broadcast_message(
+                                {'type': 'event', 'event': 'overrun',
+                                 'device': dev_idx, 'kind': 'buffer'})
+                        return
+                    if not data:
+                        continue
+                    got_any = True
+                    self._raw_buffers[dev_idx].append(data)
+                    if not self._registry:
+                        continue
+                    if self.stream_raw:
+                        self._registry.broadcast_stream_frame(data_frame(
+                            dev_idx, array('d', data).tobytes()))
+                    if self.level_enabled and self._level:
+                        self._emit_levels(dev_idx, backend, data)
+                    bank = self._band_banks.get(dev_idx)
+                    if bank is not None:
+                        if self.band_config.get('output', 'level') == \
+                                'waveform':
+                            self._emit_bands(bank, data)
+                        else:
+                            self._emit_band_levels(dev_idx, bank, data)
+                if not got_any:
                     sleep(0.002)
         finally:
             with self._lock:
-                try:
-                    self._hat.a_in_scan_stop()
-                except HatError:
-                    pass
-                try:
-                    self._hat.a_in_scan_cleanup()
-                except HatError:
-                    pass
-                self._band_bank = None
+                for backend in self._backends:
+                    try:
+                        backend.stop()
+                    except Exception:   # noqa: BLE001
+                        pass
                 self._running = False
             print('[scan] stopped', flush=True)
             if self._registry:
                 self._registry.broadcast_message(
                     {'type': 'event', 'event': 'stopped'})
+
+    def _emit_bands(self, bank, raw_data):
+        """BAND (waveform) frames; bank yields GLOBAL channel labels."""
+        for band_index, g_chan, samples in bank.process(raw_data):
+            self._registry.broadcast_stream_frame(band_frame(
+                band_index, g_chan, samples.astype('<f8').tobytes()))
+
+    def _emit_levels(self, dev_idx, backend, raw_data):
+        """Broadband weighted level (dB) LEVEL frames for one device block."""
+        import numpy as np
+        from scipy import signal
+        data = np.asarray(raw_data, dtype=np.float64).reshape(
+            -1, backend.num_channels)
+        sos = self._wsos.get(dev_idx)
+        for ci, g_chan in enumerate(
+                self._chan_map.globals_for_device(dev_idx)):
+            x = data[:, ci]
+            if sos is not None:
+                x, self._wzi[g_chan] = signal.sosfilt(
+                    sos, x, zi=self._wzi[g_chan])
+            levels = self._level[g_chan].process(x)
+            if levels.size:
+                self._registry.broadcast_stream_frame(level_frame(
+                    g_chan, levels.astype('<f8').tobytes()))
+
+    def _emit_band_levels(self, dev_idx, bank, raw_data):
+        """Per-band weighted level (dB) BAND_LEVEL frames for one block."""
+        for band_index, g_chan, samples in bank.process(raw_data):
+            integrator = self._band_level.get((dev_idx, band_index, g_chan))
+            if integrator is None:
+                continue
+            levels = integrator.process(samples)
+            if levels.size:
+                levels = levels + self._band_offset.get(
+                    (dev_idx, band_index), 0.0)
+                self._registry.broadcast_stream_frame(band_level_frame(
+                    band_index, g_chan, levels.astype('<f8').tobytes()))
 
     # -- command dispatch --------------------------------------------------
     def dispatch(self, request):
@@ -742,52 +742,59 @@ class Controller:
         return self.config_snapshot()
 
     def _cmd_status(self, _req):
-        result = {'running': self._running}
-        if self._running:
-            status = self._hat.a_in_scan_status()
-            result.update({
-                'hardware_overrun': status.hardware_overrun,
-                'buffer_overrun': status.buffer_overrun,
-                'triggered': status.triggered,
-                'samples_available': status.samples_available,
-                'buffer_size': self._hat.a_in_scan_buffer_size()})
-        return result
+        return {'running': self._running,
+                'devices': [{'index': i, 'type': b.name,
+                             'running': b.running,
+                             'actual_rate': b.actual_rate}
+                            for i, b in enumerate(self._backends)]}
 
     def _cmd_info(self, _req):
-        info = self._hat.info()
-        fw = self._hat.firmware_version()
-        return {'address': self._hat.address(),
-                'product_name': self._product_name,
-                'firmware_version': fw.version,
-                'serial': self._hat.serial(),
-                'calibration_date': self._hat.calibration_date(),
-                'num_ai_channels': info.NUM_AI_CHANNELS,
-                'ai_min_voltage': info.AI_MIN_VOLTAGE,
-                'ai_max_voltage': info.AI_MAX_VOLTAGE}
+        return {'devices': [dict(b.info(), index=i,
+                                 channels=self._chan_map.globals_for_device(i))
+                            for i, b in enumerate(self._backends)],
+                'channel_map': self._chan_map.table(self._backends),
+                'num_channels': len(self._chan_map)}
 
     def _cmd_get_sensitivity(self, req):
-        chan = self._channel(req)
-        return {'channel': chan,
-                'sensitivity': self._hat.a_in_sensitivity_read(chan)}
+        g = int(req['channel'])
+        self._resolve(g)
+        return {'channel': g,
+                'sensitivity': self.sensitivity.get(g, 1000.0)}
 
     def _cmd_get_iepe(self, req):
-        chan = self._channel(req)
-        return {'channel': chan, 'mode': self._hat.iepe_config_read(chan)}
+        g = int(req['channel'])
+        self._resolve(g)
+        return {'channel': g, 'mode': self.iepe.get(g, 0)}
 
     def _cmd_get_clock(self, _req):
-        source, rate, synced = self._hat.a_in_clock_config_read()
-        return {'clock_source': SourceType(source).name,
-                'sample_rate': rate, 'synced': synced}
+        return {'devices': [{'index': i, 'type': b.name,
+                             'actual_rate': b.actual_rate}
+                            for i, b in enumerate(self._backends)],
+                'requested_rate': self.sample_rate,
+                'synchronized': False}
 
     def _cmd_calibration_read(self, req):
-        chan = self._channel(req)
-        slope, offset = self._hat.calibration_coefficient_read(chan)
-        return {'channel': chan, 'slope': slope, 'offset': offset}
+        g = int(req['channel'])
+        dev_idx, local = self._resolve(g)
+        backend = self._backends[dev_idx]
+        if not isinstance(backend, Mcc172Backend):
+            raise CommandError('calibration_read is mcc172-only')
+        slope, offset = backend.calibration_read(local)
+        return {'channel': g, 'slope': slope, 'offset': offset}
 
     def _cmd_blink_led(self, req):
         count = int(req.get('count', 1))
-        self._hat.blink_led(count)
-        return {'count': count}
+        blinked = []
+        want = req.get('device')
+        for i, backend in enumerate(self._backends):
+            if want is not None and int(want) != i:
+                continue
+            try:
+                backend.blink(count)
+                blinked.append(i)
+            except Exception:   # noqa: BLE001 - not all devices support it
+                pass
+        return {'count': count, 'devices': blinked}
 
     # ---- streaming ----
     def _cmd_start(self, _req):
@@ -799,69 +806,104 @@ class Controller:
     # ---- configuration handlers (require the scan to be stopped) ----
     def _cmd_set_sensitivity(self, req):
         self._require_stopped()
-        chan = self._channel(req)
+        g = int(req['channel'])
+        dev_idx, local = self._resolve(g)
         value = float(req['value'])
-        self._hat.a_in_sensitivity_write(chan, value)
-        self.sensitivity[chan] = value
-        return {'channel': chan, 'sensitivity': value,
-                'units': self._units().get(str(chan))}
+        self._backends[dev_idx].set_sensitivity(local, value)
+        self.sensitivity[g] = value
+        return {'channel': g, 'sensitivity': value,
+                'units': self._units().get(str(g))}
 
     def _cmd_set_iepe(self, req):
         self._require_stopped()
-        chan = self._channel(req)
+        g = int(req['channel'])
+        dev_idx, local = self._resolve(g)
         mode = 1 if req.get('mode') in (1, '1', True, 'true', 'on') else 0
-        self._hat.iepe_config_write(chan, mode)
-        self.iepe[chan] = mode
-        return {'channel': chan, 'mode': mode}
+        self._backends[dev_idx].set_iepe(local, mode)
+        self.iepe[g] = mode
+        return {'channel': g, 'mode': mode}
 
     def _cmd_set_sample_rate(self, req):
         self._require_stopped()
         rate = float(req['sample_rate'])
-        source = self._source(req.get('clock_source'), self.clock_source)
-        self._hat.a_in_clock_config_write(source, rate)
-        self._wait_for_sync_locked()
         self.sample_rate = rate
-        self.clock_source = source
-        self._raw_buffer = None   # buffered raw no longer matches the rate
-        return {'requested_rate': rate, 'actual_rate': self.actual_rate,
-                'clock_source': source.name}
+        self._apply_static_config()   # each device recomputes its actual rate
+        self._raw_buffers = {}        # buffered raw no longer matches
+        return {'requested_rate': rate,
+                'devices': [{'index': i, 'type': b.name,
+                             'actual_rate': b.actual_rate}
+                            for i, b in enumerate(self._backends)]}
 
     def _cmd_set_channels(self, req):
         self._require_stopped()
+        dev_idx = int(req.get('device', 0))
+        if not 0 <= dev_idx < len(self._backends):
+            raise CommandError('device must be 0..{}'.format(
+                len(self._backends) - 1))
         channels = req.get('channels')
         if not isinstance(channels, list) or not channels:
             raise CommandError('"channels" must be a non-empty list')
-        channels = [int(c) for c in channels]
-        if any(c not in (0, 1) for c in channels):
-            raise CommandError('channels must be a subset of 0, 1')
-        self.channels = channels
-        self._raw_buffer = None   # buffered raw no longer matches channels
-        return {'channels': channels}
+        backend = self._backends[dev_idx]
+        old = backend.channels
+        backend.channels = sorted(set(int(c) for c in channels))
+        try:
+            if backend.name == 'dt9837a' and \
+                    backend.channels != list(range(len(backend.channels))):
+                raise CommandError(
+                    'dt9837a channels must be contiguous from 0')
+            backend.num_channels = len(backend.channels)
+        except CommandError:
+            backend.channels = old
+            backend.num_channels = len(old)
+            raise
+        # Global numbering changes: rebuild the map and per-channel state.
+        self._chan_map = ChannelMap(self._backends)
+        self.iepe = {g: self.iepe.get(g, 1) for g in self.channels}
+        self.sensitivity = {g: self.sensitivity.get(g, 1000.0)
+                            for g in self.channels}
+        self._raw_buffers = {}
+        return {'device': dev_idx, 'channels': backend.channels,
+                'channel_map': self._chan_map.table(self._backends)}
 
     def _cmd_set_trigger(self, req):
         self._require_stopped()
+        from daqhats import SourceType, TriggerModes
+        sources = {'LOCAL': SourceType.LOCAL, 'MASTER': SourceType.MASTER,
+                   'SLAVE': SourceType.SLAVE}
+        modes = {'RISING_EDGE': TriggerModes.RISING_EDGE,
+                 'FALLING_EDGE': TriggerModes.FALLING_EDGE,
+                 'ACTIVE_HIGH': TriggerModes.ACTIVE_HIGH,
+                 'ACTIVE_LOW': TriggerModes.ACTIVE_LOW}
+        self._mcc()   # validate an MCC 172 is present
         enable = req.get('enable', True)
         self.use_trigger = bool(enable) and enable not in ('false', 'off', 0)
-        self.trigger_source = self._source(req.get('source'),
-                                           self.trigger_source)
-        self.trigger_mode = self._trigger_mode(req.get('mode'),
-                                               self.trigger_mode)
+        if 'source' in req:
+            key = str(req['source']).upper()
+            if key not in sources:
+                raise CommandError('source must be one of {}'.format(
+                    list(sources)))
+            self.trigger_source = sources[key]
+        elif self.trigger_source is None:
+            self.trigger_source = SourceType.LOCAL
+        if 'mode' in req:
+            key = str(req['mode']).upper()
+            if key not in modes:
+                raise CommandError('mode must be one of {}'.format(
+                    list(modes)))
+            self.trigger_mode = modes[key]
+        elif self.trigger_mode is None:
+            self.trigger_mode = TriggerModes.RISING_EDGE
         if self.use_trigger:
-            self._hat.trigger_config(self.trigger_source, self.trigger_mode)
-        return {'enabled': self.use_trigger,
+            self._mcc().trigger_config(self.trigger_source, self.trigger_mode)
+        return {'enabled': self.use_trigger, 'device': 'mcc172',
                 'source': self.trigger_source.name,
                 'mode': self.trigger_mode.name}
 
     def _cmd_set_options(self, req):
         self._require_stopped()
-        if 'continuous' in req:
-            self.continuous = bool(req['continuous'])
-        if 'ext_clock' in req:
-            self.ext_clock = bool(req['ext_clock'])
         if 'stream_raw' in req:
             self.stream_raw = bool(req['stream_raw'])
-        return {'continuous': self.continuous, 'ext_clock': self.ext_clock,
-                'stream_raw': self.stream_raw}
+        return {'stream_raw': self.stream_raw}
 
     def _cmd_set_bands(self, req):
         self._require_stopped()
@@ -878,8 +920,6 @@ class Controller:
         for key in ('fraction', 'order'):
             if key in req:
                 cfg[key] = int(req[key])
-        # Build a throwaway bank to validate settings and report the resulting
-        # band table (also surfaces a missing numpy/scipy immediately).
         table = None
         if cfg.get('enabled'):
             try:
@@ -888,12 +928,17 @@ class Controller:
                 raise CommandError(
                     'band output needs numpy + scipy on the Pi ({})'.format(
                         err))
-            bank = BandFilterBank(
-                self.actual_rate, self.channels,
-                f_min=cfg.get('f_min', 20.0), f_max=cfg.get('f_max', 20000.0),
-                fraction=cfg.get('fraction', 3), order=cfg.get('order', 6),
-                margin=cfg.get('margin', 1.0))
-            table = bank.metadata()
+            table = []
+            for dev_idx, backend in enumerate(self._backends):
+                bank = BandFilterBank(
+                    backend.actual_rate,
+                    self._chan_map.globals_for_device(dev_idx),
+                    f_min=cfg.get('f_min', 20.0),
+                    f_max=cfg.get('f_max', 20000.0),
+                    fraction=cfg.get('fraction', 3),
+                    order=cfg.get('order', 6),
+                    margin=cfg.get('margin', 1.0))
+                table.append(dict(bank.metadata(), device=dev_idx))
         return {'enabled': bool(cfg.get('enabled')),
                 'output': cfg.get('output', 'level'),
                 'fraction': cfg.get('fraction', 3),
@@ -934,13 +979,12 @@ class Controller:
             if seconds <= 0:
                 raise CommandError('buffer_seconds must be > 0')
             self.buffer_seconds = seconds
-            self._raw_buffer = None
+            self._raw_buffers = {}
         return {'buffer_seconds': self.buffer_seconds}
 
     def _cmd_get_metrics(self, req):
-        """Compute SLM metrics (Leq, Lmax, Lmin, Lpeak, LN) over the most
-        recent buffered raw data. Works while running or after a stop."""
-        if self._raw_buffer is None:
+        """SLM metrics over the buffered raw data, per global channel."""
+        if not self._raw_buffers:
             raise CommandError('no data buffered yet; start a scan first')
         try:
             import numpy as np
@@ -955,48 +999,55 @@ class Controller:
         pct = req.get('percentiles', [10, 50, 90])
         want = req.get('channels', self.channels)
 
-        flat = self._raw_buffer.get_recent(seconds, self.actual_rate)
-        nch = len(self.channels)
-        if len(flat) < nch:
-            raise CommandError('not enough data buffered')
-        data = np.asarray(flat, dtype=np.float64).reshape(-1, nch)
-
         results = {}
-        for chan in want:
-            if chan not in self.channels:
+        for g in want:
+            g = int(g)
+            try:
+                dev_idx, local = self._chan_map.resolve(g)
+            except ValueError:
                 continue
-            ci = self.channels.index(chan)
+            backend = self._backends[dev_idx]
+            buffer_ = self._raw_buffers.get(dev_idx)
+            if buffer_ is None:
+                continue
+            flat = buffer_.get_recent(seconds, backend.actual_rate)
+            nch = backend.num_channels
+            if len(flat) < nch:
+                continue
+            data = np.asarray(flat, dtype=np.float64).reshape(-1, nch)
+            ci = backend.channels.index(local)
             metrics = slm.window_metrics(
-                data[:, ci], self.actual_rate, weighting=weighting,
-                time_weighting=time_w, ref=self._ref_for(chan),
+                data[:, ci], backend.actual_rate, weighting=weighting,
+                time_weighting=time_w, ref=self._ref_for(g),
                 percentiles=pct)
-            metrics['units'] = self._units().get(str(chan))
-            metrics['calibrated'] = self.sensitivity[chan] != 1000
+            metrics['units'] = self._units().get(str(g))
+            metrics['calibrated'] = self.sensitivity.get(g, 1000.0) != 1000
+            metrics['device'] = dev_idx
             if req.get('include_bands') and self.band_config.get('enabled'):
                 metrics['bands'] = self._band_metrics(
-                    data[:, ci], chan, weighting)
-            results[str(chan)] = metrics
+                    data[:, ci], backend.actual_rate, g, weighting)
+            results[str(g)] = metrics
 
-        return {'sample_rate': self.actual_rate,
-                'requested_seconds': seconds,
-                'channels': results}
+        if not results:
+            raise CommandError('not enough data buffered')
+        return {'requested_seconds': seconds, 'channels': results}
 
-    def _band_metrics(self, x, chan, weighting):
+    def _band_metrics(self, x, rate, g_chan, weighting):
         """Per-band Leq (with A/C offset) over a window, computed on demand."""
-        import numpy as np
         import math
+        import numpy as np
         import slm
         from band_filter import BandFilterBank
         cfg = self.band_config
         bank = BandFilterBank(
-            self.actual_rate, [chan],
+            rate, [g_chan],
             f_min=cfg.get('f_min', 20.0), f_max=cfg.get('f_max', 20000.0),
             fraction=cfg.get('fraction', 3), order=cfg.get('order', 6),
             margin=cfg.get('margin', 1.0))
         segments = {}
         for band_index, _c, samples in bank.process(list(x)):
             segments.setdefault(band_index, []).append(samples)
-        ref2 = self._ref_for(chan) ** 2
+        ref2 = self._ref_for(g_chan) ** 2
         out = []
         for band in bank.bands:
             segs = segments.get(band['index'])
@@ -1012,51 +1063,23 @@ class Controller:
 
     def _cmd_calibration_write(self, req):
         self._require_stopped()
-        chan = self._channel(req)
+        g = int(req['channel'])
+        dev_idx, local = self._resolve(g)
+        backend = self._backends[dev_idx]
+        if not isinstance(backend, Mcc172Backend):
+            raise CommandError('calibration_write is mcc172-only')
         slope = float(req['slope'])
         offset = float(req['offset'])
-        self._hat.calibration_coefficient_write(chan, slope, offset)
-        return {'channel': chan, 'slope': slope, 'offset': offset}
+        backend.calibration_write(local, slope, offset)
+        return {'channel': g, 'slope': slope, 'offset': offset}
 
     def _cmd_test_signals_write(self, req):
         self._require_stopped()
         mode = int(req['mode'])
         clock = int(req.get('clock', 0))
         sync = int(req.get('sync', 0))
-        self._hat.test_signals_write(mode, clock, sync)
+        self._mcc().test_signals_write(mode, clock, sync)
         return {'mode': mode, 'clock': clock, 'sync': sync}
-
-    # -- small parsers -----------------------------------------------------
-    @staticmethod
-    def _channel(req):
-        chan = int(req['channel'])
-        if chan not in (0, 1):
-            raise CommandError('channel must be 0 or 1')
-        return chan
-
-    @staticmethod
-    def _source(value, default):
-        if value is None:
-            return default
-        if isinstance(value, str):
-            key = value.upper()
-            if key not in SOURCE_TYPES:
-                raise CommandError('source must be one of {}'.format(
-                    list(SOURCE_TYPES)))
-            return SOURCE_TYPES[key]
-        return SourceType(int(value))
-
-    @staticmethod
-    def _trigger_mode(value, default):
-        if value is None:
-            return default
-        if isinstance(value, str):
-            key = value.upper()
-            if key not in TRIGGER_MODES:
-                raise CommandError('mode must be one of {}'.format(
-                    list(TRIGGER_MODES)))
-            return TRIGGER_MODES[key]
-        return TriggerModes(int(value))
 
     _HANDLERS = {
         'ping': _cmd_ping,
@@ -1087,26 +1110,25 @@ class Controller:
 
 
 # --------------------------------------------------------------------------
-# Device open + main
+# main
 # --------------------------------------------------------------------------
-def open_mcc172():
-    hats = hat_list(filter_by_id=HatIDs.MCC_172)
-    if not hats:
-        raise HatError(0, 'No MCC 172 HAT device found')
-    descriptor = hats[0]
-    print('[hat] using {} at address {}'.format(
-        descriptor.product_name, descriptor.address), flush=True)
-    return mcc172(descriptor.address), descriptor.product_name
-
-
 def main():
     config_path = os.environ.get(
         'NOISE_MONITOR_CONFIG',
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini'))
     settings = load_config(config_path)
 
-    hat, product_name = open_mcc172()
-    controller = Controller(hat, settings, product_name)
+    backends, errors = open_backends(settings['devices'])
+    for name, err in errors.items():
+        print('[dev] {}: {}'.format(name, err), flush=True)
+    if not backends:
+        raise RuntimeError('no acquisition devices available: {}'.format(
+            errors))
+    for i, backend in enumerate(backends):
+        print('[dev] {}: {} ({} ch)'.format(i, backend.name,
+                                            backend.num_channels), flush=True)
+
+    controller = Controller(backends, settings)
     registry = ClientRegistry(controller, settings['max_queue_blocks'])
     controller.attach_registry(registry)
 
@@ -1147,15 +1169,13 @@ def main():
         # systemd service always runs in the main thread and gets signals.
         pass
 
-    # Auto-start streaming at boot if configured (original headless behavior).
     if settings['autostart']:
         try:
             controller.start()
             print('[scan] autostart: streaming', flush=True)
-        except HatError as err:
+        except Exception as err:    # noqa: BLE001 - report and stay up
             print('[scan] autostart failed: {}'.format(err), flush=True)
 
-    # Accept stream connections in a background thread; control in the main one.
     stream_thread = threading.Thread(
         target=accept_loop, args=(stream_server, 'stream'), daemon=True)
     stream_thread.start()
@@ -1166,24 +1186,23 @@ def main():
         try:
             if controller.running:
                 controller.stop()
-        except HatError:
+        except Exception:   # noqa: BLE001
             pass
         for srv in (control_server, stream_server):
             try:
                 srv.close()
             except OSError:
                 pass
-        # Power the sensors down on exit.
-        for chan in (0, 1):
+        for backend in backends:
             try:
-                hat.iepe_config_write(chan, 0)
-            except HatError:
+                backend.close()
+            except Exception:   # noqa: BLE001
                 pass
 
 
 if __name__ == '__main__':
     try:
         main()
-    except (HatError, ValueError, RuntimeError) as err:
+    except (ValueError, RuntimeError) as err:
         print('\nError: {}'.format(err), file=sys.stderr)
         sys.exit(1)
