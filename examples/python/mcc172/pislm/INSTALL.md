@@ -112,10 +112,26 @@ GND (header pin 9) ------------+-- MCC 172 "GND"   (J5 pin 2)
 
 ## 5. Operating system
 
+**Raspberry Pi OS (64-bit, Lite), Trixie.**
+
+- **Raspberry Pi OS**, not Ubuntu/DietPi: the daqhats installer calls
+  `raspi-config` directly to enable SPI and installs its dependencies with
+  `apt`. Other distributions break that step.
+- **64-bit**: faster numpy/scipy (this system is DSP-bound), and the RAM
+  ring buffer reaches ~740 MB for 6 channels at 300 s.
+- **Lite**: headless measurement node — no desktop background load. The
+  CLI tools (`daqhats_list_boards` etc.) are all still there.
+- **Trixie** ships **libgpiod v2** and **Python 3.13**. Both are supported:
+  daqhats picks its GPIO backend from `pkg-config --modversion libgpiod`
+  and builds `gpio_v2.c` for v2, and PiSLM's trigger tries libgpiod v2
+  before v1 and RPi.GPIO. Trixie support in daqhats is recent, so if
+  anything fails to build, Bookworm is the conservative fallback.
+
+Steps:
+
 1. Flash **Raspberry Pi OS (64-bit, Lite)** with Raspberry Pi Imager. In the
    Imager's settings (gear icon) pre-configure: hostname `pislm`, your user,
-   SSH enabled, and locale. Lite (no desktop) is preferred — less background
-   load and lower power.
+   SSH enabled, and locale.
 2. Boot the Pi, log in over SSH, and update:
 
    ```sh
@@ -126,6 +142,15 @@ GND (header pin 9) ------------+-- MCC 172 "GND"   (J5 pin 2)
 3. Confirm SPI is not claimed by anything else. GPIO-header LCDs and other
    SPI HATs **will** break the MCC 172 — remove their overlays from
    `/boot/firmware/config.txt` if any were ever installed.
+
+4. Check what you actually got — the rest of the manual assumes these:
+
+   ```sh
+   cat /etc/os-release | head -2      # expect trixie
+   dpkg --print-architecture          # expect arm64
+   pkg-config --modversion libgpiod   # expect 2.x on Trixie
+   python3 --version                  # expect 3.13.x
+   ```
 
 ---
 
@@ -164,11 +189,22 @@ cd libuldaq-1.2.1
 ./configure && make
 sudo make install
 sudo ldconfig
-
-# Python binding
-sudo apt install -y python3-pip
-pip3 install uldaq --break-system-packages
 ```
+
+> **Trixie note.** This is the one build in the whole install that is not
+> maintained against Trixie, and it uses the distribution's compiler
+> (Trixie's GCC is much newer than what the release was written for). If
+> `make` stops on an error, the usual fix is to relax the new default
+> diagnostics:
+>
+> ```sh
+> make CFLAGS="-w -std=gnu11" CXXFLAGS="-w -std=gnu++14"
+> ```
+>
+> If it still will not build, that is the point to fall back to Bookworm —
+> everything else here works on either release.
+
+The Python binding is installed into the virtual environment in §8.
 
 Allow non-root USB access:
 
@@ -189,21 +225,44 @@ lsusb | grep -i "data translation"
 
 ---
 
-## 8. Install Python dependencies
+## 8. Python environment
+
+Install the heavy scientific packages from `apt` — Debian's builds are
+optimised for the platform, and letting `pip` compile numpy/scipy on a Pi is
+both slow and slower at runtime:
 
 ```sh
-sudo apt install -y python3-numpy python3-scipy python3-libgpiod
+sudo apt install -y python3-numpy python3-scipy python3-libgpiod python3-venv
 ```
 
-- `numpy` / `scipy` — required for levels, metrics, and band filtering.
-- `python3-libgpiod` — for the GPIO trigger (§4). PiSLM also accepts
-  libgpiod v1 or `RPi.GPIO`, whichever the OS provides.
+- `numpy` / `scipy` — levels, metrics, band filtering, resampling.
+- `python3-libgpiod` — on Trixie this is **libgpiod v2**; PiSLM's trigger
+  detects v2, v1, or `RPi.GPIO` automatically.
 
-Verify:
+Trixie enforces **PEP 668**, so system-wide `pip install` is refused. Create
+a virtual environment that can still see the apt packages, and install the
+device bindings into it:
 
 ```sh
-python3 -c "import numpy, scipy, gpiod; print('deps ok')"
+python3 -m venv --system-site-packages ~/pislm-venv
+~/pislm-venv/bin/pip install daqhats
+~/pislm-venv/bin/pip install uldaq        # only if using the DT9837A
 ```
+
+`--system-site-packages` is what makes the apt numpy/scipy visible inside
+the venv — without it, pip would try to build them from source.
+
+Verify everything imports together:
+
+```sh
+~/pislm-venv/bin/python -c "import numpy, scipy, gpiod, daqhats, uldaq; print('deps ok')"
+```
+
+(Drop `uldaq` from that line if you are not using the DT9837A.)
+
+> Prefer not to use a venv? `sudo pip install daqhats --break-system-packages`
+> works too, but the venv keeps the measurement system independent of OS
+> package updates — worth it on an instrument.
 
 ---
 
@@ -356,7 +415,7 @@ printf '{"id":4,"cmd":"get_metrics","seconds":5,"channels":[0]}\n' \
 
 ```sh
 cd ~/daqhats/examples/python/mcc172/pislm
-python3 pislm.py
+~/pislm-venv/bin/python pislm.py
 ```
 
 Expected output: each device detected, the DSP worker count, and the two
@@ -374,6 +433,9 @@ Stop with Ctrl-C.
 cd ~/daqhats/examples/python/mcc172/pislm
 sudo cp pislm.service /etc/systemd/system/
 sudoedit /etc/systemd/system/pislm.service   # fix User= and the paths
+# ExecStart must point at the venv interpreter, e.g.
+#   ExecStart=/home/pi/pislm-venv/bin/python \
+#             /home/pi/daqhats/examples/python/mcc172/pislm/pislm.py
 sudo systemctl daemon-reload
 sudo systemctl enable --now pislm
 ```
@@ -424,7 +486,10 @@ resampling, keep phase-coherent channel pairs on the same device.
 | Levels ~0 dB or nonsense | IEPE off, or `sensitivity` left at 1000 (data in volts, not Pa). |
 | Level is off by a fixed amount | Recalibrate with the calibrator (§12). |
 | Hum / mains buzz | Ground loop. Use one PSU, bond DGND to earth for floating sources, keep cables away from mains. |
-| `trigger GPIO unavailable` | Missing `python3-libgpiod`, or the pin collides with the MCC 172 (§4). |
+| `trigger GPIO unavailable` | Missing `python3-libgpiod`, or the pin collides with the MCC 172 (§4). On Trixie this package is libgpiod v2, which PiSLM detects automatically. |
+| `error: externally-managed-environment` from pip | Trixie enforces PEP 668. Install into the venv (§8), or append `--break-system-packages`. |
+| `ModuleNotFoundError: daqhats` / `uldaq` under systemd but not by hand | The unit is running the system python. Point `ExecStart` at `~/pislm-venv/bin/python` (§13). |
+| uldaq `make` fails on Trixie | Newer GCC diagnostics; retry with `make CFLAGS="-w -std=gnu11" CXXFLAGS="-w -std=gnu++14"` (§7). |
 | Service dies at boot, works by hand | Wrong `User=`/paths in the unit, or it started before the HAT was ready — `Restart=always` retries; check `journalctl -u pislm`. |
 | Client cannot connect | Check the Pi's IP and that `config.ini` binds `host = 0.0.0.0`. |
 

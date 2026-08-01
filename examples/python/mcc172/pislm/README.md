@@ -86,20 +86,28 @@ command list with request/response schemas, events, and examples).
 | `PROTOCOL.md`          | —            | Communication protocol specification for your client. |
 | `INSTALL.md`           | —            | Full field installation manual (parts, wiring, OS, drivers, calibration, service). |
 
-Python dependencies on the Pi (for the level/metrics DSP):
+Python dependencies on the Pi. Install the scientific stack from `apt`
+(Debian's builds are optimised for the platform), then put the device
+bindings in a venv — Trixie enforces PEP 668, so system-wide `pip` is
+refused:
 
 ```sh
-sudo apt install python3-numpy python3-scipy
+sudo apt install python3-numpy python3-scipy python3-libgpiod python3-venv
+python3 -m venv --system-site-packages ~/pislm-venv
+~/pislm-venv/bin/pip install daqhats
 ```
 
-For the DT9837A, additionally build/install the **uldaq** C library and its
-Python binding (https://github.com/mccdaq/uldaq):
+For the DT9837A, additionally build/install the **uldaq** C library
+(https://github.com/mccdaq/uldaq) and add its binding to the same venv:
 
 ```sh
 sudo apt install gcc g++ make libusb-1.0-0-dev
 # build & install the C library from the uldaq release tarball, then:
-pip3 install uldaq
+~/pislm-venv/bin/pip install uldaq
 ```
+
+See [`INSTALL.md`](INSTALL.md) for the full sequence, including the udev
+rule for non-root USB access and the systemd unit paths.
 
 A device listed in `config.ini` but not attached is skipped at startup with
 a log message — the monitor runs with whatever is present.

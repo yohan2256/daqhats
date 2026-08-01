@@ -11,10 +11,10 @@ Type=simple
 # so the daqhats SPI/EEPROM access matches the interactive install.
 User=pi
 WorkingDirectory=/home/pi/daqhats/examples/python/mcc172/pislm
-# Use the Python where daqhats is installed. If you installed daqhats into
-# a virtual environment, point this at that venv's python, e.g.
-#   /home/pi/daqhats/venv/bin/python
-ExecStart=/usr/bin/python3 /home/pi/daqhats/examples/python/mcc172/pislm/pislm.py
+# Point this at the interpreter that has daqhats/uldaq installed. On Trixie
+# (PEP 668) that is the virtual environment created in INSTALL.md section 8;
+# the system python will NOT have them.
+ExecStart=/home/pi/pislm-venv/bin/python /home/pi/daqhats/examples/python/mcc172/pislm/pislm.py
 # ---------------------------------------------------------------------
 
 # Location of config.ini (optional; defaults to the script's directory).
