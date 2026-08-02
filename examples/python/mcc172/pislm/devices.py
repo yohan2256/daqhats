@@ -66,6 +66,9 @@ class Mcc172Backend:
         self.num_channels = len(self.channels)
         self.actual_rate = 51200.0
         self.running = False
+        # ADC full-scale, for clipping/overload detection -- fixed by the
+        # hardware, not affected by the sensitivity scaling applied on read.
+        self.full_scale_v = abs(mcc172.info().AI_MAX_VOLTAGE)
 
     # -- configuration (call while stopped) --
     def configure(self, rate, iepe, sensitivity_mv):
@@ -183,6 +186,10 @@ class Dt9837aBackend:
     #: seconds of circular buffer allocated for the background scan
     BUFFER_SECONDS = 4.0
 
+    #: uldaq Range enum name -> full-scale volts. Only these two are ever
+    #: registered for the DT9837A (see AiUsb9837x.cpp).
+    _RANGE_VOLTS = {'BIP10VOLTS': 10.0, 'BIP1VOLTS': 1.0}
+
     def __init__(self, channels=None, unique_id=None):
         import uldaq
         self._ul = uldaq
@@ -210,6 +217,12 @@ class Dt9837aBackend:
             raise ValueError('dt9837a has only {} channels'.format(max_chans))
         self.num_channels = len(self.channels)
         self._range = info.get_ranges(self._input_mode())[0]
+        # ADC full-scale, for clipping/overload detection -- fixed by the
+        # selected input range, not affected by the sensitivity scaling
+        # applied on read. Only BIP10VOLTS/BIP1VOLTS are ever registered for
+        # this device (see AiUsb9837x.cpp); default to the wider one if an
+        # unexpected range name shows up rather than raising.
+        self.full_scale_v = self._RANGE_VOLTS.get(self._range.name, 10.0)
         self._buffer = None
         self._view = None
         self._last_total = 0

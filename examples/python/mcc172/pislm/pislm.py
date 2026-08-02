@@ -29,21 +29,30 @@ Two separate TCP ports (see PROTOCOL.md for the full specification):
 
   Streaming port (default 5001) -- typed, length-prefixed binary frames:
           [1-byte type][4-byte little-endian uint32 length][payload]
-      type 0x01 DATA : [4-byte device index] then interleaved little-endian
-                       float64 samples for that device's channels
-                       (channel-fastest within the device).
+      Every payload below ends its fixed header with an 8-byte little-endian
+      uint64 start_index: the index, on that stream's own sample grid (reset
+      to 0 at each start()), of the first sample in the frame. It advances
+      monotonically even across a network-dropped frame, so a client can
+      size a gap exactly (pislm/4; see PROTOCOL.md sec. 1 and 9).
+      type 0x01 DATA : [4-byte device index][8-byte start_index] then
+                       interleaved little-endian float64 samples for that
+                       device's channels (channel-fastest within the device).
       type 0x02 MSG  : UTF-8 JSON (handshake on connect, then events).
       type 0x03 BAND : fractional-octave band waveform.
-                       [4-byte band index][4-byte GLOBAL channel] + float64.
+                       [4-byte band index][4-byte GLOBAL channel]
+                       [8-byte start_index] + float64.
       type 0x04 LEVEL: broadband time-weighted level in dB.
-                       [4-byte GLOBAL channel] + float64 dB samples.
+                       [4-byte GLOBAL channel][8-byte start_index] + float64.
       type 0x05 BAND_LEVEL : per-band time-weighted level in dB.
-                       [4-byte band index][4-byte GLOBAL channel] + float64.
+                       [4-byte band index][4-byte GLOBAL channel]
+                       [8-byte start_index] + float64.
       type 0x06 RAW_DUMP : one chunk of an on-demand "get_raw" dump of the
                        RAM ring buffer. [4-byte dump id][4-byte device index]
-                       [4-byte chunk index][4-byte is_last] + interleaved
-                       float64 (channel-fastest within the device). Chunks
-                       are delivered reliably (blocking, not dropped).
+                       [4-byte chunk index][4-byte is_last][8-byte
+                       start_index -- same grid as DATA for that device] +
+                       interleaved float64 (channel-fastest within the
+                       device). Chunks are delivered reliably (blocking, not
+                       dropped).
 
 Storage note: raw samples live only in RAM (packed float64 ring buffers,
 [storage] buffer_seconds each per device). Nothing is written to the SD
@@ -60,7 +69,9 @@ import socket
 import struct
 import sys
 import threading
+from datetime import datetime, timezone
 from time import monotonic, sleep
+from time import time as wall_time
 
 try:
     import queue
@@ -69,7 +80,7 @@ except ImportError:  # pragma: no cover - Python 2 fallback
 
 from devices import open_backends, ChannelMap, Mcc172Backend
 
-PROTOCOL_VERSION = 'pislm/3'
+PROTOCOL_VERSION = 'pislm/4'
 
 # Downstream frame types.
 TYPE_DATA = 0x01        # raw interleaved waveform (per device)
@@ -78,12 +89,17 @@ TYPE_BAND = 0x03        # decimated fractional-octave band waveform
 TYPE_LEVEL = 0x04       # broadband time-weighted level (dB)
 TYPE_BAND_LEVEL = 0x05  # per-band time-weighted level (dB)
 TYPE_RAW_DUMP = 0x06    # on-demand chunked dump of the buffered raw samples
-FRAME_HEADER = struct.Struct('<BI')       # type byte + payload length
-DATA_HEADER = struct.Struct('<I')         # device index
-BAND_HEADER = struct.Struct('<II')        # band index + global channel
-LEVEL_HEADER = struct.Struct('<I')        # global channel
-BAND_LEVEL_HEADER = struct.Struct('<II')  # band index + global channel
-RAW_DUMP_HEADER = struct.Struct('<IIII')  # dump id, device, chunk idx, is_last
+FRAME_HEADER = struct.Struct('<BI')          # type byte + payload length
+# Every payload header below ends with a u64 start_index: the index (on
+# that stream's own sample grid, reset to 0 at each start()) of the first
+# sample in this frame. It advances monotonically even when a frame is
+# later dropped by network backpressure, so a client can detect and size
+# a gap exactly (see PROTOCOL.md sec. 9).
+DATA_HEADER = struct.Struct('<IQ')            # device index, start_index
+BAND_HEADER = struct.Struct('<IIQ')           # band index, channel, start_index
+LEVEL_HEADER = struct.Struct('<IQ')           # channel, start_index
+BAND_LEVEL_HEADER = struct.Struct('<IIQ')     # band index, channel, start_index
+RAW_DUMP_HEADER = struct.Struct('<IIIIQ')     # dump id, device, chunk, is_last, start_index
 
 # Interleaved samples per RAW_DUMP chunk (x8 bytes = 512 KiB per frame).
 RAW_DUMP_CHUNK = 65536
@@ -260,39 +276,49 @@ def build_frame(frame_type, payload):
     return FRAME_HEADER.pack(frame_type, len(payload)) + payload
 
 
-def data_frame(device_index, payload_bytes):
-    """A DATA frame: [device index] then that device's interleaved float64."""
+def data_frame(device_index, start_index, payload_bytes):
+    """A DATA frame: [device index][start_index] then interleaved float64."""
     return build_frame(TYPE_DATA,
-                       DATA_HEADER.pack(device_index) + payload_bytes)
+                       DATA_HEADER.pack(device_index, start_index) +
+                       payload_bytes)
 
 
 def msg_frame(obj):
     return build_frame(TYPE_MSG, json.dumps(obj).encode('utf-8'))
 
 
-def band_frame(band_index, channel, sample_bytes):
-    """A BAND frame: [band_index][global channel], then decimated float64."""
-    return build_frame(TYPE_BAND,
-                       BAND_HEADER.pack(band_index, channel) + sample_bytes)
+def band_frame(band_index, channel, start_index, sample_bytes):
+    """A BAND frame: [band_index][global channel][start_index], decimated
+    float64."""
+    return build_frame(
+        TYPE_BAND,
+        BAND_HEADER.pack(band_index, channel, start_index) + sample_bytes)
 
 
-def level_frame(channel, sample_bytes):
-    """A LEVEL frame: [global channel], then float64 level(dB) samples."""
-    return build_frame(TYPE_LEVEL, LEVEL_HEADER.pack(channel) + sample_bytes)
+def level_frame(channel, start_index, sample_bytes):
+    """A LEVEL frame: [global channel][start_index], float64 level(dB)."""
+    return build_frame(
+        TYPE_LEVEL, LEVEL_HEADER.pack(channel, start_index) + sample_bytes)
 
 
-def band_level_frame(band_index, channel, sample_bytes):
-    """A BAND_LEVEL frame: [band_index][global channel], then float64 dB."""
+def band_level_frame(band_index, channel, start_index, sample_bytes):
+    """A BAND_LEVEL frame: [band_index][global channel][start_index],
+    float64 dB."""
     return build_frame(
         TYPE_BAND_LEVEL,
-        BAND_LEVEL_HEADER.pack(band_index, channel) + sample_bytes)
+        BAND_LEVEL_HEADER.pack(band_index, channel, start_index) +
+        sample_bytes)
 
 
-def raw_dump_frame(dump_id, device_index, chunk_index, is_last, sample_bytes):
-    """A RAW_DUMP frame: one chunk of a get_raw buffer dump."""
+def raw_dump_frame(dump_id, device_index, chunk_index, is_last, start_index,
+                   sample_bytes):
+    """A RAW_DUMP frame: one chunk of a get_raw buffer dump. start_index is
+    on the same grid as DATA for that device, so a dump lines up exactly
+    with the live stream it was pulled from."""
     return build_frame(
         TYPE_RAW_DUMP,
-        RAW_DUMP_HEADER.pack(dump_id, device_index, chunk_index, is_last) +
+        RAW_DUMP_HEADER.pack(dump_id, device_index, chunk_index, is_last,
+                             start_index) +
         sample_bytes)
 
 
@@ -358,14 +384,38 @@ class RawRingBuffer:
 #               anything the client sends on this port is ignored.
 # --------------------------------------------------------------------------
 class ClientRegistry:
-    """Manages connected clients: fan out data/events, deliver replies."""
+    """Manages connected clients: fan out data/events, deliver replies.
+
+    Each client gets TWO outbound queues, merged in delivery order by one
+    sender thread (a socket can only have one writer at a time, so the two
+    queues cannot each run their own send loop):
+
+    - ``best_effort`` (bounded to ``max_queue_blocks``): DATA and BAND. This
+      is the bulk of the bandwidth, so it drops the oldest queued frame on
+      overflow rather than stalling acquisition for a slow client.
+    - ``reliable`` (bounded, but generously -- its traffic is a tiny
+      fraction of DATA's): LEVEL, BAND_LEVEL, and MSG (events/handshake).
+      These are the sound-level-meter's primary output and its state
+      messages, so they are practically never dropped, without ever
+      blocking the producer thread (see PROTOCOL.md sec. 4).
+    """
+
+    #: LEVEL/BAND_LEVEL/MSG traffic is tiny (~1 KB/s) next to DATA/BAND, so
+    #: this can be large enough to absorb minutes of backlog before a real
+    #: eviction would ever happen.
+    RELIABLE_QUEUE_SIZE = 8192
+
+    _RELIABLE_KINDS = frozenset(('LEVEL', 'BAND_LEVEL', 'MSG'))
 
     def __init__(self, controller, max_queue_blocks):
         self._controller = controller
         self._max_queue_blocks = max_queue_blocks
-        self._clients = {}          # conn -> (kind, queue.Queue of bytes)
+        # conn -> (kind, best_effort queue.Queue, reliable queue.Queue,
+        #          doorbell queue.Queue)
+        self._clients = {}
         self._lock = threading.Lock()
-        self._frames_dropped = 0    # stream frames evicted by a slow client
+        self._frames_dropped = 0          # total, all frame kinds
+        self._frames_dropped_by_type = {}  # frame kind name -> count
 
     @staticmethod
     def _encode(kind, obj):
@@ -375,66 +425,107 @@ class ClientRegistry:
         return (json.dumps(obj) + '\n').encode('utf-8')
 
     def add(self, conn, addr, kind):
-        send_queue = queue.Queue(maxsize=self._max_queue_blocks)
+        best_effort = queue.Queue(maxsize=self._max_queue_blocks)
+        reliable = queue.Queue(maxsize=self.RELIABLE_QUEUE_SIZE)
+        # Wake-up signal only (unbounded, tiny tokens): lets _sender block
+        # until *either* queue has something, with no polling delay -- a
+        # control client's best_effort queue is never fed (only stream
+        # clients get DATA/BAND), so a poll-with-timeout design would have
+        # to wait out a full timeout on every single reply/event.
+        doorbell = queue.Queue()
         with self._lock:
-            self._clients[conn] = (kind, send_queue)
+            self._clients[conn] = (kind, best_effort, reliable, doorbell)
         threading.Thread(target=self._sender,
-                         args=(conn, addr, send_queue), daemon=True).start()
+                         args=(conn, addr, best_effort, reliable, doorbell),
+                         daemon=True).start()
         threading.Thread(target=self._reader,
-                         args=(conn, addr, send_queue, kind),
+                         args=(conn, addr, reliable, doorbell, kind),
                          daemon=True).start()
         # Greet the new client with the current configuration.
-        self._enqueue(send_queue,
-                      self._encode(kind, self._controller.handshake()))
+        self._enqueue(reliable, self._encode(kind, self._controller.handshake()),
+                     doorbell=doorbell)
         print('[net] {} client connected: {}'.format(kind, addr), flush=True)
 
-    def broadcast_stream_frame(self, frame):
-        """Send a prebuilt frame to stream clients, dropping oldest on
-        overflow (so a slow client never stalls acquisition)."""
+    def broadcast_stream_frame(self, frame, kind_name):
+        """Send a prebuilt frame to stream clients.
+
+        ``kind_name`` is one of 'DATA', 'BAND', 'LEVEL', 'BAND_LEVEL' and
+        selects which queue/drop policy applies (see the class docstring).
+        """
+        reliable = kind_name in self._RELIABLE_KINDS
         with self._lock:
-            queues = [q for (kind, q) in self._clients.values()
-                      if kind == 'stream']
-        dropped = sum(1 for send_queue in queues
-                     if self._enqueue(send_queue, frame, drop_oldest=True))
+            targets = [(be, rel, bell) for (kind, be, rel, bell)
+                      in self._clients.values() if kind == 'stream']
+        q_index = 1 if reliable else 0
+        dropped = 0
+        for t in targets:
+            if self._enqueue(t[q_index], frame, doorbell=t[2],
+                             drop_oldest=True):
+                dropped += 1
         if dropped:
             with self._lock:
                 self._frames_dropped += dropped
+                self._frames_dropped_by_type[kind_name] = (
+                    self._frames_dropped_by_type.get(kind_name, 0) + dropped)
 
     def stream_frames_dropped(self):
         with self._lock:
             return self._frames_dropped
 
-    def broadcast_message(self, obj):
-        """Send a MSG/event to every client, encoded per client kind."""
+    def stream_frames_dropped_by_type(self):
         with self._lock:
-            targets = list(self._clients.values())
-        for kind, send_queue in targets:
-            self._enqueue(send_queue, self._encode(kind, obj))
+            return dict(self._frames_dropped_by_type)
+
+    def broadcast_message(self, obj):
+        """Send a MSG/event to every client (both kinds), encoded per
+        client kind, via the reliable queue -- an event lost to backpressure
+        would leave a client's state permanently out of sync."""
+        with self._lock:
+            targets = [(kind, rel, bell) for (kind, _be, rel, bell)
+                      in self._clients.values()]
+        dropped = 0
+        for kind, reliable, bell in targets:
+            if self._enqueue(reliable, self._encode(kind, obj),
+                             doorbell=bell, drop_oldest=True):
+                dropped += 1
+        if dropped:
+            with self._lock:
+                self._frames_dropped += dropped
+                self._frames_dropped_by_type['MSG'] = (
+                    self._frames_dropped_by_type.get('MSG', 0) + dropped)
 
     def stream_client_count(self):
         with self._lock:
-            return sum(1 for (kind, _q) in self._clients.values()
+            return sum(1 for (kind, _be, _rel, _bell) in self._clients.values()
                        if kind == 'stream')
 
     def send_stream_reliable(self, frame, timeout=30.0):
         """Send a frame to stream clients WITHOUT dropping it when the queue
         is full: block until there is room (or the per-client timeout runs
-        out). Used for get_raw dumps, where every chunk matters."""
+        out). Used for get_raw dumps, where every chunk matters. Shares the
+        best_effort queue with DATA/BAND (documented: live frames continue
+        and interleave with a dump) -- this call runs on its own thread
+        (see _cmd_get_raw), so blocking here never stalls acquisition."""
         with self._lock:
-            queues = [q for (kind, q) in self._clients.values()
-                      if kind == 'stream']
-        for send_queue in queues:
+            targets = [(be, bell) for (kind, be, _rel, bell)
+                      in self._clients.values() if kind == 'stream']
+        for send_queue, bell in targets:
             try:
                 send_queue.put(frame, timeout=timeout)
+                bell.put_nowait(None)
             except queue.Full:
                 pass    # client stalled for the whole timeout; it loses this chunk
 
     @staticmethod
-    def _enqueue(send_queue, frame, drop_oldest=False):
+    def _enqueue(send_queue, frame, doorbell=None, drop_oldest=False):
         """Return True if an already-queued frame had to be evicted (i.e. a
-        frame was lost to a slow consumer), False otherwise."""
+        frame was lost to a slow consumer), False otherwise. Rings
+        ``doorbell`` (if given) whenever the frame actually got queued, so
+        _sender's wait wakes up immediately instead of polling."""
         try:
             send_queue.put_nowait(frame)
+            if doorbell is not None:
+                doorbell.put_nowait(None)
             return False
         except queue.Full:
             if not drop_oldest:
@@ -445,6 +536,8 @@ class ClientRegistry:
                 pass
             try:
                 send_queue.put_nowait(frame)
+                if doorbell is not None:
+                    doorbell.put_nowait(None)
             except queue.Full:
                 pass
             return True
@@ -453,10 +546,22 @@ class ClientRegistry:
         with self._lock:
             self._clients.pop(conn, None)
 
-    def _sender(self, conn, addr, send_queue):
+    def _sender(self, conn, addr, best_effort, reliable, doorbell):
+        """Merge both queues onto the one socket, in send order: drain
+        whatever is ready right now (reliable first -- its volume is tiny,
+        so this never meaningfully delays best_effort), then block on the
+        doorbell -- rung by every successful enqueue on either queue -- so
+        this wakes up immediately on new data with no polling delay."""
         try:
             while True:
-                frame = send_queue.get()
+                try:
+                    frame = reliable.get_nowait()
+                except queue.Empty:
+                    try:
+                        frame = best_effort.get_nowait()
+                    except queue.Empty:
+                        doorbell.get()   # blocks until something is enqueued
+                        continue
                 if frame is None:
                     break
                 conn.sendall(frame)
@@ -470,9 +575,11 @@ class ClientRegistry:
                 pass
             print('[net] client disconnected: {}'.format(addr), flush=True)
 
-    def _reader(self, conn, addr, send_queue, kind):
+    def _reader(self, conn, addr, reply_queue, doorbell, kind):
         """For control clients, read newline-delimited JSON commands and reply
-        on their queue. For stream clients, just watch for disconnect."""
+        on the reliable queue. For stream clients, just watch for
+        disconnect. Replies go on the reliable queue (same as events), so
+        responses and events stay in one strict FIFO per connection."""
         buf = bytearray()
         try:
             while True:
@@ -485,14 +592,15 @@ class ClientRegistry:
                 while b'\n' in buf:
                     line, _, rest = buf.partition(b'\n')
                     buf = bytearray(rest)
-                    self._handle_line(line, send_queue)
+                    self._handle_line(line, reply_queue, doorbell)
         except (OSError, socket.error):
             pass
         finally:
             self._remove(conn)
-            self._enqueue(send_queue, None)   # unblock the sender
+            # unblock the sender
+            self._enqueue(reply_queue, None, doorbell=doorbell)
 
-    def _handle_line(self, line, send_queue):
+    def _handle_line(self, line, reply_queue, doorbell):
         text = line.decode('utf-8', errors='replace').strip()
         if not text:
             return
@@ -514,7 +622,8 @@ class ClientRegistry:
         except Exception as err:    # noqa: BLE001 - device library errors
             reply = {'type': 'response', 'id': cmd_id, 'ok': False,
                      'error': '{}: {}'.format(type(err).__name__, err)}
-        self._enqueue(send_queue, self._encode('control', reply))
+        self._enqueue(reply_queue, self._encode('control', reply),
+                     doorbell=doorbell)
 
 
 # --------------------------------------------------------------------------
@@ -589,6 +698,19 @@ class Controller:
         self._scan_thread = None
         self._dump_id = 0           # sequence for get_raw dumps
 
+        # pislm/4 per-stream sample counters -- the index (on that stream's
+        # own grid) of the NEXT sample to be emitted, reset to 0 at start().
+        # These advance even when a frame is later dropped by network
+        # backpressure, so start_index always reflects true elapsed samples
+        # produced, letting a client size a gap exactly.
+        self._data_count = {}        # dev_idx -> count (also the RAW_DUMP grid)
+        self._level_count = {}       # global chan -> count
+        self._band_count = {}        # (band_index, global chan) -> count
+        self._band_level_count = {}  # (band_index, global chan) -> count
+        self._epoch = None           # set at start(): ties index 0 to wall time
+        self._overload_count = {}    # global chan -> cumulative clipped samples
+        self._overload_last_emit = {}  # global chan -> monotonic time of last event
+
         # Rate tracking is always on, so the clock figures are available
         # from the first handshake; start() rebuilds these for the rates the
         # devices actually settle on.
@@ -645,6 +767,34 @@ class Controller:
         if self._resamplers:
             return float(self.resample_cfg.get('output_rate', 48000.0))
         return self._backends[dev_idx].actual_rate
+
+    @staticmethod
+    def _next_index(table, key, n):
+        """Advance a pislm/4 per-stream sample counter by n samples and
+        return the index the *next* n samples start at (i.e. the value the
+        counter had before this call). One counter per (stream, key) --
+        device for DATA, global channel for LEVEL, (band, channel) for
+        BAND/BAND_LEVEL -- shared by the inline and DSP-pool code paths so
+        both advance it identically. Called once per produced block,
+        independent of whether the resulting frame is later dropped by
+        network backpressure, so the index always reflects true elapsed
+        samples."""
+        start = table.get(key, 0)
+        table[key] = start + n
+        return start
+
+    def _make_epoch(self):
+        """Wall-clock/monotonic reference for sample index 0 of this scan."""
+        now_wall = wall_time()
+        return {
+            'index': 0,
+            'unix': now_wall,
+            'utc': datetime.fromtimestamp(
+                now_wall, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+            'monotonic': monotonic(),
+            'source': 'system_clock',
+            'note': 'NTP synchronization is not guaranteed',
+        }
 
     def _ref_for(self, global_chan):
         return (20e-6 if self.sensitivity.get(global_chan, 1000.0) != 1000
@@ -710,12 +860,18 @@ class Controller:
                 'clock_sync_note': ('shared-trigger start aligns scan start; '
                                     'ADC clocks still drift (~ppm) between '
                                     'devices'),
+                'epoch': self._epoch,
+                'overload': {str(g): self._overload_count.get(g, 0)
+                            for g in self.channels},
                 'network': {
                     'stream_clients': (self._registry.stream_client_count()
                                        if self._registry else 0),
                     'stream_frames_dropped': (
                         self._registry.stream_frames_dropped()
                         if self._registry else 0),
+                    'stream_frames_dropped_by_type': (
+                        self._registry.stream_frames_dropped_by_type()
+                        if self._registry else {}),
                 },
             }
 
@@ -870,6 +1026,16 @@ class Controller:
         self._level = {}
         self._band_level = {}
         self._band_offset = {}
+
+        # A new scan is a new time axis: every per-stream sample counter and
+        # overload tally starts over at 0.
+        self._data_count = {}
+        self._level_count = {}
+        self._band_count = {}
+        self._band_level_count = {}
+        self._overload_count = {g: 0 for g in self.channels}
+        self._overload_last_emit = {}
+        self._epoch = self._make_epoch()
 
         self._build_clock_sync()
         for dev_idx, backend in enumerate(self._backends):
@@ -1068,6 +1234,10 @@ class Controller:
                             self._registry.broadcast_message(
                                 {'type': 'event', 'event': 'triggered',
                                  'device': dev_idx})
+                    # Clipping is checked on the raw ADC block, before any
+                    # resampling could smear a hard clip's edge.
+                    if self._registry:
+                        self._check_overload(dev_idx, backend, data, now)
                     # Track the device's true rate against the Pi clock, and
                     # convert to the common grid if resampling is on. The
                     # Pi's own clock error cancels in the ratio between two
@@ -1088,11 +1258,19 @@ class Controller:
                     # The backend hands us a float64 array; the ring buffer,
                     # the DATA frame, and the DSP all share that one buffer.
                     self._raw_buffers[dev_idx].append(data)
+                    # This counter is the DATA/RAW_DUMP grid for this device;
+                    # advance it unconditionally (ring buffer always gets the
+                    # data) so get_raw's start_index lines up with DATA even
+                    # when stream_raw is off.
+                    data_start = self._next_index(
+                        self._data_count, dev_idx,
+                        data.size // backend.num_channels)
                     if not self._registry:
                         continue
                     if self.stream_raw:
-                        self._registry.broadcast_stream_frame(data_frame(
-                            dev_idx, data.tobytes()))
+                        self._registry.broadcast_stream_frame(
+                            data_frame(dev_idx, data_start, data.tobytes()),
+                            'DATA')
                     if self._pool is not None:
                         # (frames, channels) view -- no copy.
                         self._pool.submit(
@@ -1125,19 +1303,75 @@ class Controller:
                 self._registry.broadcast_message(
                     {'type': 'event', 'event': 'stopped'})
 
+    #: fraction of ADC full-scale counted as clipped (matched against the
+    #: raw voltage reconstructed from the calibrated sample, not the
+    #: calibrated value itself -- clipping happens at the ADC, and judging
+    #: it post-calibration would make the threshold move with sensitivity).
+    _OVERLOAD_THRESHOLD = 0.99
+
+    def _check_overload(self, dev_idx, backend, raw_block, now):
+        """Flag ADC clipping per channel, throttled to at most one event per
+        channel per level-output period; tallies persist even when
+        throttled so get_config/handshake can report the full count."""
+        full_scale = getattr(backend, 'full_scale_v', None)
+        if not full_scale:
+            return
+        import numpy as np
+        block = raw_block.reshape(-1, backend.num_channels)
+        threshold = self._OVERLOAD_THRESHOLD * full_scale
+        period = (1.0 / self.level_rate) if self.level_rate > 0 else 1.0
+        globals_ = self._chan_map.globals_for_device(dev_idx)
+        dev_start = self._data_count.get(dev_idx, 0)
+        for ci, g in enumerate(globals_):
+            sens = self.sensitivity.get(g, 1000.0) / 1000.0  # mV/unit -> V/unit
+            col = block[:, ci]
+            raw_volts = col * sens if sens else col
+            clipped = np.abs(raw_volts) >= threshold
+            n_clip = int(clipped.sum())
+            if n_clip == 0:
+                continue
+            self._overload_count[g] = self._overload_count.get(g, 0) + n_clip
+            last = self._overload_last_emit.get(g, 0.0)
+            if now - last < period:
+                continue
+            self._overload_last_emit[g] = now
+            peak = float(np.max(np.abs(raw_volts)))
+            self._registry.broadcast_message({
+                'type': 'event', 'event': 'overload',
+                'device': dev_idx, 'channel': g,
+                'start_index': dev_start, 'samples': n_clip,
+                'peak': peak, 'units': 'V', 'full_scale': full_scale,
+            })
+
     _POOL_FRAME_BUILDERS = {
         'level': level_frame,
         'band': band_frame,
         'band_level': band_level_frame,
+    }
+    # kind -> (counter table attr, key-from-args function). 'level' args are
+    # (channel,); 'band'/'band_level' args are (band_index, channel) -- the
+    # same shape the inline path keys its counters with (see _emit_bands
+    # etc.), so pool and inline runs advance identical counters.
+    _POOL_COUNTER_TABLE = {
+        'level': ('_level_count', lambda args: args[0]),
+        'band': ('_band_count', lambda args: args),
+        'band_level': ('_band_level_count', lambda args: args),
+    }
+    _POOL_KIND_NAMES = {
+        'level': 'LEVEL', 'band': 'BAND', 'band_level': 'BAND_LEVEL',
     }
 
     def _emit_pool_frames(self):
         """Broadcast whatever the DSP workers have finished."""
         for kind, args, payload in self._pool.drain():
             builder = self._POOL_FRAME_BUILDERS.get(kind)
-            if builder is not None:
-                self._registry.broadcast_stream_frame(
-                    builder(*(args + (payload,))))
+            if builder is None:
+                continue
+            table_name, key_fn = self._POOL_COUNTER_TABLE[kind]
+            table = getattr(self, table_name)
+            start = self._next_index(table, key_fn(args), len(payload) // 8)
+            self._registry.broadcast_stream_frame(
+                builder(*(args + (start, payload))), self._POOL_KIND_NAMES[kind])
         if self._pool.errors:
             for wid, err in self._pool.errors:
                 print('[dsp] worker {} error: {}'.format(wid, err), flush=True)
@@ -1157,8 +1391,11 @@ class Controller:
     def _emit_bands(self, bank, raw_data):
         """BAND (waveform) frames; bank yields GLOBAL channel labels."""
         for band_index, g_chan, samples in bank.process(raw_data):
-            self._registry.broadcast_stream_frame(band_frame(
-                band_index, g_chan, samples.astype('<f8').tobytes()))
+            start = self._next_index(
+                self._band_count, (band_index, g_chan), samples.size)
+            self._registry.broadcast_stream_frame(
+                band_frame(band_index, g_chan, start,
+                          samples.astype('<f8').tobytes()), 'BAND')
 
     def _emit_levels(self, dev_idx, backend, raw_data):
         """Broadband weighted level (dB) LEVEL frames for one device block."""
@@ -1175,8 +1412,11 @@ class Controller:
                     sos, x, zi=self._wzi[g_chan])
             levels = self._level[g_chan].process(x)
             if levels.size:
-                self._registry.broadcast_stream_frame(level_frame(
-                    g_chan, levels.astype('<f8').tobytes()))
+                start = self._next_index(
+                    self._level_count, g_chan, levels.size)
+                self._registry.broadcast_stream_frame(
+                    level_frame(g_chan, start, levels.astype('<f8').tobytes()),
+                    'LEVEL')
 
     def _emit_band_levels(self, dev_idx, bank, raw_data):
         """Per-band weighted level (dB) BAND_LEVEL frames for one block."""
@@ -1188,8 +1428,12 @@ class Controller:
             if levels.size:
                 levels = levels + self._band_offset.get(
                     (dev_idx, band_index), 0.0)
-                self._registry.broadcast_stream_frame(band_level_frame(
-                    band_index, g_chan, levels.astype('<f8').tobytes()))
+                start = self._next_index(
+                    self._band_level_count, (band_index, g_chan), levels.size)
+                self._registry.broadcast_stream_frame(
+                    band_level_frame(band_index, g_chan, start,
+                                     levels.astype('<f8').tobytes()),
+                    'BAND_LEVEL')
 
     # -- command dispatch --------------------------------------------------
     def dispatch(self, request):
@@ -1723,15 +1967,21 @@ class Controller:
             if len(data) < nch:
                 continue
             total_chunks = (len(data) + RAW_DUMP_CHUNK - 1) // RAW_DUMP_CHUNK
-            plan.append((dev_idx, data, total_chunks))
+            samples_per_channel = len(data) // nch
+            # Same grid as DATA for this device: the ring buffer holds the
+            # most recent samples, so the dump's first sample is this many
+            # samples behind the device's running total.
+            dump_start = self._data_count.get(dev_idx, 0) - samples_per_channel
+            plan.append((dev_idx, data, total_chunks, dump_start, nch))
             info.append({
                 'device': dev_idx,
                 'channels': self._chan_map.globals_for_device(dev_idx),
                 'num_channels': nch,
                 'sample_rate': rate,
-                'samples_per_channel': len(data) // nch,
+                'samples_per_channel': samples_per_channel,
                 'seconds': round(len(data) / nch / rate, 3),
                 'total_chunks': total_chunks,
+                'start_index': dump_start,
             })
         if not plan:
             raise CommandError('not enough data buffered')
@@ -1739,13 +1989,15 @@ class Controller:
         registry = self._registry
 
         def send_dump():
-            for dev_idx, dump_data, total_chunks in plan:
+            for dev_idx, dump_data, total_chunks, dump_start, nch in plan:
                 for i in range(total_chunks):
                     chunk = dump_data[i * RAW_DUMP_CHUNK:
                                       (i + 1) * RAW_DUMP_CHUNK]
+                    chunk_start = dump_start + i * (RAW_DUMP_CHUNK // nch)
                     registry.send_stream_reliable(raw_dump_frame(
                         dump_id, dev_idx, i,
-                        1 if i == total_chunks - 1 else 0, chunk.tobytes()))
+                        1 if i == total_chunks - 1 else 0, chunk_start,
+                        chunk.tobytes()))
 
         threading.Thread(target=send_dump, daemon=True).start()
         return {'dump_id': dump_id, 'chunk_samples': RAW_DUMP_CHUNK,

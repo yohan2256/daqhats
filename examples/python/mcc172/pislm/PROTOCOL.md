@@ -4,7 +4,9 @@ Wire specification for talking to `pislm.py` running on the
 Raspberry Pi. It is language-agnostic: any TCP client that follows this
 document can receive levels/waveforms and control the acquisition devices.
 
-- **Protocol version:** `pislm/3` (see the handshake).
+- **Protocol version:** `pislm/4` (see the handshake). Every stream frame
+  header ends with a `start_index` (§2), and the handshake carries an
+  `epoch` (§3) and per-channel `overload` counts (§3, §4).
 - **Devices:** up to two IEPE acquisition devices — an MCC 172 DAQ HAT
   (2 channels) and a Data Translation DT9837A (4 channels) — for **6
   channels total**. Channels are numbered **globally** in device order
@@ -73,12 +75,17 @@ Everything the server sends here is a **typed, length-prefixed frame**:
 ```
 
 - `length` is the payload size in bytes (does **not** include the 5-byte header).
-- Two frame types:
+- Six frame types. Every payload below (except MSG, which is JSON) ends its
+  fixed-width header with an 8-byte little-endian `uint64` **start_index**:
+  the index, on that stream's own sample grid, of the first sample in the
+  frame. It is reset to 0 at each `start()` and advances monotonically even
+  when a frame is later dropped by network backpressure (§6), so a client
+  can size a gap exactly. See §9 for the client-side gap-detection recipe.
 
 | type | name | payload |
 |:----:|------|---------|
-| `0x01` | DATA | `[4-byte device index]` + raw interleaved `float64` for that device, see §2.1. |
-| `0x02` | MSG  | A UTF-8 JSON object (handshake on connect, then events). |
+| `0x01` | DATA | `[4-byte device index][8-byte start_index]` + raw interleaved `float64` for that device, see §2.1. |
+| `0x02` | MSG  | A UTF-8 JSON object (handshake on connect, then events). No start_index (not a sample stream). |
 | `0x03` | BAND | Fractional-octave band **waveform** (decimated), see §2.2. |
 | `0x04` | LEVEL | Broadband time-weighted **level** (dB), see §2.3. |
 | `0x05` | BAND_LEVEL | Per-band time-weighted **level** (dB), see §2.4. |
@@ -89,12 +96,12 @@ Everything the server sends here is a **typed, length-prefixed frame**:
 ```
 read 5 bytes -> (type, length)
 read `length` bytes -> payload
-if type == 0x01: device,float64[]         = payload            # raw waveform
-if type == 0x02: json                     = payload            # msg / event
-if type == 0x03: band_index,channel,float64[]  = payload       # band waveform
-if type == 0x04: channel,float64[]        = payload            # level dB
-if type == 0x05: band_index,channel,float64[]  = payload       # band level dB
-if type == 0x06: dump_id,device,chunk,is_last,float64[] = payload  # raw dump
+if type == 0x01: device,start_index,float64[]              = payload  # raw waveform
+if type == 0x02: json                                      = payload  # msg / event
+if type == 0x03: band_index,channel,start_index,float64[]  = payload  # band waveform
+if type == 0x04: channel,start_index,float64[]              = payload  # level dB
+if type == 0x05: band_index,channel,start_index,float64[]  = payload  # band level dB
+if type == 0x06: dump_id,device,chunk,is_last,start_index,float64[] = payload  # raw dump
 ```
 
 All `channel` fields are **global** channel numbers; `device` is the index
@@ -109,7 +116,7 @@ frames only when band output mode is `waveform`.
 ### 2.1 DATA payload layout
 
 ```
-payload = [4-byte device uint32][interleaved float64 samples...]
+payload = [4-byte device uint32][8-byte start_index uint64][interleaved float64 samples...]
 ```
 
 Each DATA frame carries one **device's** block. The samples are
@@ -123,8 +130,12 @@ where `chA, chB, ...` are the device's channels in ascending order — their
 **global** numbers are `devices[device].channels` in the handshake.
 
 - Channels in the frame = `len(devices[device].channels)`.
-- Samples per channel in a frame = `(length - 4) / 8 / num_device_channels`.
+- Samples per channel in a frame = `(length - 12) / 8 / num_device_channels`.
 - Devices produce independent DATA frames (their clocks are not synced).
+- `start_index` is on the device's **effective** rate grid (`resample.output_rate`
+  when resampling is active, else the device's `actual_rate`) — the same grid
+  `RAW_DUMP` uses for this device, so a `get_raw` dump lines up exactly with
+  the live DATA stream it was pulled from.
 - Sample **value units** depend on calibration (see §5): volts (`V`) when the
   channel's sensitivity is `1000`, pascals (`Pa`) otherwise.
 
@@ -141,8 +152,8 @@ just above twice its upper edge, and sends the result as BAND frames — one
 frame per band per channel per block:
 
 ```
-payload = [4-byte band_index uint32][4-byte channel uint32][decimated float64 samples...]
-          |------------- 8-byte header ---------------|
+payload = [4-byte band_index uint32][4-byte channel uint32][8-byte start_index uint64][decimated float64 samples...]
+          |----------------------- 16-byte header -----------------------|
 ```
 
 - `band_index` maps to the `band_table` in the handshake (§3). The table is
@@ -150,7 +161,10 @@ payload = [4-byte band_index uint32][4-byte channel uint32][decimated float64 sa
   actual sample rate); resolve the channel's device via `channel_map`, then
   look the band up in that device's table entry.
 - `channel` is the **global** channel number.
-- Sample count in a frame = `(length - 8) / 8`.
+- Sample count in a frame = `(length - 16) / 8`.
+- `start_index` is on **that band's own** decimated rate grid (its
+  `decimated_rate` in `band_table`) -- every band advances its own counter
+  independently, since bands decimate by different amounts.
 - Low-frequency bands decimate heavily and therefore emit frames
   infrequently; high bands emit often. Frames with zero samples are not sent.
 - The band samples are in the same units as the raw stream (Pa when the
@@ -176,13 +190,16 @@ broadband signal and streams the resulting level in dB, downsampled to the
 level output rate.
 
 ```
-payload = [4-byte channel uint32][level float64 samples...]   # dB
+payload = [4-byte channel uint32][8-byte start_index uint64][level float64 samples...]   # dB
 ```
 
-- Sample count = `(length - 4) / 8`; the sample rate is `level.output_rate`
-  from the handshake (e.g. 10 Hz).
+- Sample count = `(length - 12) / 8`; the sample rate is `level.output_rate`
+  from the handshake (e.g. 10 Hz), and `start_index` is on that same grid,
+  counted independently per channel.
 - dB reference is 20 µPa when the channel is calibrated to Pa, else 1.0
   (see `units` in the handshake). This is L_AF, L_ZF, etc. per the weighting.
+- LEVEL frames are **never dropped** by network backpressure (§6) — this is
+  the meter's primary output.
 
 ### 2.4 BAND_LEVEL frames (type `0x05`) — per-band time-weighted level
 
@@ -191,11 +208,15 @@ decimated signal is Fast/Slow/Impulse time-weighted, and the A/C
 frequency-weighting **offset for that band's center frequency** is added.
 
 ```
-payload = [4-byte band_index uint32][4-byte channel uint32][level float64 samples...]  # dB
+payload = [4-byte band_index uint32][4-byte channel uint32][8-byte start_index uint64][level float64 samples...]  # dB
 ```
 
 - `band_index` maps to the handshake `band_table`; sample rate is
-  `level.output_rate`. This is what you display as bars in an octave analyzer.
+  `level.output_rate`, and `start_index` is on that grid, counted
+  independently per (band, channel) pair. This is what you display as bars
+  in an octave analyzer.
+- Like LEVEL, BAND_LEVEL frames are **never dropped** by network
+  backpressure (§6).
 
 ### 2.5 RAW_DUMP frames (type `0x06`) — on-demand buffer dump
 
@@ -207,6 +228,7 @@ clients** as a sequence of chunked frames:
 ```
 payload = [4-byte dump_id uint32][4-byte device uint32]
           [4-byte chunk_index uint32][4-byte is_last uint32]
+          [8-byte start_index uint64]
           [interleaved float64 samples...]
 ```
 
@@ -216,11 +238,17 @@ payload = [4-byte dump_id uint32][4-byte device uint32]
 - Sample layout inside a chunk is identical to DATA (§2.1): channel-fastest
   across that device's channels. Chunk boundaries are **not** aligned to
   frame boundaries — concatenate all chunks of a device first, then reshape.
+- `start_index` is **this chunk's** first sample, on the same grid as DATA
+  for that device (§2.1) — not the dump's start, each chunk's own. This is
+  what lets a `get_raw` dump line up exactly with the live stream it was
+  pulled from: e.g. to find where an event sits in the dump, subtract the
+  first chunk's `start_index` from the DATA `start_index` you saw live.
 - The `get_raw` **response** (control port) carries the decode metadata per
   device: `num_channels`, `sample_rate`, `samples_per_channel`,
-  `total_chunks`, plus `chunk_samples` (interleaved samples per full chunk).
+  `total_chunks`, `start_index` (the first sample's index, same grid as
+  the frames), plus `chunk_samples` (interleaved samples per full chunk).
 - **Delivery is reliable, not best-effort**: dump chunks are never dropped
-  by the backpressure mechanism (unlike live frames). A client that stalls
+  by the backpressure mechanism (unlike DATA/BAND). A client that stalls
   longer than ~30 s per chunk forfeits the remainder of that chunk's slot.
 - Live LEVEL/DATA frames continue during a dump and interleave with it;
   demux by frame type.
@@ -244,7 +272,7 @@ The full configuration plus protocol metadata:
 ```json
 {
   "type": "handshake",
-  "protocol": "pislm/3",
+  "protocol": "pislm/4",
   "running": false,
   "channels": [0, 1, 2, 3, 4, 5],
   "num_channels": 6,
@@ -286,12 +314,30 @@ The full configuration plus protocol metadata:
                   "ppm": -50.0, "points": 5000, "elapsed": 250.0,
                   "settled": true}},
   "clock_sync_note": "shared-trigger start aligns scan start; ADC clocks still drift (~ppm) between devices",
-  "network": {"stream_clients": 1, "stream_frames_dropped": 0},
+  "epoch": {"index": 0, "unix": 1785638285.824955, "monotonic": 1157.7955,
+            "utc": "2026-08-02T02:38:05.824955Z", "source": "system_clock",
+            "note": "NTP synchronization is not guaranteed"},
+  "overload": {"0": 0, "1": 0, "2": 0, "3": 0, "4": 0, "5": 0},
+  "network": {"stream_clients": 1, "stream_frames_dropped": 0,
+              "stream_frames_dropped_by_type": {}},
   "dtype": "float64",
   "byte_order": "little",
   "interleave": "channel-fastest-per-device"
 }
 ```
+
+- **`epoch`** ties sample index 0 (of every per-stream counter, reset at
+  each `start()`) to wall-clock time: `wall_clock_time = epoch.unix +
+  start_index / rate_of_that_grid`. `monotonic` is the Pi's monotonic
+  clock at the same instant — safe to use for elapsed-time math even if
+  the wall clock jumps (e.g. an NTP correction) mid-scan. `source` is
+  currently always `"system_clock"`; treat `utc`/`unix` as best-effort
+  unless you independently know the Pi's clock is NTP- or GPS-disciplined.
+- **`overload`** is the cumulative count of clipped samples per channel
+  since the last `start()` (see the `overload` event below and §4). All
+  zero means no clipping has been detected yet.
+- **`network.stream_frames_dropped_by_type`** breaks the total down by
+  frame kind (e.g. `{"DATA": 40, "BAND": 2}`) — see §6.
 
 When band output is **active** (i.e. during a running scan with bands
 enabled, or in a `started` event), the handshake also carries a `band_table`:
@@ -350,6 +396,9 @@ On failure:
 {"type": "event", "event": "started", ...full handshake body incl. band_table...}
 {"type": "event", "event": "triggered", "device": 0}
 {"type": "event", "event": "overrun", "kind": "hardware"}
+{"type": "event", "event": "overload", "device": 1, "channel": 4,
+ "start_index": 2457600, "samples": 137, "peak": 5.02, "units": "V",
+ "full_scale": 5.0}
 {"type": "event", "event": "stopped"}
 ```
 
@@ -358,6 +407,7 @@ On failure:
 | `started` | A scan has begun (or, with the sync trigger enabled, has been armed). Carries the full config (like the handshake), including `band_table` if band output is on, and `trigger` status when a synchronized start was used. |
 | `triggered` (`device`: index) | An armed device received its trigger edge and its first samples arrived. Mainly useful with `source: "external"`. |
 | `overrun` (`device`: index, `kind`: `hardware` \| `buffer`) | Data was lost on that device; the whole scan has stopped. Reconfigure/reduce rate and `start` again. |
+| `overload` (`device`, `channel`, `start_index`, `samples`, `peak`, `units`, `full_scale`) | ADC clipping detected on that channel: `samples` samples in this window were at or above `full_scale * 0.99` volts. `start_index` is on the DATA grid for that device (§2.1) so the clipped span can be located exactly. `peak` and `full_scale` are raw pre-calibration volts (clipping happens at the ADC; the threshold is fixed regardless of sensitivity). At most one `overload` event per channel per `level.output_rate` period is sent, but the tally in `overload` (handshake/`get_config`) keeps every clipped sample even when throttled. Treat a measurement window containing an `overload` as invalid per most SLM standards. |
 | `stopped` | The scan has ended (after `stop`, or after an overrun). No more DATA until the next `start`. |
 
 **Distinguishing message kinds:** switch on the `type` field — `handshake`,
@@ -570,7 +620,7 @@ Typical field sequence: `calibrate` each channel, then one `save_config`.
 
 | cmd | fields | result |
 |-----|--------|--------|
-| `get_raw` | optional `seconds` (default: full buffer), `devices` (list of device indexes, default: all) | `{"dump_id", "chunk_samples", "units", "devices": [{device, channels, num_channels, sample_rate, samples_per_channel, seconds, total_chunks}]}` |
+| `get_raw` | optional `seconds` (default: full buffer), `devices` (list of device indexes, default: all) | `{"dump_id", "chunk_samples", "units", "devices": [{device, channels, num_channels, sample_rate, samples_per_channel, seconds, total_chunks, start_index}]}` |
 
 `get_raw` dumps the most recent `seconds` of the RAM ring buffers to every
 connected **stream** client as RAW_DUMP frames (§2.5) — connect to the
@@ -657,19 +707,29 @@ Leq_T  = 10 * log10( mean(x^2 over T) / (20e-6)^2 )
 
 ## 6. Reliability notes
 
-- **Backpressure:** the server keeps a bounded per-client send queue
-  (`config.ini`, `[network] max_queue_blocks`). If a client cannot keep up,
-  the **oldest live stream frames (DATA and BAND) are dropped** so a slow
-  reader never stalls acquisition or affects other clients. There is no
-  guarantee every live frame is delivered; treat the live stream as
-  best-effort real-time. (A dropped BAND frame leaves a gap in that band's
-  decimated series.) RAW_DUMP chunks are the exception — they block instead
-  of dropping (§2.5), so a `get_raw` after the fact is the reliable way to
-  recover a gap in a live recording. Every eviction increments
-  `network.stream_frames_dropped`, readable from `get_config` or the
-  handshake (**not** `status` — see §3), so a client can tell the difference
-  between "quiet because nothing changed" and "quiet because frames are
-  being lost."
+- **Backpressure, by frame kind:** each stream client actually has two
+  outbound queues, merged onto the one connection in send order:
+  - **DATA and BAND** use a bounded queue (`config.ini`,
+    `[network] max_queue_blocks`). If a client cannot keep up, the
+    **oldest queued frame is dropped** so a slow reader never stalls
+    acquisition or affects other clients. There is no guarantee every
+    DATA/BAND frame is delivered; treat them as best-effort real-time. (A
+    dropped BAND frame leaves a gap in that band's decimated series --
+    use `start_index`, §2, to size it exactly.)
+  - **LEVEL, BAND_LEVEL, and MSG** (events/handshake/responses) use a
+    separate, much larger queue and are **practically never dropped** --
+    their combined bandwidth is a tiny fraction of DATA's (§8), so the
+    queue only fills if a client stalls for minutes. This queue is still
+    non-blocking on the producer side (see §9): a client that never reads
+    at all cannot stall acquisition either.
+  - RAW_DUMP chunks share DATA/BAND's queue but are sent with a blocking
+    put instead of drop-on-full (§2.5), so a `get_raw` after the fact is
+    the reliable way to recover a gap in a live DATA/BAND recording.
+  - Every eviction increments `network.stream_frames_dropped` (with a
+    per-frame-kind breakdown in `stream_frames_dropped_by_type`), readable
+    from `get_config` or the handshake (**not** `status` — see §3), so a
+    client can tell "quiet because nothing changed" from "quiet because
+    frames are being lost" -- and, from the breakdown, *which* frame kind.
 - **Ordering:** within a single connection, bytes are ordered (TCP). On the
   control port a command's `response` always follows the commands sent
   before it; an event may be interleaved (e.g. the `stopped` event can
@@ -690,7 +750,7 @@ Control port (5000) — JSON lines both ways:
 
 ```
 connect 5000
-  <- {"type":"handshake", "protocol":"pislm/3", "num_channels":6, ...}
+  <- {"type":"handshake", "protocol":"pislm/4", "num_channels":6, ...}
   -> {"id":1,"cmd":"stop"}                       (ignore error if already stopped)
   -> {"id":2,"cmd":"set_sensitivity","channel":3,"value":50}     (global ch 3 = DT9837A ch 1)
   <- {"type":"response","id":2,"ok":true,"result":{"channel":3,"sensitivity":50.0,"units":"Pa"}}
@@ -710,7 +770,7 @@ Stream port (5001) — typed frames, Pi → client (default SLM configuration):
 
 ```
 connect 5001
-  <- MSG    {"type":"handshake", "protocol":"pislm/3", ...}
+  <- MSG    {"type":"handshake", "protocol":"pislm/4", ...}
   <- LEVEL  ch0 <dB samples>                     (repeats for every channel
   <- LEVEL  ch2 <dB samples>                      at the level output rate)
   <- BAND_LEVEL band 12, ch 0 <dB samples>       (if bands enabled)
@@ -857,3 +917,30 @@ If you write your own client from this document alone, start here.
     is negligible (~1 KB/s); raw waveform for 6 channels is tens of Mbps
     (§8). Measure your own link with a `bench`-style test before committing
     to always-on raw streaming in the field.
+
+12. **Use `start_index` to detect and size gaps, not to reject anything.**
+    Track the expected next index per stream (device for DATA, channel for
+    LEVEL, (band, channel) for BAND/BAND_LEVEL):
+    ```
+    expected = last_start_index + last_sample_count
+    if frame.start_index > expected:
+        gap = frame.start_index - expected      # samples lost, exactly
+    if frame.start_index < expected:
+        # duplicate/reordering -- a protocol violation; log and discard
+    ```
+    A gap on DATA/BAND is expected occasionally under network pressure
+    (§6) — that is what the frame is dropped for, not an error condition.
+    A gap on LEVEL/BAND_LEVEL should be rare to never; if you see one,
+    something is more seriously wrong (e.g. the client itself stalled long
+    enough to fill even the large reliable queue). Reset your expected-index
+    tracking to `None` on every `started` event (`start_index` resets to 0
+    server-side too).
+
+13. **The control response and stream frames are on independent
+    connections** — nothing in the protocol *guarantees* their relative
+    arrival order, even though the reference server enqueues a command's
+    response before its side effects begin streaming. For `get_raw`
+    specifically: register wherever you'll write incoming RAW_DUMP chunks
+    (by `dump_id`) as soon as you have it from the response, and match
+    incoming chunks by `dump_id` rather than assuming "response first, then
+    frames" as a hard invariant.
