@@ -13,6 +13,10 @@ document can receive levels/waveforms and control the acquisition devices.
   (default: 0–1 = MCC 172, 2–5 = DT9837A); the handshake's `channel_map`
   gives the exact mapping. All frames and commands use global channel
   numbers.
+- **Analog output:** the DT9837A (only) also has a single analog output
+  channel, for playing an excitation signal (sweep/MLS/noise) for
+  reverberation-time measurement — see §10. Check `output.available` in
+  the handshake; hardware without a DT9837A has none.
 - **Clocks are not synchronized between devices.** Each device runs its own
   ADC clock. Per-channel levels/metrics are unaffected; cross-channel phase
   analysis is only valid within one device.
@@ -318,6 +322,9 @@ The full configuration plus protocol metadata:
             "utc": "2026-08-02T02:38:05.824955Z", "source": "system_clock",
             "note": "NTP synchronization is not guaranteed"},
   "overload": {"0": 0, "1": 0, "2": 0, "3": 0, "4": 0, "5": 0},
+  "output": {"available": true, "device": 1, "channels": [0],
+             "output_rate": 48000.0, "full_scale_volts": 10.0,
+             "running": false, "signal": null},
   "network": {"stream_clients": 1, "stream_frames_dropped": 0,
               "stream_frames_dropped_by_type": {}},
   "dtype": "float64",
@@ -409,6 +416,8 @@ On failure:
 | `overrun` (`device`: index, `kind`: `hardware` \| `buffer`) | Data was lost on that device; the whole scan has stopped. Reconfigure/reduce rate and `start` again. |
 | `overload` (`device`, `channel`, `start_index`, `samples`, `peak`, `units`, `full_scale`) | ADC clipping detected on that channel: `samples` samples in this window were at or above `full_scale * 0.99` volts. `start_index` is on the DATA grid for that device (§2.1) so the clipped span can be located exactly. `peak` and `full_scale` are raw pre-calibration volts (clipping happens at the ADC; the threshold is fixed regardless of sensitivity). At most one `overload` event per channel per `level.output_rate` period is sent, but the tally in `overload` (handshake/`get_config`) keeps every clipped sample even when throttled. Treat a measurement window containing an `overload` as invalid per most SLM standards. |
 | `stopped` | The scan has ended (after `stop`, or after an overrun). No more DATA until the next `start`. |
+| `output_started` (`signal`, `start_index`, `total_seconds`, `device`, `channel`) | Analog-output playback began (§10). |
+| `output_finished` (`samples_played`, `end_index`, `completed`) | Analog-output playback ended, naturally or via `output_stop`/a scan stop (§10). |
 
 **Distinguishing message kinds:** switch on the `type` field — `handshake`,
 `response`, or `event`. On the control port these arrive as JSON lines; on
@@ -422,6 +431,10 @@ the stream port as MSG frames (type `0x02`).
 configuration changes during an active scan, so the server returns an error
 (`"a scan is active; send \"stop\" first"`). Workflow: `stop` → change →
 `start`. Queries, `start`, `stop`, `info`, and `blink_led` work anytime.
+The analog-output commands (§10: `set_output`, `output_start`,
+`output_stop`, `output_status`) are the exception among "configuration"-ish
+commands — they work whether the AI scan is running or not, since playing
+the excitation signal *while* the scan records is the point.
 
 ### Streaming
 
@@ -944,3 +957,163 @@ If you write your own client from this document alone, start here.
     (by `dump_id`) as soon as you have it from the response, and match
     incoming chunks by `dump_id` rather than assuming "response first, then
     frames" as a hard invariant.
+
+---
+
+## 10. Analog output — excitation signal (reverberation measurement)
+
+Optional. The DT9837A (only — the MCC 172 has no DAC) has a single analog
+output channel, usable independently of its own AI scan, for playing an
+excitation signal to derive reverberation time (T20/T30) as required by
+ISO 3382-2 for L'nT and L'n. Check `output.available` in the handshake
+before using any of this — hardware without a DT9837A has no output at all.
+
+### Commands
+
+All are ordinary control-port commands (§1); `id` is echoed, `ok` must be
+checked. `set_output`/`output_start`/`output_stop` do **not** require the
+AI scan to be stopped — playing the excitation signal *while* the scan
+records is the point.
+
+| cmd | fields | result |
+|-----|--------|--------|
+| `set_output` | optional `signal` (`"white"` \| `"pink"` \| `"sweep"` \| `"mls"`, default `"sweep"`), `seconds` (default 3.0; ignored for `mls`, which is a whole number of periods), `level_dbfs` (≤ 0, default -20.0), `f_min`/`f_max` (Hz; band limits for noise, start/end for `sweep`; default 50/5000), `mls_order` (default 16; one of 8,10,12,14,15,16,17,18), `channel` (must be `0` — the only channel), `tail_seconds` (silence appended after the signal, default 1.0), `repeats` (default 1) | the settings as applied, plus `output_rate`, `total_samples`, `total_seconds`, `device` |
+| `output_start` | — | `{"running", "signal", "total_seconds", "start_index", "device"}` |
+| `output_stop` | — | `{"running": false, "samples_played"}` |
+| `output_status` | — | `{"running", "signal", "elapsed_seconds", "remaining_seconds", "start_index", "device", "channel"}` (works anytime) |
+
+`set_output` generates and caches the waveform (at the device's actual
+output rate — `resample.output_rate` when resampling is active, else
+48 kHz, clamped to the DT9837A's supported range of 10–52.734 kHz) but
+does not play it; `output_start` begins playback of what was last
+configured. Only one output can be configured/running at a time; both
+commands error if an output is already running (`output_stop` first).
+
+```json
+{"id": 11, "cmd": "set_output", "signal": "sweep", "seconds": 3.0,
+ "level_dbfs": -20.0, "f_min": 50, "f_max": 5000, "channel": 0,
+ "tail_seconds": 2.0, "repeats": 1}
+```
+```json
+{"type": "response", "id": 11, "ok": true, "cmd": "set_output",
+ "result": {"signal": "sweep", "seconds": 3.0, "level_dbfs": -20.0,
+            "f_min": 50.0, "f_max": 5000.0, "mls_order": 16, "channel": 0,
+            "tail_seconds": 2.0, "repeats": 1,
+            "output_rate": 48000.0, "total_samples": 240000,
+            "total_seconds": 5.0, "device": 1}}
+```
+
+#### `start_index` — and its real accuracy
+
+`start_index` (in `output_start`'s result and the `output_started` event)
+is the DATA-grid index (§2.1) of the device's own AI stream at the moment
+`output_start` began the analog-output scan — the same grid `DATA` and
+`RAW_DUMP` use for that device, so a client can locate the excitation
+inside the recorded waveform to align a sweep/MLS deconvolution. It is
+`null` whenever the AI scan is not running (there is no grid to place it
+on).
+
+**This is a software timestamp correlation, not a hardware-verified
+alignment.** The reference implementation reads the AI DATA-grid counter
+as close as possible to the instant the analog-output scan is issued —
+there is a small, non-zero USB/scheduling latency between that instant and
+the DAC's first real output sample that this cannot measure or remove.
+True hardware synchronization (arming the AO scan on the same external
+trigger edge used for synchronized AI start, §4 "Synchronized start")
+only works when arming a scan from a full stop; it cannot mark an
+arbitrary future edge inside an AI scan that is already running, which is
+the whole point of this feature. Treat `start_index` as a good starting
+estimate, not a promise: an MLS deconvolution in particular needs exact
+circular alignment, so refine it by cross-correlating the recorded
+response against the known sequence rather than trusting the index to the
+sample.
+
+### Events
+
+```json
+{"type": "event", "event": "output_started", "signal": "sweep",
+ "start_index": 480000, "total_seconds": 5.0, "device": 1, "channel": 0}
+{"type": "event", "event": "output_finished", "samples_played": 240000,
+ "end_index": 720000, "completed": true}
+```
+
+`completed` is `false` when `output_stop` (or the AI scan stopping —
+stopping the scan also stops any in-flight output) cut playback short; a
+client waiting for the pass to end needs to tell the two apart, since a
+truncated sweep or MLS run must not be deconvolved. `end_index` is
+`start_index + samples_played` (on the same DATA grid), or `null` when
+`start_index` was `null`.
+
+### Handshake addition
+
+```json
+"output": {"available": true, "device": 1, "channels": [0],
+           "output_rate": 48000.0, "full_scale_volts": 10.0,
+           "running": false, "signal": null}
+```
+
+`channels` is always `[0]` on hardware that has an output at all — the
+DT9837A's analog-output subsystem is hard-wired to a single channel
+regardless of how many AI channels are in use. `available: false` (with
+no other keys meaningful) on hardware without a DT9837A; check this
+before offering the feature in a UI rather than failing at `set_output`.
+
+### Signal generation
+
+The sweep and MLS generators must be bit-identical to whatever you
+implement client-side, or deconvolution silently returns noise instead of
+an impulse response — port the reference implementation
+(`pislm/excitation.py`) rather than reimplementing from scratch.
+
+**Exponential (Farina) sine sweep:**
+```
+s(t) = sin( (w1·T / ln(w2/w1)) · (exp(t/T · ln(w2/w1)) − 1) )
+w1 = 2π·f_min,  w2 = 2π·f_max,  T = seconds
+```
+A 20 ms raised-cosine fade is applied at both ends, then the signal is
+normalized to unit peak and scaled by `10**(level_dbfs/20)`.
+
+**MLS** — Fibonacci LFSR, register initialized to all ones, output taken
+from the last register cell, `{0,1}` mapped to `{−1,+1}`:
+
+| order | taps (polynomial exponents) |
+|---|---|
+| 8 | 8, 6, 5, 4 |
+| 10 | 10, 7 |
+| 12 | 12, 6, 4, 1 |
+| 14 | 14, 5, 3, 1 |
+| 15 | 15, 14 |
+| 16 | 16, 15, 13, 4 |
+| 17 | 17, 14 |
+| 18 | 18, 11 |
+
+⚠ **Exponent `t` maps to register index `t − 1`.** The plausible-looking
+`order − t` mapping also yields a full-period sequence (so a period-length
+check alone won't catch the mistake), but the circular autocorrelation's
+peak-to-sidelobe ratio collapses from `2**order - 1` to about 1, and
+deconvolution against it silently returns noise. Verify any change with
+the peak-to-sidelobe ratio of one period's circular autocorrelation — it
+must equal exactly `2**order - 1`.
+
+MLS is played **back-to-back with no silence between periods** (`repeats`
+whole periods, at least 2 recommended); deconvolution uses the last
+complete period, by which point the room response has reached steady
+state — that's what makes the circular-convolution assumption valid.
+
+Noise (`white`, `pink`) is band-limited to `[f_min, f_max]` via a hard
+mask in the frequency domain. Pink is shaped as exactly `1/sqrt(f)` in the
+frequency domain (an exact −3 dB/octave slope, not a filter-cascade
+approximation). The time-domain fade applied afterward spreads a small,
+expected amount of energy outside the band (window sidelobes) — this is
+normal, not a bug.
+
+### Safety
+
+- `level_dbfs` must be ≤ 0; the server rejects anything above.
+- `output_stop` ramps the output to 0 V over ~10 ms before stopping the
+  scan (a hard cut into a power amplifier makes an audible click and can
+  stress a driver). The same ramp runs if the AI scan stops while an
+  output is in flight.
+- The output is held at 0 V from server startup until the first
+  `output_start`.
+- Only channel `0` exists; `set_output` rejects any other `channel` value.
