@@ -383,7 +383,8 @@ class Shell:
         if seconds <= 0:
             print('[bench] seconds must be > 0')
             return
-        status0 = self._call({'cmd': 'status'})
+        # get_config (not status) -- status omits the dsp/network counters.
+        status0 = self._call({'cmd': 'get_config'})
         bytes0 = dict(self.stream.bytes_by_type)
         frames0 = dict(self.stream.frames_by_type)
         rtt0 = time()
@@ -395,7 +396,7 @@ class Shell:
         elapsed = time() - t0
         bytes1 = dict(self.stream.bytes_by_type)
         frames1 = dict(self.stream.frames_by_type)
-        status1 = self._call({'cmd': 'status'})
+        status1 = self._call({'cmd': 'get_config'})
 
         types = sorted(set(bytes0) | set(bytes1))
         total_bytes = sum(bytes1.get(t, 0) - bytes0.get(t, 0) for t in types)
