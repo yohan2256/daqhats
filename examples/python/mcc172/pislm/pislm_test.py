@@ -51,11 +51,14 @@ TYPE_NAMES = {
     TYPE_RAW_DUMP: 'RAW_DUMP',
 }
 
+# pislm/4: every payload header below ends with a u64 start_index -- the
+# index (on that stream's own sample grid, reset to 0 at each start()) of
+# the first sample in the frame. See PROTOCOL.md secs. 1 and 9.
 FRAME_HEADER = struct.Struct('<BI')
-DATA_HEADER = struct.Struct('<I')
-BAND_HEADER = struct.Struct('<II')
-LEVEL_HEADER = struct.Struct('<I')
-RAW_DUMP_HEADER = struct.Struct('<IIII')
+DATA_HEADER = struct.Struct('<IQ')
+BAND_HEADER = struct.Struct('<IIQ')
+LEVEL_HEADER = struct.Struct('<IQ')
+RAW_DUMP_HEADER = struct.Struct('<IIIIQ')
 
 
 def recv_exact(sock, n):
@@ -280,9 +283,9 @@ class StreamReader(threading.Thread):
             _print_async('[stream event] {}'.format(json.dumps(msg)))
 
     def _on_level(self, payload):
-        (chan,) = LEVEL_HEADER.unpack(payload[:4])
+        chan, _start_index = LEVEL_HEADER.unpack(payload[:LEVEL_HEADER.size])
         values = array('d')
-        values.frombytes(payload[4:])
+        values.frombytes(payload[LEVEL_HEADER.size:])
         if values:
             self._levels[chan] = values[-1]
         now = time()
@@ -304,12 +307,13 @@ class StreamReader(threading.Thread):
             sys.stdout.flush()
 
     def _on_raw_dump(self, payload):
-        dump_id, dev, chunk_i, is_last = RAW_DUMP_HEADER.unpack(payload[:16])
+        dump_id, dev, chunk_i, is_last, _start_index = \
+            RAW_DUMP_HEADER.unpack(payload[:RAW_DUMP_HEADER.size])
         files = self._dump_files.get(dump_id)
         if files is None or dev not in files:
             return       # not one we're capturing; ignore
         handle = files[dev]
-        handle.write(payload[16:])
+        handle.write(payload[RAW_DUMP_HEADER.size:])
         if is_last:
             handle.close()
             del files[dev]
