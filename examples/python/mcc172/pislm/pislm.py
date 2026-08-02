@@ -711,6 +711,17 @@ class Controller:
         self._overload_count = {}    # global chan -> cumulative clipped samples
         self._overload_last_emit = {}  # global chan -> monotonic time of last event
 
+        # Analog output (excitation signal for reverberation measurement).
+        # At most one device offers it (the DT9837A; the MCC 172 is input
+        # only) -- find it once, up front.
+        self._output_dev_idx = next(
+            (i for i, b in enumerate(backends) if b.has_output()), None)
+        self._output_cfg = None      # last set_output result (incl. samples)
+        self._output_running = False
+        self._output_start_index = None
+        self._output_samples_played = 0
+        self._output_lock = threading.Lock()
+
         # Rate tracking is always on, so the clock figures are available
         # from the first handshake; start() rebuilds these for the rates the
         # devices actually settle on.
@@ -718,6 +729,10 @@ class Controller:
 
         # Apply initial IEPE + sensitivity so a fresh boot is calibrated.
         self._apply_static_config()
+
+        # The output must be at zero until output_start (§ safety).
+        if self._output_dev_idx is not None:
+            self._backends[self._output_dev_idx].zero_output()
 
     def attach_registry(self, registry):
         self._registry = registry
@@ -863,6 +878,7 @@ class Controller:
                 'epoch': self._epoch,
                 'overload': {str(g): self._overload_count.get(g, 0)
                             for g in self.channels},
+                'output': self._output_snapshot(),
                 'network': {
                     'stream_clients': (self._registry.stream_client_count()
                                        if self._registry else 0),
@@ -1290,6 +1306,18 @@ class Controller:
                     except Exception:   # noqa: BLE001
                         pass
                 self._running = False
+            # An in-flight excitation output loses its start_index meaning
+            # the instant the scan it was correlated against stops; the
+            # already-running _poll_output watcher notices stop_output()'s
+            # effect within one poll and broadcasts output_finished itself.
+            if self._output_dev_idx is not None:
+                with self._output_lock:
+                    output_was_running = self._output_running
+                if output_was_running:
+                    try:
+                        self._backends[self._output_dev_idx].stop_output()
+                    except Exception:   # noqa: BLE001
+                        pass
             # Flush anything the workers finished during shutdown, then
             # release the processes and their shared-memory slots.
             if self._pool is not None:
@@ -1342,6 +1370,195 @@ class Controller:
                 'start_index': dev_start, 'samples': n_clip,
                 'peak': peak, 'units': 'V', 'full_scale': full_scale,
             })
+
+    # -- analog output: excitation signal for reverberation measurement ----
+    # DT9837A only (single channel; see devices.py). Independent of the AI
+    # scan's running state, except that start_index (correlating the
+    # output's first sample to the AI DATA grid, §2.1) is only meaningful
+    # while the scan is running.
+    #
+    # Accuracy note: start_index is a *software* timestamp correlation --
+    # the AI DATA-grid counter is read as close as possible to the instant
+    # a_out_scan() is issued -- not a hardware-verified alignment. It is a
+    # good starting estimate, dominated by USB scheduling latency (small
+    # but not zero); a client doing MLS deconvolution (which needs exact
+    # circular alignment) should still refine the alignment by
+    # cross-correlating against the known sequence rather than trusting
+    # this index to the sample. True hardware synchronization would need
+    # the same GPIO trigger used for synchronized AI start (§ "Synchronized
+    # start" in PROTOCOL.md), but that only works when arming a scan from a
+    # full stop -- it cannot mark an arbitrary future edge in an AI scan
+    # that is already running, which is the whole point of this feature
+    # ("does not require the scan to be stopped").
+    def _output_snapshot(self):
+        if self._output_dev_idx is None:
+            return {'available': False}
+        backend = self._backends[self._output_dev_idx]
+        cfg = self._output_cfg
+        return {
+            'available': True,
+            'device': self._output_dev_idx,
+            'channels': [0],
+            'output_rate': (cfg['output_rate'] if cfg
+                            else backend.ao_max_rate),
+            'full_scale_volts': backend.ao_full_scale_v,
+            'running': self._output_running,
+            'signal': cfg['signal'] if cfg else None,
+        }
+
+    def _require_output_configured(self):
+        if self._output_dev_idx is None:
+            raise CommandError('no analog output device available')
+        return self._backends[self._output_dev_idx]
+
+    def _cmd_set_output(self, req):
+        backend = self._require_output_configured()
+        with self._output_lock:
+            if self._output_running:
+                raise CommandError(
+                    'output is running; send "output_stop" first')
+        import numpy as np
+        import excitation
+
+        signal = str(req.get('signal', 'sweep'))
+        if signal not in ('white', 'pink', 'sweep', 'mls'):
+            raise CommandError(
+                'signal must be one of white, pink, sweep, mls')
+        channel = int(req.get('channel', 0))
+        if channel != 0:
+            raise CommandError(
+                'the DT9837A analog output has only channel 0')
+        level_dbfs = float(req.get('level_dbfs', -20.0))
+        if level_dbfs > 0:
+            raise CommandError('level_dbfs must be <= 0')
+        seconds = float(req.get('seconds', 3.0))
+        f_min = float(req.get('f_min', 50.0))
+        f_max = float(req.get('f_max', 5000.0))
+        mls_order = int(req.get('mls_order', 16))
+        tail_seconds = float(req.get('tail_seconds', 1.0))
+        if tail_seconds < 0:
+            raise CommandError('tail_seconds must be >= 0')
+        repeats = max(1, int(req.get('repeats', 1)))
+
+        rate = self.resample_cfg.get('output_rate', 48000.0) if \
+            self.resample_cfg.get('enabled') else 48000.0
+        rate = max(backend.ao_min_rate, min(rate, backend.ao_max_rate))
+
+        try:
+            if signal == 'mls':
+                sig = excitation.generate_mls(mls_order, level_dbfs, repeats)
+            elif signal == 'sweep':
+                sig = excitation.generate_sweep(
+                    seconds, f_min, f_max, rate, level_dbfs)
+                sig = np.tile(sig, repeats) if repeats > 1 else sig
+            else:
+                sig = excitation.generate_noise(
+                    signal, seconds, rate, f_min, f_max, level_dbfs)
+                sig = np.tile(sig, repeats) if repeats > 1 else sig
+        except ValueError as err:
+            raise CommandError(str(err))
+
+        if tail_seconds > 0:
+            tail = np.zeros(int(round(tail_seconds * rate)))
+            sig = np.concatenate([sig, tail])
+
+        volts = sig * backend.ao_full_scale_v
+        total_samples = int(volts.size)
+        total_seconds = total_samples / rate
+
+        self._output_cfg = {
+            'signal': signal, 'seconds': seconds, 'level_dbfs': level_dbfs,
+            'f_min': f_min, 'f_max': f_max, 'mls_order': mls_order,
+            'channel': channel, 'tail_seconds': tail_seconds,
+            'repeats': repeats, 'output_rate': rate,
+            'total_samples': total_samples, 'total_seconds': total_seconds,
+            'device': self._output_dev_idx, 'volts': volts,
+        }
+        result = dict(self._output_cfg)
+        del result['volts']
+        return result
+
+    def _cmd_output_start(self, req):
+        backend = self._require_output_configured()
+        with self._output_lock:
+            if self._output_running:
+                raise CommandError('output already running')
+            if self._output_cfg is None:
+                raise CommandError('call set_output first')
+            cfg = self._output_cfg
+            start_index = (self._data_count.get(self._output_dev_idx)
+                           if self._running else None)
+            actual_rate = backend.start_output(cfg['volts'], cfg['output_rate'])
+            self._output_running = True
+            self._output_start_index = start_index
+            self._output_samples_played = 0
+        threading.Thread(target=self._poll_output,
+                         args=(backend, cfg['total_samples']),
+                         daemon=True).start()
+        snapshot = {'type': 'event', 'event': 'output_started',
+                   'signal': cfg['signal'], 'start_index': start_index,
+                   'total_seconds': cfg['total_seconds'],
+                   'device': self._output_dev_idx, 'channel': cfg['channel']}
+        if self._registry:
+            self._registry.broadcast_message(snapshot)
+        return {'running': True, 'signal': cfg['signal'],
+                'total_seconds': cfg['total_seconds'],
+                'start_index': start_index, 'device': self._output_dev_idx}
+
+    def _poll_output(self, backend, expected_total):
+        """Background completion watcher for one output_start (§ above) --
+        runs independent of the AI scan's own thread/lifecycle. Owns
+        broadcasting 'output_finished' for both natural completion and a
+        manual output_stop, so it is never broadcast twice."""
+        played = 0
+        while True:
+            played, done = backend.output_progress()
+            with self._output_lock:
+                self._output_samples_played = played
+            if done:
+                break
+            sleep(0.02)
+        with self._output_lock:
+            self._output_running = False
+            start_index = self._output_start_index
+        end_index = (start_index + played) if start_index is not None else None
+        if self._registry:
+            self._registry.broadcast_message({
+                'type': 'event', 'event': 'output_finished',
+                'samples_played': played, 'end_index': end_index,
+                'completed': played >= expected_total,
+            })
+
+    def _cmd_output_stop(self, req):
+        backend = self._require_output_configured()
+        with self._output_lock:
+            if not self._output_running:
+                raise CommandError('output is not running')
+        played, _done = backend.output_progress()
+        backend.stop_output()   # ramps to 0 V, then stops the scan
+        return {'running': False, 'samples_played': played}
+
+    def _cmd_output_status(self, req):
+        if self._output_dev_idx is None:
+            return {'running': False, 'signal': None,
+                    'elapsed_seconds': 0.0, 'remaining_seconds': 0.0,
+                    'start_index': None, 'device': None, 'channel': None}
+        with self._output_lock:
+            running = self._output_running
+            played = self._output_samples_played
+            start_index = self._output_start_index
+            cfg = self._output_cfg
+        if cfg is None:
+            return {'running': False, 'signal': None,
+                    'elapsed_seconds': 0.0, 'remaining_seconds': 0.0,
+                    'start_index': None, 'device': self._output_dev_idx,
+                    'channel': None}
+        elapsed = played / cfg['output_rate'] if running else 0.0
+        remaining = max(0.0, cfg['total_seconds'] - elapsed) if running else 0.0
+        return {'running': running, 'signal': cfg['signal'],
+                'elapsed_seconds': elapsed, 'remaining_seconds': remaining,
+                'start_index': start_index if running else None,
+                'device': self._output_dev_idx, 'channel': cfg['channel']}
 
     _POOL_FRAME_BUILDERS = {
         'level': level_frame,
@@ -2149,6 +2366,10 @@ class Controller:
         'get_raw': _cmd_get_raw,
         'calibration_write': _cmd_calibration_write,
         'test_signals_write': _cmd_test_signals_write,
+        'set_output': _cmd_set_output,
+        'output_start': _cmd_output_start,
+        'output_stop': _cmd_output_stop,
+        'output_status': _cmd_output_status,
     }
 
 

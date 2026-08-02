@@ -192,7 +192,9 @@ python3 pislm_test.py --host 192.168.50.1
 
 Type `help` at its prompt for the full command list (`status`, `metrics`,
 `calibrate`, `sens`, `iepe`, `rate`, `raw` to dump buffered audio to a file,
-`bench` to measure streaming bandwidth, `send <json>` for anything not
+`bench` to measure streaming bandwidth, `output`/`outstart`/`outstop`/
+`outstatus` to play an excitation signal through the DT9837A's analog
+output (reverberation-time measurement), `send <json>` for anything not
 covered by a shortcut). It is meant for quick checks during commissioning,
 not as your production client — implement that against
 [`PROTOCOL.md`](PROTOCOL.md), which documents both ports in full.

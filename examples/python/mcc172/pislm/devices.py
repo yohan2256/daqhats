@@ -46,6 +46,7 @@ class Mcc172Backend:
     """MCC 172 DAQ HAT via the daqhats library (2 IEPE channels)."""
 
     name = 'mcc172'
+    ao_full_scale_v = None   # no analog output on this device
 
     def __init__(self, channels=None, address=None):
         from daqhats import hat_list, mcc172, HatIDs, HatError
@@ -158,6 +159,10 @@ class Mcc172Backend:
     def blink(self, count):
         self._hat.blink_led(count)
 
+    # -- analog output: the MCC 172 is IEPE input only, no DAC. --
+    def has_output(self):
+        return False
+
     # MCC-172-specific extras used by some commands.
     def calibration_read(self, chan):
         return self._hat.calibration_coefficient_read(chan)
@@ -189,6 +194,11 @@ class Dt9837aBackend:
     #: uldaq Range enum name -> full-scale volts. Only these two are ever
     #: registered for the DT9837A (see AiUsb9837x.cpp).
     _RANGE_VOLTS = {'BIP10VOLTS': 10.0, 'BIP1VOLTS': 1.0}
+
+    #: Analog output range -- only BIP10VOLTS is ever registered for the
+    #: DT9837A's AO subsystem (see AoUsb9837x.cpp; the DT9837C uses
+    #: BIP3VOLTS instead, but that variant isn't handled here).
+    _AO_RANGE_VOLTS = {'BIP10VOLTS': 10.0}
 
     def __init__(self, channels=None, unique_id=None):
         import uldaq
@@ -228,6 +238,33 @@ class Dt9837aBackend:
         self._last_total = 0
         self.actual_rate = 51200.0
         self.running = False
+
+        # -- analog output: one channel, DT9837A only (see Usb9837x.cpp:
+        # `new AoUsb9837x(*this, 1)` -- the AO subsystem is hard-wired to a
+        # single channel regardless of how many AI channels are in use). --
+        self._ao = None
+        self.ao_full_scale_v = None
+        self.ao_min_rate = None
+        self.ao_max_rate = None
+        try:
+            ao = self._device.get_ao_device()
+            if ao is not None:
+                ao_info = ao.get_info()
+                ao_range = ao_info.get_ranges()[0]
+                self.ao_full_scale_v = self._AO_RANGE_VOLTS.get(
+                    ao_range.name, 10.0)
+                self.ao_min_rate = ao_info.get_min_scan_rate()
+                self.ao_max_rate = ao_info.get_max_scan_rate()
+                self._ao_range = ao_range
+                self._ao = ao
+        except Exception:   # noqa: BLE001 - AO is optional; AI must not fail
+            self._ao = None
+        self._ao_buffer = None
+        self._ao_running = False
+        self._ao_last_played = 0
+
+    def has_output(self):
+        return self._ao is not None
 
     def _input_mode(self):
         # The DT9837A's ADC only supports single-ended inputs; DIFFERENTIAL
@@ -341,10 +378,114 @@ class Dt9837aBackend:
         except Exception:   # noqa: BLE001 - releasing best-effort
             pass
         try:
+            self.stop_output()
+        except Exception:   # noqa: BLE001 - releasing best-effort
+            pass
+        try:
             self._device.disconnect()
             self._device.release()
         except self._ul.ULException:
             pass
+
+    # -- analog output (single channel; independent of the AI scan) --
+    def start_output(self, samples_volts, rate):
+        """Play a finite buffer once (not recycled/looped -- 'repeats' for
+        MLS is handled by the caller tiling the sequence before this call).
+        `samples_volts` is a 1-D array already scaled to real volts (the
+        caller multiplies the normalized excitation.py signal by
+        ao_full_scale_v). Returns the achieved output rate."""
+        if self._ao is None:
+            raise RuntimeError('no analog output on this device')
+        import numpy as np
+        ul = self._ul
+        n = len(samples_volts)
+        self._ao_buffer = ul.create_float_buffer(1, n)
+        view = np.frombuffer(self._ao_buffer, dtype=np.float64)
+        view[:n] = samples_volts
+        actual_rate = self._ao.a_out_scan(
+            0, 0, self._ao_range, n, rate, ul.ScanOption.DEFAULTIO,
+            ul.AOutScanFlag.DEFAULT, self._ao_buffer)
+        self._ao_running = True
+        self._ao_last_played = 0
+        return actual_rate
+
+    def output_progress(self):
+        """(samples_played, done) for the in-flight output scan.
+
+        Once the scan has stopped (naturally or via stop_output()), keeps
+        returning the last known count instead of resetting to 0 -- a
+        caller that queries progress *after* a stop (e.g. to report
+        samples_played in the stop response, or a completion watcher
+        racing a concurrent stop_output()) must still see the true final
+        count, not an artifact of query timing.
+        """
+        if self._ao is None:
+            return 0, True
+        if not self._ao_running:
+            return self._ao_last_played, True
+        try:
+            status, transfer = self._ao.get_scan_status()
+        except self._ul.ULException:
+            return self._ao_last_played, True
+        done = status != self._ul.ScanStatus.RUNNING
+        self._ao_last_played = transfer.current_total_count
+        if done:
+            self._ao_running = False
+        return self._ao_last_played, done
+
+    def stop_output(self, ramp_ms=10.0):
+        """Ramp to 0 V over ~ramp_ms (avoids a click/thump into an
+        amplifier), then stop the scan and leave the DAC at 0 V."""
+        if self._ao is None:
+            return
+        if self._ao_running:
+            try:
+                self._ramp_output_to_zero(ramp_ms)
+            except self._ul.ULException:
+                pass
+            try:
+                self._ao.scan_stop()
+            except self._ul.ULException:
+                pass
+            # Capture the true final count now that the scan has been
+            # stopped, so a subsequent output_progress() (e.g. the
+            # completion watcher racing this call) reports the real
+            # samples-played instead of a stale pre-stop snapshot.
+            try:
+                _status, transfer = self._ao.get_scan_status()
+                self._ao_last_played = transfer.current_total_count
+            except self._ul.ULException:
+                pass
+            self._ao_running = False
+        else:
+            self.zero_output()
+
+    def zero_output(self):
+        if self._ao is None:
+            return
+        try:
+            self._ao.a_out(0, self._ao_range, self._ul.AOutFlag.DEFAULT, 0.0)
+        except self._ul.ULException:
+            pass
+
+    def _ramp_output_to_zero(self, ramp_ms):
+        """Step the single-value output down from the last sample toward
+        0 V. During a scan the single-value write and the scan share the
+        same DAC, so this both audibly fades and leaves a clean state for
+        scan_stop()."""
+        import numpy as np
+        from time import sleep
+        ul = self._ul
+        last = 0.0
+        if self._ao_buffer is not None:
+            view = np.frombuffer(self._ao_buffer, dtype=np.float64)
+            if view.size:
+                last = float(view[-1])
+        steps = max(1, int(ramp_ms))
+        for i in range(steps, -1, -1):
+            self._ao.a_out(0, self._ao_range, ul.AOutFlag.DEFAULT,
+                           last * i / steps)
+            sleep(0.001)
 
     # -- misc --
     def info(self):

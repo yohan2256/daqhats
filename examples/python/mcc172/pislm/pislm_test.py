@@ -219,11 +219,23 @@ class StreamReader(threading.Thread):
         self._last_print = 0.0
         self._dump_files = {}       # dump_id -> {device: file handle}
         self._dump_meta = {}        # dump_id -> response 'devices' info
+        # RAW_DUMP chunks that arrive before start_dump() registers their
+        # dump_id -- the control-port response and the stream-port frames
+        # are on independent connections with no guaranteed relative order
+        # (see PROTOCOL.md sec. 9), so a chunk beating its own get_raw
+        # response home is normal, not a bug. Buffered briefly rather than
+        # silently dropped; capped so a truly unclaimed dump_id can't grow
+        # without bound.
+        self._pending_raw_dump = {}   # dump_id -> [(dev, chunk_i, is_last, bytes), ...]
         # Cumulative bandwidth counters, keyed by frame type; only ever
         # written from this thread (run()), so plain dicts are fine to read
         # from elsewhere without a lock (see Shell._bench).
         self.bytes_by_type = {}
         self.frames_by_type = {}
+
+    #: total bytes across all not-yet-claimed dump_ids before the oldest
+    #: is evicted (see _pending_raw_dump above).
+    _PENDING_RAW_DUMP_MAX_BYTES = 64 * 1024 * 1024
 
     def start_dump(self, dump_id, meta_devices, path_template):
         """Register file handles for an in-flight get_raw dump. Call this
@@ -234,6 +246,11 @@ class StreamReader(threading.Thread):
             files[dev['device']] = open(path, 'wb')
         self._dump_files[dump_id] = files
         self._dump_meta[dump_id] = {d['device']: d for d in meta_devices}
+        # Replay whatever already arrived for this dump_id before now.
+        pending = self._pending_raw_dump.pop(dump_id, None)
+        if pending:
+            for dev, _chunk_i, is_last, body in pending:
+                self._write_raw_dump_chunk(dump_id, dev, is_last, body)
 
     def _apply_handshake(self, msg):
         for entry in msg.get('channel_map', []):
@@ -309,11 +326,37 @@ class StreamReader(threading.Thread):
     def _on_raw_dump(self, payload):
         dump_id, dev, chunk_i, is_last, _start_index = \
             RAW_DUMP_HEADER.unpack(payload[:RAW_DUMP_HEADER.size])
+        body = payload[RAW_DUMP_HEADER.size:]
+        if dump_id not in self._dump_files:
+            # get_raw's response (which carries the dump_id -> file mapping)
+            # hasn't arrived on the control port yet -- the two ports are
+            # independent connections with no guaranteed relative order, so
+            # this is normal, not a lost frame. Buffer it; start_dump()
+            # replays anything buffered once it's called.
+            self._buffer_pending_raw_dump(dump_id, dev, chunk_i, is_last, body)
+            return
+        self._write_raw_dump_chunk(dump_id, dev, is_last, body)
+
+    def _buffer_pending_raw_dump(self, dump_id, dev, chunk_i, is_last, body):
+        self._pending_raw_dump.setdefault(dump_id, []).append(
+            (dev, chunk_i, is_last, body))
+        total = sum(len(b) for chunks in self._pending_raw_dump.values()
+                   for (_d, _c, _l, b) in chunks)
+        while total > self._PENDING_RAW_DUMP_MAX_BYTES and \
+                self._pending_raw_dump:
+            # An unclaimed dump_id this large is not going to be claimed;
+            # drop the oldest one entirely rather than grow without bound.
+            oldest = next(iter(self._pending_raw_dump))
+            dropped = sum(len(b) for (_d, _c, _l, b)
+                         in self._pending_raw_dump.pop(oldest))
+            total -= dropped
+
+    def _write_raw_dump_chunk(self, dump_id, dev, is_last, body):
         files = self._dump_files.get(dump_id)
         if files is None or dev not in files:
             return       # not one we're capturing; ignore
         handle = files[dev]
-        handle.write(payload[RAW_DUMP_HEADER.size:])
+        handle.write(body)
         if is_last:
             handle.close()
             del files[dev]
@@ -343,6 +386,11 @@ Commands:
                                         (default 10); reports KB/s, Mbps,
                                         frames/s per frame type, plus
                                         dropped-block/frame deltas
+  output <signal> [seconds] [dbfs]     set_output (signal: white|pink|sweep|
+                                        mls; default 3s, -20 dBFS; scan may
+                                        stay running -- see PROTOCOL.md)
+  outstart | outstop | outstatus       output_start / output_stop /
+                                        output_status
   blink [count]                        blink_led
   meter on|off                         toggle the live level readout
   send <raw json>                      send any command verbatim, e.g.
@@ -503,6 +551,23 @@ class Shell:
             elif cmd == 'bench':
                 seconds = float(args[0]) if args else 10.0
                 self._bench(seconds)
+            elif cmd == 'output':
+                if not args:
+                    print('usage: output <white|pink|sweep|mls> '
+                         '[seconds] [level_dbfs]')
+                    return True
+                req = {'cmd': 'set_output', 'signal': args[0]}
+                if len(args) > 1:
+                    req['seconds'] = float(args[1])
+                if len(args) > 2:
+                    req['level_dbfs'] = float(args[2])
+                self._call(req)
+            elif cmd == 'outstart':
+                self._call({'cmd': 'output_start'})
+            elif cmd == 'outstop':
+                self._call({'cmd': 'output_stop'})
+            elif cmd == 'outstatus':
+                self._call({'cmd': 'output_status'})
             elif cmd == 'blink':
                 count = int(args[0]) if args else 1
                 self._call({'cmd': 'blink_led', 'count': count})
