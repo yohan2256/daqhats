@@ -319,8 +319,11 @@ via `channel_map`, then look `band_index` up in that device's table entry.
 `network.stream_frames_dropped` counts stream frames evicted because a
 stream client's send queue was full (a slow network link or a stalled
 client) — the oldest queued frame is dropped so acquisition never stalls
-(see §6). A rising count during a bandwidth test means the link cannot
-keep up with the current streaming mode; see §8 for how to measure this.
+(see §6). It is present in the handshake and in `get_config`'s result —
+**not** in `status`'s result, which is a deliberately smaller, per-device
+snapshot (§4) without the `dsp`/`network` blocks. A rising count during a
+bandwidth test means the link cannot keep up with the current streaming
+mode; see §8 for how to measure this.
 
 ### Command response (control port only)
 
@@ -663,9 +666,10 @@ Leq_T  = 10 * log10( mean(x^2 over T) / (20e-6)^2 )
   decimated series.) RAW_DUMP chunks are the exception — they block instead
   of dropping (§2.5), so a `get_raw` after the fact is the reliable way to
   recover a gap in a live recording. Every eviction increments
-  `network.stream_frames_dropped` in `status`/the handshake, so a client can
-  tell the difference between "quiet because nothing changed" and "quiet
-  because frames are being lost."
+  `network.stream_frames_dropped`, readable from `get_config` or the
+  handshake (**not** `status` — see §3), so a client can tell the difference
+  between "quiet because nothing changed" and "quiet because frames are
+  being lost."
 - **Ordering:** within a single connection, bytes are ordered (TCP). On the
   control port a command's `response` always follows the commands sent
   before it; an event may be interleaved (e.g. the `stopped` event can
@@ -740,7 +744,7 @@ on the actual link. `pislm_test.py` has a `bench <seconds>` shorthand that
 counts received bytes/frames per frame type over a window and reports
 throughput (KB/s and Mbps) alongside `dsp.dropped_blocks` (device-side DSP
 overload) and `network.stream_frames_dropped` (§6, network-side backpressure)
-deltas from `status`:
+deltas from **`get_config`** (`status` does not carry these fields — see §3):
 
 ```
 > bench 15
@@ -750,8 +754,106 @@ deltas from `status`:
   dsp dropped_blocks: +0   stream frames dropped: +0
 ```
 
+**Measured in the field** (Pi 4, 6 channels, resampled to 48 kHz, raw
+streaming, 10-minute `bench` runs): Wi-Fi sustained 18.34 Mbps and wired
+Ethernet 18.45 Mbps, both with `dsp dropped_blocks: +0` and
+`stream frames dropped: +0` over the full 600 s window. Wired had roughly
+4x lower control-port round-trip latency (2.1 ms vs. 8.2 ms). Both links are
+viable for continuous raw streaming on a similar network; always re-measure
+on your own, especially for unattended multi-hour sessions.
+
 A non-zero `stream frames dropped` delta while `dropped_blocks` stays at 0
 means the **network**, not the Pi's DSP, is the bottleneck for the current
 mode — switch to Ethernet, lower `sample_rate`, enable `[resample]` to a
 lower common rate, or turn off `stream_raw` and rely on bands/levels plus
 on-demand `get_raw` instead.
+
+---
+
+## 9. Implementation checklist (read this before you start coding)
+
+Everything below was learned the hard way while building the reference
+client (`pislm_test.py`) — each item is a real bug that was hit and fixed.
+If you write your own client from this document alone, start here.
+
+1. **TCP is a byte stream, not a message stream.** A single `recv()` call
+   can return fewer bytes than you asked for, or bundle several messages
+   together. Never assume one `recv()` = one frame or one JSON line. Use a
+   read-exactly-N-bytes loop for the stream port:
+   ```
+   function recv_exact(sock, n):
+       buf = empty
+       while len(buf) < n:
+           chunk = sock.recv(n - len(buf))
+           if chunk is empty: raise "peer closed"
+           buf += chunk
+       return buf
+   ```
+   Apply it to the stream port's 5-byte header, then again to the `length`
+   bytes of payload it declares (§2).
+
+2. **The control port's JSON is newline-delimited, not one-JSON-per-`recv()`.**
+   Buffer incoming bytes yourself and split on `\n`; a single `recv()` may
+   contain zero, one, or several complete lines, or a truncated one. Keep
+   the remainder for the next read.
+
+3. **Do not put a read/receive timeout on your long-lived listener.** Idle
+   silence is *normal*, not a sign of disconnection:
+   - The control port sends nothing while no command is pending and no
+     event fires — that can be minutes.
+   - The stream port sends nothing at all while the scan is stopped, even
+     right after a client connects.
+   A socket-level timeout (e.g. Python's `settimeout(N)`) will raise once
+   `N` seconds pass without traffic on *either* port, and that exception is
+   easy to mistake for a real disconnect (`socket.timeout` is a subclass of
+   `OSError`, so a catch-all disconnect handler swallows it) — this exact
+   bug made `pislm_test.py` print "connection closed" after 10 s of a user
+   just sitting at the prompt, with nothing wrong. Fix: only bound the
+   initial `connect()` (so an unreachable host still fails fast), then clear
+   the timeout once connected and block indefinitely. The only reliable
+   disconnect signal is `recv()` returning **zero bytes**. To actively check
+   liveness, send `{"cmd": "ping"}` on the control port and time out on that
+   specific request/response pair, not on the socket itself.
+
+4. **Open both ports.** The control port sends commands (`start`, `stop`,
+   config) and receives their responses; the stream port receives
+   LEVEL/DATA/BAND/etc. A client that only wants levels still needs the
+   control port to `start` the scan in the first place (unless
+   `[control] autostart = true`).
+
+5. **Match responses to requests by `id`, not by arrival order.** Keep a
+   map of pending `id -> waiter`; a background reader dispatches each
+   incoming `response` to whichever caller is waiting on that `id`, and
+   handles `event` messages (unsolicited) immediately as they arrive,
+   independent of any pending request.
+
+6. **Re-read `channel_map` and `units` from the latest handshake/event.**
+   They can change after `set_channels`, or simply be reissued fresh on
+   every reconnect — don't cache them once at startup and assume they're
+   still valid.
+
+7. **You must parse every frame's header, even ones you ignore.** The
+   5-byte type+length header is how you find the start of the *next*
+   frame; skip `length` bytes for a frame type you don't care about, but
+   never skip parsing the header itself, or you'll lose sync with the
+   stream permanently.
+
+8. **Configuration commands require the scan to be stopped.** If a command
+   returns `"a scan is active; send \"stop\" first"`, send `stop`, retry,
+   then `start` again to resume.
+
+9. **Don't assume the two devices' samples line up** unless `resample` is
+   enabled and `active: true` — check `effective_rate` per device (`status`
+   or `get_config`) before doing any cross-device timing/phase analysis.
+
+10. **Know which query has which fields.** `status` is intentionally a
+    small per-device snapshot (`running`, `actual_rate`, `effective_rate`,
+    `clock`, `triggered`) — it does **not** include `dsp` or `network`.
+    For those, use `get_config` (or the handshake), e.g. when polling
+    `dsp.dropped_blocks` / `network.stream_frames_dropped` for a bandwidth
+    test (§8).
+
+11. **Plan bandwidth before enabling `stream_raw` continuously.** Level-only
+    is negligible (~1 KB/s); raw waveform for 6 channels is tens of Mbps
+    (§8). Measure your own link with a `bench`-style test before committing
+    to always-on raw streaming in the field.
