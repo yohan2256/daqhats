@@ -1,0 +1,30 @@
+[Unit]
+Description=PiSLM physical shutdown button (hold 3s to power off)
+# Deliberately does NOT depend on pislm.service or the network -- the
+# button must keep working to cleanly power off the Pi even if the
+# acquisition service has crashed or the network is down.
+
+[Service]
+Type=simple
+# Runs as root: needed to issue `systemctl poweroff` and to write the
+# onboard status LED's sysfs brightness/trigger files.
+User=root
+WorkingDirectory=/home/pi/daqhats/examples/python/mcc172/pislm
+# Point this at the interpreter that has gpiod/RPi.GPIO installed. On
+# Trixie (PEP 668) that is the virtual environment created in INSTALL.md
+# section 8; the system python will NOT have them unless installed with
+# --break-system-packages.
+ExecStart=/home/pi/pislm-venv/bin/python /home/pi/daqhats/examples/python/mcc172/pislm/shutdown_button.py
+
+# Override the GPIO pin or hold time without editing the script:
+#Environment=PISLM_SHUTDOWN_GPIO_PIN=27
+#Environment=PISLM_SHUTDOWN_HOLD_SECONDS=3.0
+
+Restart=always
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

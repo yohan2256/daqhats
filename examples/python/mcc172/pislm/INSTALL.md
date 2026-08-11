@@ -5,9 +5,10 @@ MCC 172 DAQ HAT and a Data Translation DT9837A, giving 6 calibrated IEPE
 channels streamed to a laptop as sound-level-meter data.
 
 Work through the sections in order. Sections 1–4 are hardware, 5–9 are
-software, 10–13 are configuration and commissioning.
+software, 10–13 are configuration and commissioning, and §14 adds an
+optional physical shutdown button.
 
-**Already booted and just want the commands?** §16 is the whole
+**Already booted and just want the commands?** §17 is the whole
 post-first-boot sequence in one block.
 
 ---
@@ -515,7 +516,53 @@ After editing `config.ini`: `sudo systemctl restart pislm`.
 
 ---
 
-## 14. Field checklist
+## 14. Physical shutdown button (optional)
+
+A momentary switch that powers off the Pi cleanly when held 3 seconds,
+blinking the Pi's own onboard status LED (ACT) as feedback — no dedicated
+LED or resistor to wire, and it works even if `pislm.service` has crashed,
+since it runs as its own independent service.
+
+```
+GPIO 27 (BCM, header pin 13) --+-- switch --+
+GND (header pin 9 or 14) --------------------+
+```
+
+- Internal pull-up is used, so no external resistor is needed — just a
+  switch between GPIO 27 and any GND pin.
+- **Do not use** a pin the MCC 172 occupies (BCM 0, 1, 5, 6, 8–13, 16, 19,
+  20, 26) or the sync-start trigger pin if §4 is in use (default BCM 17).
+  Override the pin with `PISLM_SHUTDOWN_GPIO_PIN` in the service file below
+  if 27 is unavailable on your wiring.
+- Holding for less than 3 s does nothing and resets the timer on release —
+  only a continuous 3-second hold blinks the LED and shuts down.
+
+Install the service:
+
+```sh
+cd ~/daqhats/examples/python/mcc172/pislm
+sed -e "s|/home/pi|$HOME|g" pislm-shutdown-button.service \
+    | sudo tee /etc/systemd/system/pislm-shutdown-button.service >/dev/null
+
+# Check it points at your home and the venv interpreter:
+grep -E "^(WorkingDirectory|ExecStart)=" \
+    /etc/systemd/system/pislm-shutdown-button.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now pislm-shutdown-button
+```
+
+It runs as root (needed for `systemctl poweroff` and the status LED's sysfs
+files), independently of `pislm.service` — deliberately so the button still
+works to power the Pi off even if the acquisition service is down.
+
+To power back on, unplug/replug power (or use a smart plug / PoE switch
+with remote power control) — there is no soft power-on without extra
+hardware, only a clean soft power-off.
+
+---
+
+## 15. Field checklist
 
 Before each measurement session:
 
@@ -538,7 +585,7 @@ resampling, keep phase-coherent channel pairs on the same device.
 
 ---
 
-## 15. Troubleshooting
+## 16. Troubleshooting
 
 | Symptom | Cause / fix |
 |---------|-------------|
@@ -552,6 +599,8 @@ resampling, keep phase-coherent channel pairs on the same device.
 | Levels ~0 dB or nonsense | IEPE off, or `sensitivity` left at 1000 (data in volts, not Pa). |
 | Level is off by a fixed amount | Recalibrate with the calibrator (§12). |
 | Hum / mains buzz | Ground loop. Use one PSU, bond DGND to earth for floating sources, keep cables away from mains. |
+| Broadband/RF-ish noise on MCC 172, clean on DT9837A | The Wi-Fi/BT antenna sits right under the HAT. Disable the radios (§11) — `rfkill block` alone does not survive a reboot, use the `dtoverlay` in §11. |
+| Shutdown button does nothing | `systemctl status pislm-shutdown-button`; check the pin isn't shared with the sync-start trigger (§4/§14) and that `python3-libgpiod` is installed (§8). |
 | `trigger GPIO unavailable` | Missing `python3-libgpiod`, or the pin collides with the MCC 172 (§4). On Trixie this package is libgpiod v2, which PiSLM detects automatically. |
 | `error: externally-managed-environment` from pip | Trixie enforces PEP 668. Install into the venv (§8), or append `--break-system-packages`. |
 | `ModuleNotFoundError: daqhats` / `uldaq` under systemd but not by hand | The unit is running the system python. Point `ExecStart` at `~/pislm-venv/bin/python` (§13). |
@@ -561,7 +610,7 @@ resampling, keep phase-coherent channel pairs on the same device.
 
 ---
 
-## 16. Quick reference — everything after the first boot
+## 17. Quick reference — everything after the first boot
 
 The full sequence, condensed. Each block links back to the section that
 explains it. Run them in order on a freshly booted Pi.
@@ -625,13 +674,18 @@ grep -E "^(User|WorkingDirectory|ExecStart|Environment)=" \
     /etc/systemd/system/pislm.service
 sudo systemctl daemon-reload && sudo systemctl enable --now pislm
 systemctl status pislm
+
+# --- 14. physical shutdown button (optional) ----------------------------
+sed -e "s|/home/pi|$HOME|g" pislm-shutdown-button.service \
+    | sudo tee /etc/systemd/system/pislm-shutdown-button.service >/dev/null
+sudo systemctl daemon-reload && sudo systemctl enable --now pislm-shutdown-button
 ```
 
 Then calibrate (§12) from the laptop and you are measuring.
 
 ---
 
-## 17. Next steps
+## 18. Next steps
 
 - **Write your client** against [`PROTOCOL.md`](PROTOCOL.md) — the complete
   wire specification (both ports, frame types, every command).
