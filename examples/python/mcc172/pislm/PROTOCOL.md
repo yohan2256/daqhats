@@ -221,6 +221,16 @@ payload = [4-byte band_index uint32][4-byte channel uint32][8-byte start_index u
   in an octave analyzer.
 - Like LEVEL, BAND_LEVEL frames are **never dropped** by network
   backpressure (§6).
+- **Filter order is a real tradeoff, not free selectivity.** `bands.order`
+  (default 3, a 6th-order Butterworth band-pass) only rejects a pure tone
+  in the *next* 1/3-octave band by ~18 dB. A sound with concentrated or
+  resonant energy (many real impacts have one) will visibly leak into
+  neighboring bands and read higher than you might expect — this is not a
+  bug, it's this filter's actual selectivity at low order. Raising `order`
+  (via `set_bands`) improves rejection (~35 dB at order=6) at the cost of
+  roughly doubling the filter's ringing on impulsive content. There is no
+  order that minimizes both; pick based on whether accurate per-band
+  separation or clean transient response matters more for your use case.
 
 ### 2.5 RAW_DUMP frames (type `0x06`) — on-demand buffer dump
 
@@ -300,7 +310,7 @@ The full configuration plus protocol metadata:
                               "3": 50.0, "4": 50.0, "5": 50.0},
   "units": {"0": "Pa", "1": "V", "2": "Pa", "3": "Pa", "4": "Pa", "5": "Pa"},
   "stream_raw": false,
-  "bands": {"enabled": true, "output": "level", "fraction": 3, "order": 6,
+  "bands": {"enabled": true, "output": "level", "fraction": 3, "order": 3,
             "f_min": 20.0, "f_max": 20000.0},
   "weighting": {"frequency": "A", "time": "Fast"},
   "level": {"enabled": true, "output_rate": 10.0},
@@ -353,14 +363,14 @@ BAND / BAND_LEVEL frames to its parameters at that device's rate:
 
 ```json
 "band_table": [
-  {"device": 0, "fraction": 3, "order": 6, "input_rate": 51200.0,
+  {"device": 0, "fraction": 3, "order": 3, "input_rate": 51200.0,
    "channels": [0, 1],
    "bands": [
      {"index": 0, "center": 19.7, "f_lo": 17.5, "f_hi": 22.1,
       "decimation": 1158, "decimated_rate": 44.2}
      /* ... */
    ]},
-  {"device": 1, "fraction": 3, "order": 6, "input_rate": 51200.0,
+  {"device": 1, "fraction": 3, "order": 3, "input_rate": 51200.0,
    "channels": [2, 3, 4, 5],
    "bands": [ /* ... */ ]}
 ]

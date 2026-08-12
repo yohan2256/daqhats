@@ -35,14 +35,18 @@ class BandFilterBank:
         fraction (int): octave fraction; 3 -> 1/3-octave bands.
         order (int): Butterworth order passed to scipy.signal.butter. Note a
             band-pass design yields a 2*order system, so order=3 (the
-            default) gives a 6th-order band-pass (3 biquads). This is
-            already comfortably steep enough for IEC 61260 (>=40 dB down at
-            1.5x the band edge, >50 dB at 2x, for a 1/3-octave band) --
-            going higher (e.g. order=6 -> 12th-order) buys little further
-            stopband margin but roughly doubles the filter's ringing on
-            impulsive/transient content, which shows up as an odd-looking
-            decay tail on impact/impulse sounds in that band. Prefer a
-            lower order unless a specific compliance class demands more.
+            default) gives a 6th-order band-pass (3 biquads). This is a real
+            tradeoff between two failure modes, not a free lunch:
+              - ringing on impulsive/transient content (worse at higher
+                order -- order=6 rings ~2x as long as order=3 on the
+                lowest-frequency 1/3-octave band);
+              - adjacent-band rejection (worse at lower order -- order=3
+                only rejects a pure tone one band away by ~18 dB, vs ~35 dB
+                at order=6, so tonal/resonant energy visibly leaks into
+                neighboring bands and reads them higher than expected).
+            There is no order that minimizes both. Prefer higher order if
+            accurate per-band spectral separation matters more than
+            minimizing ringing (e.g. ISO 3382 / floor impact analysis).
         margin (float): keep the decimated rate >= 2 * upper_edge * margin.
     """
 
