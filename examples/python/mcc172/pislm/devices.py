@@ -154,7 +154,11 @@ class Mcc172Backend:
                 'address': self._address,
                 'firmware_version': fw.version,
                 'serial': self._hat.serial(),
-                'calibration_date': self._hat.calibration_date()}
+                'calibration_date': self._hat.calibration_date(),
+                # ADC input range, volts, at the screw terminals/10-32
+                # connectors -- fixed by the hardware (+-5V AC coupled),
+                # not affected by the sensitivity scaling applied on read.
+                'full_scale_v': self.full_scale_v}
 
     def blink(self, count):
         self._hat.blink_led(count)
@@ -492,7 +496,12 @@ class Dt9837aBackend:
         return {'type': 'dt9837a',
                 'product_name': self._descriptor.product_name,
                 'unique_id': self._descriptor.unique_id,
-                'interface': str(self._descriptor.dev_interface)}
+                'interface': str(self._descriptor.dev_interface),
+                # ADC input range, volts -- auto-detected from the device
+                # (BIP10VOLTS or BIP1VOLTS; see _RANGE_VOLTS above), not
+                # affected by the sensitivity scaling applied on read.
+                'full_scale_v': self.full_scale_v,
+                'input_range': self._range.name}
 
     def blink(self, count):
         self._device.flash_led(count)

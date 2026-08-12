@@ -300,9 +300,9 @@ The full configuration plus protocol metadata:
   ],
   "devices": [
     {"index": 0, "type": "mcc172",  "channels": [0, 1],
-     "actual_rate": 51200.0},
+     "actual_rate": 51200.0, "full_scale_v": 5.0},
     {"index": 1, "type": "dt9837a", "channels": [2, 3, 4, 5],
-     "actual_rate": 51200.0}
+     "actual_rate": 51200.0, "full_scale_v": 10.0}
   ],
   "sample_rate": 51200.0,
   "iepe": {"0": 1, "1": 1, "2": 1, "3": 1, "4": 1, "5": 1},
@@ -353,6 +353,12 @@ The full configuration plus protocol metadata:
 - **`overload`** is the cumulative count of clipped samples per channel
   since the last `start()` (see the `overload` event below and §4). All
   zero means no clipping has been detected yet.
+- **`devices[].full_scale_v`** is that device's ADC input range in volts,
+  fixed by the hardware -- mcc172 is always 5.0 (+-5V AC coupled); dt9837a
+  is auto-detected per unit (10.0 or 1.0). This is the raw pre-calibration
+  clipping threshold used for `overload` (at 99% of this value) -- check it
+  *before* an impact/shock test to judge peak headroom, not just after one
+  clips (§9's implementation checklist has more on this).
 - **`network.stream_frames_dropped_by_type`** breaks the total down by
   frame kind (e.g. `{"DATA": 40, "BAND": 2}`) — see §6.
 

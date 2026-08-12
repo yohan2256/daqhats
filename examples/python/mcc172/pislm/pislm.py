@@ -831,7 +831,8 @@ class Controller:
                 'channel_map': self._chan_map.table(self._backends),
                 'devices': [{'index': i, 'type': b.name,
                              'channels': self._chan_map.globals_for_device(i),
-                             'actual_rate': b.actual_rate}
+                             'actual_rate': b.actual_rate,
+                             'full_scale_v': b.full_scale_v}
                             for i, b in enumerate(self._backends)],
                 'sample_rate': self.sample_rate,
                 'iepe': {str(g): self.iepe.get(g, 0) for g in self.channels},
