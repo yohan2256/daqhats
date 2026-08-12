@@ -703,10 +703,20 @@ If you prefer to compute on the client (from raw DATA or BAND waveforms),
 the definitions used are:
 
 ```
-# Time-weighted level (Fast tau=0.125 s, Slow tau=1 s, Impulse tau=0.035 s):
-#   one-pole exponential average of the squared signal, then to dB
+# Time-weighted level -- Fast (tau=0.125 s) and Slow (tau=1 s) are symmetric
+# one-pole exponential averages of the squared signal, then to dB:
 alpha  = exp(-1 / (fs * tau))
 ms[n]  = alpha * ms[n-1] + (1 - alpha) * x[n]^2
+L_tw   = 10 * log10(ms[n] / (20e-6)^2)
+
+# Impulse (IEC 60651/60804; IEC 61672-1 no longer defines it, kept for local
+# regs that still require it) is *asymmetric* -- fast 35 ms rise so it
+# catches short transients, slow 1.5 s decay so a brief peak stays readable
+# instead of collapsing back down immediately. Nonlinear: the pole used each
+# sample depends on whether the input is currently above or below the state.
+alpha_rise, alpha_decay = exp(-1 / (fs * 0.035)), exp(-1 / (fs * 1.5))
+a      = alpha_rise if x[n]**2 > ms[n-1] else alpha_decay
+ms[n]  = a * ms[n-1] + (1 - a) * x[n]^2
 L_tw   = 10 * log10(ms[n] / (20e-6)^2)
 
 # Equivalent continuous level over T seconds (energy average):

@@ -231,7 +231,7 @@ def load_config(path):
             'f_min': parser.getfloat('bands', 'f_min', fallback=20.0),
             'f_max': parser.getfloat('bands', 'f_max', fallback=20000.0),
             'fraction': parser.getint('bands', 'fraction', fallback=3),
-            'order': parser.getint('bands', 'order', fallback=6),
+            'order': parser.getint('bands', 'order', fallback=3),
             'margin': parser.getfloat('bands', 'decimation_margin',
                                       fallback=1.0),
         },
@@ -843,7 +843,7 @@ class Controller:
                 'bands': {'enabled': bool(self.band_config.get('enabled')),
                           'output': self.band_config.get('output', 'level'),
                           'fraction': self.band_config.get('fraction', 3),
-                          'order': self.band_config.get('order', 6),
+                          'order': self.band_config.get('order', 3),
                           'f_min': self.band_config.get('f_min', 20.0),
                           'f_max': self.band_config.get('f_max', 20000.0)},
                 'weighting': {'frequency': self.freq_weighting,
@@ -1125,7 +1125,7 @@ class Controller:
             'bands': {'f_min': cfg.get('f_min', 20.0),
                       'f_max': cfg.get('f_max', 20000.0),
                       'fraction': cfg.get('fraction', 3),
-                      'order': cfg.get('order', 6),
+                      'order': cfg.get('order', 3),
                       'margin': cfg.get('margin', 1.0)},
         }
         for spec in plan:
@@ -1168,7 +1168,7 @@ class Controller:
                         f_min=cfg.get('f_min', 20.0),
                         f_max=cfg.get('f_max', 20000.0),
                         fraction=cfg.get('fraction', 3),
-                        order=cfg.get('order', 6),
+                        order=cfg.get('order', 3),
                         margin=cfg.get('margin', 1.0))
             except ImportError as err:
                 print('[bands] disabled (missing dependency: {})'.format(err),
@@ -2091,13 +2091,13 @@ class Controller:
                     f_min=cfg.get('f_min', 20.0),
                     f_max=cfg.get('f_max', 20000.0),
                     fraction=cfg.get('fraction', 3),
-                    order=cfg.get('order', 6),
+                    order=cfg.get('order', 3),
                     margin=cfg.get('margin', 1.0))
                 table.append(dict(bank.metadata(), device=dev_idx))
         return {'enabled': bool(cfg.get('enabled')),
                 'output': cfg.get('output', 'level'),
                 'fraction': cfg.get('fraction', 3),
-                'order': cfg.get('order', 6),
+                'order': cfg.get('order', 3),
                 'f_min': cfg.get('f_min', 20.0),
                 'f_max': cfg.get('f_max', 20000.0),
                 'band_table': table}
@@ -2295,7 +2295,7 @@ class Controller:
         bank = BandFilterBank(
             rate, [g_chan],
             f_min=cfg.get('f_min', 20.0), f_max=cfg.get('f_max', 20000.0),
-            fraction=cfg.get('fraction', 3), order=cfg.get('order', 6),
+            fraction=cfg.get('fraction', 3), order=cfg.get('order', 3),
             margin=cfg.get('margin', 1.0))
         # Single-channel 2-D view -- no Python-list round trip.
         segments = {}

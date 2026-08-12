@@ -76,7 +76,7 @@ command list with request/response schemas, events, and examples).
 |------|---------|---------|
 | `pislm.py`     | Raspberry Pi | Multi-device acquisition; level streaming, raw ring buffers + on-demand metrics; control/stream servers. |
 | `devices.py`           | Raspberry Pi | Device backends: MCC 172 (daqhats) and DT9837A (uldaq), plus the global channel map. |
-| `slm.py`               | Raspberry Pi | Sound-level-meter DSP: IEC 61672 A/C/Z weighting, Fast/Slow/Impulse time weighting, Leq/Lmax/Lmin/Lpeak/LN. |
+| `slm.py`               | Raspberry Pi | Sound-level-meter DSP: IEC 61672 A/C/Z weighting, IEC 61672 Fast/Slow time weighting plus a legacy IEC 60651/60804 Impulse weighting, Leq/Lmax/Lmin/Lpeak/LN. |
 | `band_filter.py`       | Raspberry Pi | Fractional-octave (1/3-octave) decimating Butterworth filter bank. |
 | `dsp_pool.py`          | Raspberry Pi | Multi-core DSP: worker processes + shared memory for the level/band computation. |
 | `gpio_trigger.py`      | Raspberry Pi | GPIO trigger-pulse output for the synchronized start (gpiod v2/v1 or RPi.GPIO). |

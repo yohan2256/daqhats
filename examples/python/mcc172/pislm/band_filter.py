@@ -34,9 +34,15 @@ class BandFilterBank:
         f_min, f_max (float): requested band-center frequency range (Hz).
         fraction (int): octave fraction; 3 -> 1/3-octave bands.
         order (int): Butterworth order passed to scipy.signal.butter. Note a
-            band-pass design yields a 2*order system, so order=6 gives a
-            12th-order band-pass (6 biquads). Use order=3 for a literal
-            6th-order band-pass.
+            band-pass design yields a 2*order system, so order=3 (the
+            default) gives a 6th-order band-pass (3 biquads). This is
+            already comfortably steep enough for IEC 61260 (>=40 dB down at
+            1.5x the band edge, >50 dB at 2x, for a 1/3-octave band) --
+            going higher (e.g. order=6 -> 12th-order) buys little further
+            stopband margin but roughly doubles the filter's ringing on
+            impulsive/transient content, which shows up as an odd-looking
+            decay tail on impact/impulse sounds in that band. Prefer a
+            lower order unless a specific compliance class demands more.
         margin (float): keep the decimated rate >= 2 * upper_edge * margin.
     """
 
@@ -44,7 +50,7 @@ class BandFilterBank:
     F_REF = 1000.0
 
     def __init__(self, fs, channels, f_min=20.0, f_max=20000.0,
-                 fraction=3, order=6, margin=1.0):
+                 fraction=3, order=3, margin=1.0):
         self.fs = float(fs)
         self.channels = list(channels)
         self.fraction = int(fraction)
