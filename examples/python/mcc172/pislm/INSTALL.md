@@ -573,6 +573,12 @@ Before each measurement session:
 - [ ] `systemctl status pislm` active; laptop can reach both ports
 - [ ] `buffer_seconds` long enough to cover your longest event
 - [ ] Laptop has disk space if recording raw (6 ch ≈ 8.8 GB/hour)
+- [ ] For impact/shock measurement (hammer, tapping machine, floor impact):
+      leave headroom below full-scale. A calibrator check only validates
+      steady-state sensitivity, not peak margin -- a real impact can be
+      20-40 dB above its own RMS. Check `overload` in `status`/handshake
+      after a trial impact; if it's nonzero, back off sensitivity or check
+      the sensor is actually rated for that shock level (see Troubleshooting).
 
 **Cross-device phase.** The two ADC clocks are independent (±50 ppm each).
 Per-channel levels and metrics are unaffected either way, but for phase or
@@ -598,6 +604,7 @@ resampling, keep phase-coherent channel pairs on the same device.
 | `clock.ppm` reads hundreds of ppm | Not a crystal error — usually a stalled or restarted scan. Restart and re-check; values beyond ±500 ppm are rejected as implausible. |
 | Levels ~0 dB or nonsense | IEPE off, or `sensitivity` left at 1000 (data in volts, not Pa). |
 | Level is off by a fixed amount | Recalibrate with the calibrator (§12). |
+| Level "hooks up then slowly decays" after an impact/shock, longer than the configured time weighting should allow (Fast should settle in <1 s) | Check for an `overload` event at the same instant (`status`, or the `overload` handshake/event field) — this is almost always ADC/sensor clipping, not a DSP bug: a clipped IEPE input can take much longer to recover than its normal small-signal time constant. Reduce sensitivity/gain for headroom, or use a sensor actually rated for that shock level. A DSP filter cannot recover data lost to clipping after the fact. |
 | Hum / mains buzz | Ground loop. Use one PSU, bond DGND to earth for floating sources, keep cables away from mains. |
 | Broadband/RF-ish noise on MCC 172, clean on DT9837A | The Wi-Fi/BT antenna sits right under the HAT. Disable the radios (§11) — `rfkill block` alone does not survive a reboot, use the `dtoverlay` in §11. |
 | Shutdown button does nothing | `systemctl status pislm-shutdown-button`; check the pin isn't shared with the sync-start trigger (§4/§14) and that `python3-libgpiod` is installed (§8). |
