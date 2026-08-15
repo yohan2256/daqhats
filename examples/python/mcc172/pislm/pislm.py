@@ -1578,10 +1578,24 @@ class Controller:
     _POOL_KIND_NAMES = {
         'level': 'LEVEL', 'band': 'BAND', 'band_level': 'BAND_LEVEL',
     }
+    # A worker emits a '..._gap' entry (base kind, key, n_skipped_samples)
+    # instead of a data frame when it skip()-ed a dropped-block gap (see
+    # _WorkerState.process) -- no frame to send, just the counter to
+    # advance, so start_index on the next real frame correctly reflects the
+    # gap instead of reporting false continuity across it.
+    _POOL_GAP_KINDS = {
+        'level_gap': 'level', 'band_gap': 'band', 'band_level_gap': 'band_level',
+    }
 
     def _emit_pool_frames(self):
         """Broadcast whatever the DSP workers have finished."""
         for kind, args, payload in self._pool.drain():
+            gap_base = self._POOL_GAP_KINDS.get(kind)
+            if gap_base is not None:
+                table_name, key_fn = self._POOL_COUNTER_TABLE[gap_base]
+                table = getattr(self, table_name)
+                self._next_index(table, key_fn(args), payload)
+                continue
             builder = self._POOL_FRAME_BUILDERS.get(kind)
             if builder is None:
                 continue

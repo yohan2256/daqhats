@@ -769,6 +769,18 @@ Leq_T  = 10 * log10( mean(x^2 over T) / (20e-6)^2 )
     from `get_config` or the handshake (**not** `status` — see §3), so a
     client can tell "quiet because nothing changed" from "quiet because
     frames are being lost" -- and, from the breakdown, *which* frame kind.
+- **DSP-pool backpressure (`[dsp] workers` != 0) is a separate, earlier
+  layer than the network queues above** -- it can drop a raw block before
+  a LEVEL/BAND/BAND_LEVEL frame is even computed, if a worker process falls
+  behind (`dsp.dropped_blocks`, §8). This is correctly reflected as a real
+  jump in `start_index` on the next frame from the affected channel/band --
+  it is not silently absorbed as if the gap never happened, and the
+  underlying time-weighted/band filters are reset across the gap rather
+  than splicing pre-gap and post-gap samples together (which would
+  otherwise show up as a spurious transient/spike, most visible in narrow
+  high-Q bands). A sustained rise in `dropped_blocks` means the Pi's DSP
+  genuinely cannot keep up at the current config -- see the troubleshooting
+  table in INSTALL.md.
 - **Ordering:** within a single connection, bytes are ordered (TCP). On the
   control port a command's `response` always follows the commands sent
   before it; an event may be interleaved (e.g. the `stopped` event can

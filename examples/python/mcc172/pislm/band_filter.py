@@ -161,3 +161,37 @@ class BandFilterBank:
                         yield b, self.channels[ci], out
                 else:
                     self._phase[b][ci] = start - block_len
+
+    def skip(self, n_frames):
+        """Account for n_frames of INPUT samples that were never fed to
+        process_2d() (e.g. dropped by DSP-pool backpressure -- see
+        dsp_pool.py): advance each band/channel's decimation phase exactly
+        as process_2d() would have, and reset that band/channel's filter
+        state so the next process_2d() call starts clean instead of
+        splicing pre-gap and post-gap samples together through a stale
+        state (which would show up as a spurious transient/spike, most
+        visible in the narrowest/highest-Q bands).
+
+        Yields (band_index, channel, n_skipped) -- the number of decimated
+        OUTPUT samples that would have been produced for that band/channel,
+        for start_index gap accounting. Only skips with a nonzero count are
+        yielded (matching process_2d's "empty results are skipped").
+        """
+        if n_frames <= 0:
+            return
+        n_chan = len(self.channels)
+        for band in self.bands:
+            b = band['index']
+            decim = band['decimation']
+            for ci in range(n_chan):
+                start = self._phase[b][ci]
+                if start < n_frames:
+                    idx = np.arange(start, n_frames, decim)
+                    self._phase[b][ci] = idx[-1] + decim - n_frames
+                    n_skipped = idx.size
+                else:
+                    self._phase[b][ci] = start - n_frames
+                    n_skipped = 0
+                self._zi[b][ci][:] = 0.0
+                if n_skipped:
+                    yield b, self.channels[ci], n_skipped

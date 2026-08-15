@@ -183,6 +183,30 @@ class ExpLevel:
         out = np.maximum(ms[idx], 1e-30)
         return 10.0 * np.log10(out / self._ref2)
 
+    def skip(self, n_frames):
+        """Account for n_frames of input that were never fed to process()
+        (e.g. dropped by DSP-pool backpressure -- see dsp_pool.py): advance
+        the decimation phase exactly as process() would have, and reset the
+        filter state so the next process() call re-primes cleanly instead
+        of splicing pre-gap and post-gap samples together as if the gap
+        never happened (which would show up as a spurious transient/spike
+        in a narrow filter's output). Returns the number of OUTPUT samples
+        that would have been produced, for start_index gap accounting.
+        """
+        if n_frames <= 0:
+            return 0
+        start = self._phase
+        if start >= n_frames:
+            self._phase = start - n_frames
+            n_out = 0
+        else:
+            idx = np.arange(start, n_frames, self._step)
+            self._phase = idx[-1] + self._step - n_frames
+            n_out = idx.size
+        self._zi = None
+        self._state = None
+        return n_out
+
 
 def window_metrics(samples, fs, weighting='A', time_weighting='Fast',
                    ref=REFERENCE_PRESSURE, percentiles=(10, 50, 90),

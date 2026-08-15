@@ -600,6 +600,7 @@ resampling, keep phase-coherent channel pairs on the same device.
 | `dt9837a: libuldaq.so: cannot open shared object file` | The `uldaq` C library was never built/installed (the `pip install uldaq` wrapper needs it separately). Redo §7's `./configure && make && sudo make install && sudo ldconfig`, then confirm with `ldconfig -p \| grep uldaq`. |
 | `dt9837a: list index out of range` | Fixed in this repo — update to the latest `pislm` (`git pull`) and restart the service; the DT9837A only supports single-ended inputs. |
 | `overrun` events, scan stops | The Pi cannot keep up. Lower `sample_rate`, lower `[bands] f_max`, turn off `[resample]`, or confirm `[dsp] workers` is `-1` (not `0`). |
+| Periodic spikes in BAND_LEVEL, raw recording looks fine | A DSP worker fell behind and dropped a block (`dsp.dropped_blocks` rising in `get_config`, §8 of PROTOCOL.md). The gap is now correctly reflected in `start_index` and the affected filters reset cleanly across it, so a rising `dropped_blocks` means the Pi's DSP genuinely can't keep up at the current config -- reduce `[bands]` scope (narrower `f_min`/`f_max`, lower `fraction`), lower `sample_rate`, or add workers/a faster Pi. |
 | Cross-device phase drifts over time | Enable `[resample]`; wait for `clock.settled` on both devices (~60 s). |
 | `clock.ppm` reads hundreds of ppm | Not a crystal error — usually a stalled or restarted scan. Restart and re-check; values beyond ±500 ppm are rejected as implausible. |
 | Levels ~0 dB or nonsense | IEPE off, or `sensitivity` left at 1000 (data in volts, not Pa). |
