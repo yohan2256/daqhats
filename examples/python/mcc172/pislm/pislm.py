@@ -231,7 +231,7 @@ def load_config(path):
             'f_min': parser.getfloat('bands', 'f_min', fallback=20.0),
             'f_max': parser.getfloat('bands', 'f_max', fallback=20000.0),
             'fraction': parser.getint('bands', 'fraction', fallback=3),
-            'order': parser.getint('bands', 'order', fallback=6),
+            'order': parser.getint('bands', 'order', fallback=3),
             'margin': parser.getfloat('bands', 'decimation_margin',
                                       fallback=1.0),
         },
@@ -265,6 +265,17 @@ def load_config(path):
             'source': parser.get('trigger', 'source', fallback='gpio'),
             'gpio_pin': parser.getint('trigger', 'gpio_pin', fallback=17),
             'pulse_ms': parser.getfloat('trigger', 'pulse_ms', fallback=10.0),
+        },
+        'ups': {
+            # Read-only: this is written by the separate
+            # pislm-shutdown-button service (shutdown_button.py), which
+            # owns the actual I2C polling and low-battery shutdown -- see
+            # its module docstring. pislm.py only surfaces the latest
+            # snapshot for status/get_config, and never touches the bus.
+            'status_file': parser.get(
+                'ups', 'status_file', fallback='/run/pislm-ups-status.json'),
+            'stale_after_seconds': parser.getfloat(
+                'ups', 'stale_after_seconds', fallback=60.0),
         },
     }
 
@@ -671,6 +682,7 @@ class Controller:
         self.level_rate = level.get('output_rate', 10.0)
         storage = settings.get('storage', {})
         self.buffer_seconds = storage.get('buffer_seconds', 60.0)
+        self.ups_cfg = dict(settings.get('ups', {}))
         # DSP worker processes: -1 = auto (cpu_count-1), 0 = inline.
         self.dsp_workers = settings.get('dsp', {}).get('workers', -1)
         self._pool = None
@@ -831,7 +843,8 @@ class Controller:
                 'channel_map': self._chan_map.table(self._backends),
                 'devices': [{'index': i, 'type': b.name,
                              'channels': self._chan_map.globals_for_device(i),
-                             'actual_rate': b.actual_rate}
+                             'actual_rate': b.actual_rate,
+                             'full_scale_v': b.full_scale_v}
                             for i, b in enumerate(self._backends)],
                 'sample_rate': self.sample_rate,
                 'iepe': {str(g): self.iepe.get(g, 0) for g in self.channels},
@@ -843,7 +856,7 @@ class Controller:
                 'bands': {'enabled': bool(self.band_config.get('enabled')),
                           'output': self.band_config.get('output', 'level'),
                           'fraction': self.band_config.get('fraction', 3),
-                          'order': self.band_config.get('order', 6),
+                          'order': self.band_config.get('order', 3),
                           'f_min': self.band_config.get('f_min', 20.0),
                           'f_max': self.band_config.get('f_max', 20000.0)},
                 'weighting': {'frequency': self.freq_weighting,
@@ -879,6 +892,7 @@ class Controller:
                 'overload': {str(g): self._overload_count.get(g, 0)
                             for g in self.channels},
                 'output': self._output_snapshot(),
+                'ups': self._ups_snapshot(),
                 'network': {
                     'stream_clients': (self._registry.stream_client_count()
                                        if self._registry else 0),
@@ -1125,7 +1139,7 @@ class Controller:
             'bands': {'f_min': cfg.get('f_min', 20.0),
                       'f_max': cfg.get('f_max', 20000.0),
                       'fraction': cfg.get('fraction', 3),
-                      'order': cfg.get('order', 6),
+                      'order': cfg.get('order', 3),
                       'margin': cfg.get('margin', 1.0)},
         }
         for spec in plan:
@@ -1168,7 +1182,7 @@ class Controller:
                         f_min=cfg.get('f_min', 20.0),
                         f_max=cfg.get('f_max', 20000.0),
                         fraction=cfg.get('fraction', 3),
-                        order=cfg.get('order', 6),
+                        order=cfg.get('order', 3),
                         margin=cfg.get('margin', 1.0))
             except ImportError as err:
                 print('[bands] disabled (missing dependency: {})'.format(err),
@@ -1406,6 +1420,33 @@ class Controller:
             'signal': cfg['signal'] if cfg else None,
         }
 
+    def _ups_snapshot(self):
+        """Best-effort read of the UPS status file written by the separate
+        pislm-shutdown-button service (see its module docstring) -- pislm
+        never touches the I2C bus itself, just surfaces the latest
+        snapshot so a client can check battery status without a second
+        connection. Missing/stale/malformed is reported, never raised:
+        a UPS (or its monitor service) being absent must not affect
+        anything else pislm does."""
+        path = self.ups_cfg.get('status_file', '/run/pislm-ups-status.json')
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {'available': False}
+        age = wall_time() - data.get('timestamp', 0)
+        stale_after = self.ups_cfg.get('stale_after_seconds', 60.0)
+        return {
+            'available': True,
+            'stale': age > stale_after,
+            'age_seconds': round(age, 1),
+            'percent': data.get('percent'),
+            'bus_voltage_v': data.get('bus_voltage_v'),
+            'current_ma': data.get('current_ma'),
+            'power_w': data.get('power_w'),
+            'low_battery_hold_seconds': data.get('low_battery_hold_seconds'),
+        }
+
     def _require_output_configured(self):
         if self._output_dev_idx is None:
             raise CommandError('no analog output device available')
@@ -1577,10 +1618,24 @@ class Controller:
     _POOL_KIND_NAMES = {
         'level': 'LEVEL', 'band': 'BAND', 'band_level': 'BAND_LEVEL',
     }
+    # A worker emits a '..._gap' entry (base kind, key, n_skipped_samples)
+    # instead of a data frame when it skip()-ed a dropped-block gap (see
+    # _WorkerState.process) -- no frame to send, just the counter to
+    # advance, so start_index on the next real frame correctly reflects the
+    # gap instead of reporting false continuity across it.
+    _POOL_GAP_KINDS = {
+        'level_gap': 'level', 'band_gap': 'band', 'band_level_gap': 'band_level',
+    }
 
     def _emit_pool_frames(self):
         """Broadcast whatever the DSP workers have finished."""
         for kind, args, payload in self._pool.drain():
+            gap_base = self._POOL_GAP_KINDS.get(kind)
+            if gap_base is not None:
+                table_name, key_fn = self._POOL_COUNTER_TABLE[gap_base]
+                table = getattr(self, table_name)
+                self._next_index(table, key_fn(args), payload)
+                continue
             builder = self._POOL_FRAME_BUILDERS.get(kind)
             if builder is None:
                 continue
@@ -2091,13 +2146,13 @@ class Controller:
                     f_min=cfg.get('f_min', 20.0),
                     f_max=cfg.get('f_max', 20000.0),
                     fraction=cfg.get('fraction', 3),
-                    order=cfg.get('order', 6),
+                    order=cfg.get('order', 3),
                     margin=cfg.get('margin', 1.0))
                 table.append(dict(bank.metadata(), device=dev_idx))
         return {'enabled': bool(cfg.get('enabled')),
                 'output': cfg.get('output', 'level'),
                 'fraction': cfg.get('fraction', 3),
-                'order': cfg.get('order', 6),
+                'order': cfg.get('order', 3),
                 'f_min': cfg.get('f_min', 20.0),
                 'f_max': cfg.get('f_max', 20000.0),
                 'band_table': table}
@@ -2295,7 +2350,7 @@ class Controller:
         bank = BandFilterBank(
             rate, [g_chan],
             f_min=cfg.get('f_min', 20.0), f_max=cfg.get('f_max', 20000.0),
-            fraction=cfg.get('fraction', 3), order=cfg.get('order', 6),
+            fraction=cfg.get('fraction', 3), order=cfg.get('order', 3),
             margin=cfg.get('margin', 1.0))
         # Single-channel 2-D view -- no Python-list round trip.
         segments = {}

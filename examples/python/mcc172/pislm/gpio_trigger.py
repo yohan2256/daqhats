@@ -110,6 +110,11 @@ class GpioTrigger:
         sleep(max(0.0001, width_s))
         self._set(False)
 
+    def set(self, high):
+        """Drive the pin directly (e.g. for a status LED, not just a
+        trigger pulse)."""
+        self._set(high)
+
     def close(self):
         try:
             self._set(False)

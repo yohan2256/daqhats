@@ -13,8 +13,8 @@ Data path (no pickling of sample blocks):
     main process                          worker process
     ------------                          --------------
     slice the device block   -> shared memory slot
-    queue (slot, n_frames)   -> Queue     -> read slot as a numpy view
-                                             filter / time-weight
+    queue (slot, n_frames,   -> Queue     -> read slot as a numpy view
+           gap_frames)                       filter / time-weight
     broadcast frames         <- Queue     <- return framed bytes + free slot
 
 Each worker owns the filter state (weighting SOS + zi, ExpLevel
@@ -23,6 +23,15 @@ boundary after start-up. Only the small output frames travel back.
 
 Workers are assigned channel groups from a single device (blocks arrive
 per device), balanced so every worker gets a similar number of channels.
+
+Backpressure: if a worker falls behind (no free shared-memory slot),
+DspPool.submit() drops the block rather than blocking the acquisition
+loop. The dropped frame count travels as gap_frames on the worker's next
+successful task, so it can skip() its integrators across the gap (see
+_WorkerState.process) instead of silently splicing pre-gap and post-gap
+samples together through stale filter state -- which would otherwise
+look like a real, spurious transient (most visible in narrow, high-Q
+band filters) and would defeat the point of start_index gap detection.
 """
 from __future__ import print_function
 
@@ -137,10 +146,40 @@ class _WorkerState:
     def band_metadata(self):
         return self.bank.metadata() if self.bank is not None else None
 
-    def process(self, data):
-        """Run the DSP on one block; return a list of (kind, args, bytes)."""
+    def process(self, data, gap_frames=0):
+        """Run the DSP on one block; return a list of (kind, args, payload).
+
+        gap_frames is the count of INPUT samples dropped (by DSP-pool
+        backpressure, see DspPool.submit) just before this block -- i.e.
+        this worker never saw them at all. Rather than silently splicing
+        this block onto stale pre-gap filter state (which would look like a
+        real signal transition and can show up as a spurious spike,
+        especially in the narrow/high-Q band filters), each affected
+        integrator is skip()-ed across the gap first: that resets its state
+        for a clean restart and returns how many OUTPUT samples the gap is
+        worth in that grid, emitted here as a ('..._gap', key, n) entry so
+        the caller can advance start_index counters to correctly reflect
+        the gap instead of reporting false continuity.
+        """
         from scipy import signal
         out = []
+        if gap_frames:
+            if self.level_enabled:
+                for c in self.channels:
+                    n = self.level[c].skip(gap_frames)
+                    if n:
+                        out.append(('level_gap', (c,), n))
+            if self.bank is not None:
+                for band_index, chan, n in self.bank.skip(gap_frames):
+                    if self.band_output == 'waveform':
+                        out.append(('band_gap', (band_index, chan), n))
+                    else:
+                        integrator = self.band_level.get((band_index, chan))
+                        if integrator is not None:
+                            n2 = integrator.skip(n)
+                            if n2:
+                                out.append(
+                                    ('band_level_gap', (band_index, chan), n2))
         if self.level_enabled:
             for i, c in enumerate(self.channels):
                 x = data[:, i]
@@ -181,12 +220,12 @@ def _worker_main(cfg, shm_name, slot_bytes, n_slots, n_cols, task_q, result_q):
             task = task_q.get()
             if task is None:
                 break
-            slot, n_frames = task
+            slot, n_frames, gap_frames = task
             start = slot * per_slot
             view = flat[start:start + n_frames * n_cols].reshape(
                 n_frames, n_cols)
             try:
-                frames = state.process(view)
+                frames = state.process(view, gap_frames)
             except Exception as err:            # noqa: BLE001
                 result_q.put(('error', cfg['worker_id'], repr(err)))
                 frames = []
@@ -233,7 +272,7 @@ class DspPool:
                 'spec': spec, 'proc': proc, 'task_q': task_q, 'shm': shm,
                 'flat': flat, 'per_slot': slot_bytes // 8, 'n_cols': n_cols,
                 'free': list(range(SLOTS_PER_WORKER)), 'pending': 0,
-                'dropped': 0})
+                'dropped': 0, 'dropped_frames': 0})
 
         # Wait for every worker to finish building its filter state.
         ready = 0
@@ -246,26 +285,38 @@ class DspPool:
     def submit(self, dev_idx, block_2d):
         """Hand a device block to the workers that serve that device.
 
-        Drops the block for a worker with no free slot (that worker is
-        lagging) rather than blocking the acquisition loop.
+        Drops the block (or truncates it to fit the slot) for a worker with
+        no free slot (that worker is lagging) rather than blocking the
+        acquisition loop. Either way, the dropped/truncated frame count is
+        carried as gap_frames on the next task so the worker can skip() its
+        integrators across the gap instead of silently splicing across it
+        (see _WorkerState.process) -- and dropped_frames still accumulates
+        even while pending, so a worker that never catches up before the
+        scan ends doesn't lose the count.
         """
+        total_frames = block_2d.shape[0]
         for worker in self.workers:
             spec = worker['spec']
             if spec['device'] != dev_idx:
                 continue
             if not worker['free']:
                 worker['dropped'] += 1
+                worker['dropped_frames'] += total_frames
                 continue
-            n_frames = block_2d.shape[0]
-            if n_frames > worker['per_slot'] // worker['n_cols']:
-                n_frames = worker['per_slot'] // worker['n_cols']
+            n_frames = total_frames
+            cap = worker['per_slot'] // worker['n_cols']
+            if n_frames > cap:
+                # The tail beyond the slot's capacity is lost too.
+                worker['dropped_frames'] += n_frames - cap
+                n_frames = cap
             slot = worker['free'].pop()
             start = slot * worker['per_slot']
             size = n_frames * worker['n_cols']
             # Copy only this worker's columns into its shared slot.
             worker['flat'][start:start + size] = \
                 block_2d[:n_frames, spec['columns']].reshape(-1)
-            worker['task_q'].put((slot, n_frames))
+            worker['task_q'].put((slot, n_frames, worker['dropped_frames']))
+            worker['dropped_frames'] = 0
             worker['pending'] += 1
 
     def drain(self):

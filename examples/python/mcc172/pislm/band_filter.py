@@ -34,9 +34,19 @@ class BandFilterBank:
         f_min, f_max (float): requested band-center frequency range (Hz).
         fraction (int): octave fraction; 3 -> 1/3-octave bands.
         order (int): Butterworth order passed to scipy.signal.butter. Note a
-            band-pass design yields a 2*order system, so order=6 gives a
-            12th-order band-pass (6 biquads). Use order=3 for a literal
-            6th-order band-pass.
+            band-pass design yields a 2*order system, so order=3 (the
+            default) gives a 6th-order band-pass (3 biquads). This is a real
+            tradeoff between two failure modes, not a free lunch:
+              - ringing on impulsive/transient content (worse at higher
+                order -- order=6 rings ~2x as long as order=3 on the
+                lowest-frequency 1/3-octave band);
+              - adjacent-band rejection (worse at lower order -- order=3
+                only rejects a pure tone one band away by ~18 dB, vs ~35 dB
+                at order=6, so tonal/resonant energy visibly leaks into
+                neighboring bands and reads them higher than expected).
+            There is no order that minimizes both. Prefer higher order if
+            accurate per-band spectral separation matters more than
+            minimizing ringing (e.g. ISO 3382 / floor impact analysis).
         margin (float): keep the decimated rate >= 2 * upper_edge * margin.
     """
 
@@ -44,7 +54,7 @@ class BandFilterBank:
     F_REF = 1000.0
 
     def __init__(self, fs, channels, f_min=20.0, f_max=20000.0,
-                 fraction=3, order=6, margin=1.0):
+                 fraction=3, order=3, margin=1.0):
         self.fs = float(fs)
         self.channels = list(channels)
         self.fraction = int(fraction)
@@ -151,3 +161,37 @@ class BandFilterBank:
                         yield b, self.channels[ci], out
                 else:
                     self._phase[b][ci] = start - block_len
+
+    def skip(self, n_frames):
+        """Account for n_frames of INPUT samples that were never fed to
+        process_2d() (e.g. dropped by DSP-pool backpressure -- see
+        dsp_pool.py): advance each band/channel's decimation phase exactly
+        as process_2d() would have, and reset that band/channel's filter
+        state so the next process_2d() call starts clean instead of
+        splicing pre-gap and post-gap samples together through a stale
+        state (which would show up as a spurious transient/spike, most
+        visible in the narrowest/highest-Q bands).
+
+        Yields (band_index, channel, n_skipped) -- the number of decimated
+        OUTPUT samples that would have been produced for that band/channel,
+        for start_index gap accounting. Only skips with a nonzero count are
+        yielded (matching process_2d's "empty results are skipped").
+        """
+        if n_frames <= 0:
+            return
+        n_chan = len(self.channels)
+        for band in self.bands:
+            b = band['index']
+            decim = band['decimation']
+            for ci in range(n_chan):
+                start = self._phase[b][ci]
+                if start < n_frames:
+                    idx = np.arange(start, n_frames, decim)
+                    self._phase[b][ci] = idx[-1] + decim - n_frames
+                    n_skipped = idx.size
+                else:
+                    self._phase[b][ci] = start - n_frames
+                    n_skipped = 0
+                self._zi[b][ci][:] = 0.0
+                if n_skipped:
+                    yield b, self.channels[ci], n_skipped
