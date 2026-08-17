@@ -6,8 +6,9 @@ Description=PiSLM physical shutdown button (hold 3s to power off)
 
 [Service]
 Type=simple
-# Runs as root: needed to issue `systemctl poweroff` and to write the
-# onboard status LED's sysfs brightness/trigger files.
+# Runs as root: needed to issue `systemctl poweroff`, to drive the GPIO
+# LED pin, and (fallback only) to write the onboard status LED's sysfs
+# brightness/trigger files.
 User=root
 WorkingDirectory=/home/pi/daqhats/examples/python/mcc172/pislm
 # Point this at the interpreter that has gpiod/RPi.GPIO installed. On
@@ -16,8 +17,9 @@ WorkingDirectory=/home/pi/daqhats/examples/python/mcc172/pislm
 # --break-system-packages.
 ExecStart=/home/pi/pislm-venv/bin/python /home/pi/daqhats/examples/python/mcc172/pislm/shutdown_button.py
 
-# Override the GPIO pin or hold time without editing the script:
+# Override the GPIO pins or hold time without editing the script:
 #Environment=PISLM_SHUTDOWN_GPIO_PIN=27
+#Environment=PISLM_SHUTDOWN_LED_GPIO_PIN=22
 #Environment=PISLM_SHUTDOWN_HOLD_SECONDS=3.0
 
 Restart=always

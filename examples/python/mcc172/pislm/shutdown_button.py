@@ -10,10 +10,20 @@ switch, is polled for a continuous 3-second hold:
                     (internal pull-up)
     GND       -----------------------+
 
-No external pull-up/pull-down resistor or LED wiring is needed: the GPIO
-line uses the SoC's internal pull-up, and the "shutting down" indicator
-reuses the Raspberry Pi's own onboard status LED (ACT / led0) over sysfs
-instead of requiring a dedicated LED + resistor.
+No external pull-up/pull-down resistor is needed for the button itself --
+the GPIO line uses the SoC's internal pull-up. For the "shutting down"
+indicator, a dedicated LED wired to a second GPIO pin is tried first:
+
+    GPIO <led_pin> ----+---- resistor ----+---- LED (anode) ---- LED (cathode)
+    GND       -----------------------------------------------------+
+
+The LED blinks while shutting down and goes dark once the process is
+killed (partway through the OS halt) -- treat "stopped blinking" as safe
+to remove power, not necessarily "fully powered off" the instant it goes
+dark. If that pin can't be opened (not wired, or in use for something
+else), this falls back to the Raspberry Pi's own onboard status LED
+(ACT / led0) over sysfs, so blinking still works with zero extra wiring
+either way.
 
 This is intentionally a separate, standalone service from pislm.service
 (see pislm-shutdown-button.service) so the button still works to cleanly
@@ -37,6 +47,9 @@ import sys
 import threading
 import time
 
+from gpio_trigger import GpioTrigger    # reused as a generic single-
+                                        # output-pin driver for the LED
+
 #: BCM pins used by the MCC 172 HAT -- never use these for the button either
 #: (kept in sync with gpio_trigger.MCC172_RESERVED_PINS).
 MCC172_RESERVED_PINS = frozenset(
@@ -46,6 +59,12 @@ MCC172_RESERVED_PINS = frozenset(
 #: trigger pin (config.ini [trigger] gpio_pin, default 17) if that feature
 #: is also in use. Override with the PISLM_SHUTDOWN_GPIO_PIN env var.
 BUTTON_PIN = int(os.environ.get('PISLM_SHUTDOWN_GPIO_PIN', 27))
+
+#: BCM pin for a dedicated shutdown-indicator LED (optional -- falls back
+#: to the onboard status LED if this pin can't be opened). Must not
+#: collide with BUTTON_PIN or the trigger pin above. Override with the
+#: PISLM_SHUTDOWN_LED_GPIO_PIN env var.
+LED_PIN = int(os.environ.get('PISLM_SHUTDOWN_LED_GPIO_PIN', 22))
 
 #: How long the button must be held continuously to trigger a shutdown.
 #: Override with the PISLM_SHUTDOWN_HOLD_SECONDS env var.
@@ -144,6 +163,40 @@ class ButtonInput:
             pass
 
 
+class GpioLed:
+    """Blinks a dedicated LED wired to a GPIO output pin.
+
+    Raises on construction if the pin can't be opened (busy, no GPIO
+    backend available, etc.) -- the caller is expected to fall back to
+    StatusLed in that case. Note this doesn't confirm an LED is actually
+    wired there (a GPIO output opens fine either way); it only confirms
+    the pin itself is usable.
+    """
+
+    def __init__(self, pin):
+        self._pin = GpioTrigger(pin)   # idles low, matching an LED off
+        self._thread = None
+
+    def start_blink(self, interval=None):
+        interval = BLINK_INTERVAL_S if interval is None else interval
+
+        def _loop():
+            on = True
+            while True:
+                try:
+                    self._pin.set(on)
+                except Exception:      # noqa: BLE001
+                    return
+                on = not on
+                time.sleep(interval)
+
+        self._thread = threading.Thread(target=_loop, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        self._pin.close()
+
+
 class StatusLed:
     """Blinks the Pi's own onboard status LED (ACT / led0) over sysfs --
     no dedicated LED or resistor needed. Best-effort: if the board has no
@@ -197,7 +250,14 @@ class StatusLed:
 
 
 def main():
-    led = StatusLed()
+    try:
+        led = GpioLed(LED_PIN)
+        print('shutdown_button: shutdown LED on GPIO {}'.format(LED_PIN))
+    except Exception as err:
+        print('shutdown_button: GPIO {} unavailable for the LED ({}); '
+              'falling back to the onboard status LED'
+              .format(LED_PIN, err), file=sys.stderr)
+        led = StatusLed()
     try:
         button = ButtonInput(BUTTON_PIN)
     except Exception as err:
