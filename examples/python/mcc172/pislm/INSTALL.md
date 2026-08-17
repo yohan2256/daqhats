@@ -575,6 +575,67 @@ To power back on, unplug/replug power (or use a smart plug / PoE switch
 with remote power control) — there is no soft power-on without extra
 hardware, only a clean soft power-off.
 
+### 14.1 UPS battery monitoring (optional)
+
+If you have an INA219-based UPS HAT (e.g. Waveshare's UPS HAT family),
+`pislm-shutdown-button.service` can also watch its battery over I2C and
+trigger the same blink+poweroff sequence on sustained low charge — not
+just the button.
+
+I2C is a shared bus: if something else (an RTC, another sensor) is
+already on SDA1/SCL1 (BCM 2/3, header pins 3/5), just wire the UPS's
+SDA/SCL to the same two pins in parallel — multiple devices coexist on
+one I2C bus as long as their addresses differ. Confirm with:
+
+```sh
+sudo raspi-config nonint do_i2c 0     # enable I2C if not already on
+i2cdetect -y 1
+```
+
+Look for `0x41` (the common default for Waveshare's INA219-based boards;
+some models/wiring use a different address — whatever responds and isn't
+`UU`-claimed by another driver is your UPS). Install the driver dependency
+and enable monitoring:
+
+```sh
+~/pislm-venv/bin/pip install smbus2
+sudo systemctl edit pislm-shutdown-button --full
+# uncomment/adjust the PISLM_UPS_* Environment= lines (§14's service file
+# has all of them, commented, with their defaults)
+sudo systemctl daemon-reload
+sudo systemctl restart pislm-shutdown-button
+journalctl -u pislm-shutdown-button -f   # confirm "UPS monitor on I2C bus ..."
+```
+
+Defaults: shuts down once the battery reads ≤10% continuously for 30s
+(a sustained-low requirement, like the button's hold, so one noisy
+reading can't trigger it), polled every 10s. The percentage formula
+assumes a 2S Li-ion pack (6.0V empty .. 8.4V full) — correct for
+Waveshare's own boards even when they support extra cells in parallel
+(parallel cells raise capacity, not pack voltage); adjust `ina219.py`'s
+`read_percentage()` bounds if your board's pack is wired differently.
+
+Every poll is also written to `/run/pislm-ups-status.json` (tmpfs,
+ephemeral) purely as a live status, not a log — `pislm.py` reads this
+(best-effort, `[ups] status_file` in `config.ini`) and surfaces it in the
+handshake/`get_config`'s `ups` field, so you can check battery status
+through the same client you already use for everything else, without a
+second connection or touching I2C directly:
+
+```
+> get_config
+...
+"ups": {"available": true, "stale": false, "age_seconds": 3.2,
+        "percent": 76.0, "bus_voltage_v": 7.82, "current_ma": -215.0,
+        "power_w": 1.68, "low_battery_hold_seconds": 0.0}
+```
+
+`pislm.py` never touches the I2C bus itself — only the independent
+shutdown-button service does, so the safety-critical low-battery shutdown
+still works even if `pislm.service` has crashed. If that service isn't
+running (or the UPS isn't wired), `available` is `false` — check just
+means the value is missing, never a crash.
+
 ---
 
 ## 15. Field checklist

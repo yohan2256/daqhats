@@ -266,6 +266,17 @@ def load_config(path):
             'gpio_pin': parser.getint('trigger', 'gpio_pin', fallback=17),
             'pulse_ms': parser.getfloat('trigger', 'pulse_ms', fallback=10.0),
         },
+        'ups': {
+            # Read-only: this is written by the separate
+            # pislm-shutdown-button service (shutdown_button.py), which
+            # owns the actual I2C polling and low-battery shutdown -- see
+            # its module docstring. pislm.py only surfaces the latest
+            # snapshot for status/get_config, and never touches the bus.
+            'status_file': parser.get(
+                'ups', 'status_file', fallback='/run/pislm-ups-status.json'),
+            'stale_after_seconds': parser.getfloat(
+                'ups', 'stale_after_seconds', fallback=60.0),
+        },
     }
 
 
@@ -671,6 +682,7 @@ class Controller:
         self.level_rate = level.get('output_rate', 10.0)
         storage = settings.get('storage', {})
         self.buffer_seconds = storage.get('buffer_seconds', 60.0)
+        self.ups_cfg = dict(settings.get('ups', {}))
         # DSP worker processes: -1 = auto (cpu_count-1), 0 = inline.
         self.dsp_workers = settings.get('dsp', {}).get('workers', -1)
         self._pool = None
@@ -880,6 +892,7 @@ class Controller:
                 'overload': {str(g): self._overload_count.get(g, 0)
                             for g in self.channels},
                 'output': self._output_snapshot(),
+                'ups': self._ups_snapshot(),
                 'network': {
                     'stream_clients': (self._registry.stream_client_count()
                                        if self._registry else 0),
@@ -1405,6 +1418,33 @@ class Controller:
             'full_scale_volts': backend.ao_full_scale_v,
             'running': self._output_running,
             'signal': cfg['signal'] if cfg else None,
+        }
+
+    def _ups_snapshot(self):
+        """Best-effort read of the UPS status file written by the separate
+        pislm-shutdown-button service (see its module docstring) -- pislm
+        never touches the I2C bus itself, just surfaces the latest
+        snapshot so a client can check battery status without a second
+        connection. Missing/stale/malformed is reported, never raised:
+        a UPS (or its monitor service) being absent must not affect
+        anything else pislm does."""
+        path = self.ups_cfg.get('status_file', '/run/pislm-ups-status.json')
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {'available': False}
+        age = wall_time() - data.get('timestamp', 0)
+        stale_after = self.ups_cfg.get('stale_after_seconds', 60.0)
+        return {
+            'available': True,
+            'stale': age > stale_after,
+            'age_seconds': round(age, 1),
+            'percent': data.get('percent'),
+            'bus_voltage_v': data.get('bus_voltage_v'),
+            'current_ma': data.get('current_ma'),
+            'power_w': data.get('power_w'),
+            'low_battery_hold_seconds': data.get('low_battery_hold_seconds'),
         }
 
     def _require_output_configured(self):

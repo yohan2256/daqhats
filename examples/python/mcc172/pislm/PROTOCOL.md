@@ -335,6 +335,9 @@ The full configuration plus protocol metadata:
   "output": {"available": true, "device": 1, "channels": [0],
              "output_rate": 48000.0, "full_scale_volts": 10.0,
              "running": false, "signal": null},
+  "ups": {"available": true, "stale": false, "age_seconds": 3.2,
+          "percent": 76.0, "bus_voltage_v": 7.82, "current_ma": -215.0,
+          "power_w": 1.68, "low_battery_hold_seconds": 0.0},
   "network": {"stream_clients": 1, "stream_frames_dropped": 0,
               "stream_frames_dropped_by_type": {}},
   "dtype": "float64",
@@ -361,6 +364,17 @@ The full configuration plus protocol metadata:
   clips (§9's implementation checklist has more on this).
 - **`network.stream_frames_dropped_by_type`** breaks the total down by
   frame kind (e.g. `{"DATA": 40, "BAND": 2}`) — see §6.
+- **`ups`** is an optional INA219-based UPS's battery status (INSTALL.md
+  §14.1), read from a small status file the separate
+  `pislm-shutdown-button` service writes -- `pislm.py` never touches the
+  I2C bus itself. `available: false` means no UPS/monitor service (not an
+  error). `stale: true` means the file is older than `[ups]
+  stale_after_seconds` in `config.ini` (default 60s) -- most likely that
+  service isn't running, so treat the accompanying values as unreliable
+  rather than current. `percent`/`bus_voltage_v`/`current_ma`/`power_w`
+  are the last reading; `low_battery_hold_seconds` is how long the battery
+  has continuously read at or below the shutdown threshold so far (0 if
+  currently above it).
 
 When band output is **active** (i.e. during a running scan with bands
 enabled, or in a `started` event), the handshake also carries a `band_table`:

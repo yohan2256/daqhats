@@ -30,6 +30,13 @@ This is intentionally a separate, standalone service from pislm.service
 power off the Pi even if the acquisition service has crashed or is not
 running.
 
+Also (optionally) watches a UPS's INA219 battery monitor over I2C -- see
+ina219.py -- and triggers the same shutdown+blink sequence if the battery
+stays below a threshold for a sustained period, not just on the button.
+Every poll is written to a small status file (PISLM_UPS_STATUS_FILE) so it
+can be checked without touching I2C directly -- pislm.py reads this file
+(best-effort) to surface battery status in its own status/get_config.
+
 Same three-backend GPIO strategy as gpio_trigger.py, so this works across
 OS generations (including Pi 5 / Trixie where the legacy interfaces are
 gone):
@@ -41,6 +48,7 @@ gone):
 from __future__ import print_function
 
 import glob
+import json
 import os
 import subprocess
 import sys
@@ -69,6 +77,25 @@ LED_PIN = int(os.environ.get('PISLM_SHUTDOWN_LED_GPIO_PIN', 22))
 #: How long the button must be held continuously to trigger a shutdown.
 #: Override with the PISLM_SHUTDOWN_HOLD_SECONDS env var.
 HOLD_SECONDS = float(os.environ.get('PISLM_SHUTDOWN_HOLD_SECONDS', 3.0))
+
+#: UPS battery monitoring (optional -- an INA219-based UPS HAT, e.g. the
+#: Waveshare UPS HAT family). Disabled automatically if no INA219 answers
+#: at the configured bus/address; never blocks the button itself.
+UPS_ENABLED = os.environ.get('PISLM_UPS_ENABLED', '1') not in ('0', 'false', '')
+UPS_I2C_BUS = int(os.environ.get('PISLM_UPS_I2C_BUS', 1))
+UPS_I2C_ADDRESS = int(os.environ.get('PISLM_UPS_I2C_ADDRESS', '0x41'), 0)
+#: Shut down once the battery has read at or below this percentage for
+#: PISLM_UPS_LOW_HOLD_SECONDS continuously (a sustained-low requirement,
+#: same idea as the button's hold -- one noisy/transient low reading must
+#: not trigger a shutdown).
+UPS_LOW_PERCENT = float(os.environ.get('PISLM_UPS_LOW_PERCENT', 10.0))
+UPS_LOW_HOLD_SECONDS = float(
+    os.environ.get('PISLM_UPS_LOW_HOLD_SECONDS', 30.0))
+UPS_POLL_SECONDS = float(os.environ.get('PISLM_UPS_POLL_SECONDS', 10.0))
+#: Where the latest UPS reading is written (tmpfs -- ephemeral by design,
+#: it is a live status, not a log). pislm.py reads this, best-effort.
+UPS_STATUS_FILE = os.environ.get(
+    'PISLM_UPS_STATUS_FILE', '/run/pislm-ups-status.json')
 
 POLL_INTERVAL_S = 0.05
 BLINK_INTERVAL_S = 0.125
@@ -249,6 +276,53 @@ class StatusLed:
         self._thread.start()
 
 
+def _open_ups():
+    """Best-effort: returns an INA219 if one answers at the configured
+    bus/address, else None. A missing/unwired UPS is not an error -- the
+    button must keep working either way."""
+    if not UPS_ENABLED:
+        return None
+    try:
+        from ina219 import INA219
+        ups = INA219(bus=UPS_I2C_BUS, address=UPS_I2C_ADDRESS)
+        ups.read_all()      # confirms the chip actually answers
+        print('shutdown_button: UPS monitor on I2C bus {} address 0x{:02x}'
+              .format(UPS_I2C_BUS, UPS_I2C_ADDRESS))
+        return ups
+    except Exception as err:
+        print('shutdown_button: no UPS at I2C bus {} address 0x{:02x} '
+              '({}); battery monitoring disabled'
+              .format(UPS_I2C_BUS, UPS_I2C_ADDRESS, err), file=sys.stderr)
+        return None
+
+
+def _write_ups_status(reading, low_since):
+    """Best-effort status-file write -- a failure here (e.g. /run not
+    writable) must never interrupt monitoring."""
+    if UPS_STATUS_FILE is None:
+        return
+    payload = dict(reading, timestamp=time.time(),
+                   low_battery_hold_seconds=(
+                       round(time.monotonic() - low_since, 1)
+                       if low_since is not None else 0.0))
+    try:
+        tmp = UPS_STATUS_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(payload, f)
+        os.replace(tmp, UPS_STATUS_FILE)     # atomic -- no partial reads
+    except OSError:
+        pass
+
+
+def _trigger_shutdown(led, reason):
+    print('shutdown_button: {} -- powering off'.format(reason))
+    led.start_blink()
+    subprocess.Popen(['systemctl', 'poweroff'])
+    # Keep blinking (and this service alive) until the system actually
+    # halts; systemd will kill us then.
+    time.sleep(60.0)
+
+
 def main():
     try:
         led = GpioLed(LED_PIN)
@@ -263,11 +337,14 @@ def main():
     except Exception as err:
         print('shutdown_button: {}'.format(err), file=sys.stderr)
         sys.exit(1)
+    ups = _open_ups()
 
     print('shutdown_button: watching GPIO {} (hold {:.1f}s to power off)'
           .format(BUTTON_PIN, HOLD_SECONDS))
 
     pressed_since = None
+    low_battery_since = None
+    next_ups_poll = 0.0
     try:
         while True:
             now = time.monotonic()
@@ -275,19 +352,39 @@ def main():
                 if pressed_since is None:
                     pressed_since = now
                 elif now - pressed_since >= HOLD_SECONDS:
-                    print('shutdown_button: held for {:.1f}s -- powering '
-                          'off'.format(HOLD_SECONDS))
-                    led.start_blink()
-                    subprocess.Popen(['systemctl', 'poweroff'])
-                    # Keep blinking (and this service alive) until the
-                    # system actually halts; systemd will kill us then.
-                    time.sleep(60.0)
+                    _trigger_shutdown(
+                        led, 'button held for {:.1f}s'.format(HOLD_SECONDS))
                     return
             else:
                 pressed_since = None
+
+            if ups is not None and now >= next_ups_poll:
+                next_ups_poll = now + UPS_POLL_SECONDS
+                try:
+                    reading = ups.read_all()
+                except Exception as err:
+                    print('shutdown_button: UPS read failed ({}); will '
+                          'retry'.format(err), file=sys.stderr)
+                    low_battery_since = None
+                else:
+                    if reading['percent'] <= UPS_LOW_PERCENT:
+                        if low_battery_since is None:
+                            low_battery_since = now
+                    else:
+                        low_battery_since = None
+                    _write_ups_status(reading, low_battery_since)
+                    if (low_battery_since is not None and
+                            now - low_battery_since >= UPS_LOW_HOLD_SECONDS):
+                        _trigger_shutdown(
+                            led, 'battery at {:.0f}% for >{:.0f}s'.format(
+                                reading['percent'], UPS_LOW_HOLD_SECONDS))
+                        return
+
             time.sleep(POLL_INTERVAL_S)
     finally:
         button.close()
+        if ups is not None:
+            ups.close()
 
 
 if __name__ == '__main__':
