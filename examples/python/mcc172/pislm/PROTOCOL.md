@@ -502,7 +502,7 @@ All `channel` fields take **global** channel numbers.
 | `set_weighting` | optional `frequency` (`A`\|`C`\|`Z`), `time` (`Fast`\|`Slow`\|`Impulse`) | `{"frequency", "time"}` |
 | `set_level` | optional `enabled` (bool), `output_rate` (Hz) | `{"enabled", "output_rate"}` |
 | `set_storage` | `buffer_seconds` (raw ring-buffer length) | `{"buffer_seconds"}` |
-| `set_dsp` | `workers` (`-1` auto, `0` inline, `N` cap) | `{"workers_configured", "cpu_count", "note"}` |
+| `set_dsp` | `workers` (`-1` auto, `0` inline, `N` cap), `block_ms` (1–200, acquisition block length) | `{"workers_configured", "block_ms", "cpu_count", "note"}` |
 | `set_resample` | optional `enabled` (bool), `output_rate` (Hz), `taps`, `phases` | `{"enabled", "output_rate", "taps", "phases", "note"}` |
 | `save_config` | optional `path`, `include_settings` (bool) | `{"path", "saved": [...], "timestamp", "sensitivity_mv_per_unit"}` |
 | `calibration_write` | `channel`, `slope`, `offset` (**mcc172 channels only**) | `{"channel", "slope", "offset"}` |
@@ -689,8 +689,13 @@ frames. Like `get_metrics`, it works while running and after `stop`.
 The requested rate applies to every device; each rounds independently:
 
 - **MCC 172** generates `51200 / N` Hz (`N` = 1..256).
-- **DT9837A** supports nearly arbitrary rates up to 52.734 kHz; the exact
-  achieved rate is reported when the scan starts.
+- **DT9837A** supports nearly arbitrary rates up to 52.734 kHz. uldaq only
+  reports the achieved rate as the return value of the scan call, so the
+  monitor issues a short probe scan when the rate is configured and uses
+  what that reports — the DSP (weighting filters, time weighting,
+  1/3-octave band edges, ring buffers) is built for the rate the ADC will
+  really run at, not the requested one. `actual_rate` reflects the probe
+  before the scan starts.
 
 Read the per-device real rates from the `set_sample_rate` result,
 `get_clock`, or the handshake `devices` list. Because the devices round

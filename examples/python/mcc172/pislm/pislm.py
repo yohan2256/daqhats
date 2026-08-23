@@ -250,6 +250,7 @@ def load_config(path):
         },
         'dsp': {
             'workers': parser.getint('dsp', 'workers', fallback=-1),
+            'block_ms': parser.getfloat('dsp', 'block_ms', fallback=20.0),
         },
         'resample': {
             'enabled': parser.getboolean('resample', 'enabled',
@@ -331,6 +332,20 @@ def raw_dump_frame(dump_id, device_index, chunk_index, is_last, start_index,
         RAW_DUMP_HEADER.pack(dump_id, device_index, chunk_index, is_last,
                              start_index) +
         sample_bytes)
+
+
+def _clamp_block_ms(value):
+    """Acquisition poll period in ms, clamped to something sane.
+
+    Below ~1 ms the poll loop is a busy-wait and the per-block DSP overhead
+    dominates; above ~200 ms the streamed level (default 10/s) would visibly
+    stutter and the device-side buffers start to matter.
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 20.0
+    return min(200.0, max(1.0, value))
 
 
 # --------------------------------------------------------------------------
@@ -685,6 +700,17 @@ class Controller:
         self.ups_cfg = dict(settings.get('ups', {}))
         # DSP worker processes: -1 = auto (cpu_count-1), 0 = inline.
         self.dsp_workers = settings.get('dsp', {}).get('workers', -1)
+        # Target acquisition block length. The band bank costs one
+        # scipy.signal.sosfilt call per band per channel per block no matter
+        # how few samples the block holds, so an unpaced poll loop -- which
+        # spins as fast as the slowest device lets it and hands the workers
+        # blocks of a few dozen samples -- pays that fixed cost hundreds of
+        # times a second. Measured for a 31-band 1/3-octave bank, 2 ch:
+        # ~1/6 of the CPU per sample at 1024-sample blocks versus
+        # 128-sample ones. Paced polling is what makes 1/3-octave output
+        # affordable at all; see set_dsp / config.ini.
+        self.block_ms = _clamp_block_ms(
+            settings.get('dsp', {}).get('block_ms', 20.0))
         self._pool = None
 
         # Cross-device clock alignment. Rate tracking is always on (it is
@@ -769,6 +795,31 @@ class Controller:
                     iepe_local[local] = self.iepe.get(g, 1)
                     sens_local[local] = self.sensitivity.get(g, 1000.0)
                 backend.configure(self.sample_rate, iepe_local, sens_local)
+            self._probe_rates()
+
+    def _probe_rates(self):
+        """Settle every backend's actual_rate against its hardware.
+
+        Must run after configure() and before _build_processing(): ring
+        buffers, weighting filters, time-weighting integrators and the
+        1/3-octave band bank are all built from actual_rate. The MCC 172
+        reads its rate back in configure(); the DT9837A cannot report one
+        until a scan is issued, so its backend runs a throwaway scan here
+        (see Dt9837aBackend.probe_rate). Without this the DT9837A's DSP is
+        built for the *requested* rate while its ADC runs at the rounded
+        one -- band centers and time constants scale by the error, on that
+        device only.
+        """
+        for backend in self._backends:
+            probe = getattr(backend, 'probe_rate', None)
+            if probe is None:
+                continue
+            try:
+                probe()
+            except Exception as err:    # noqa: BLE001 - keep the estimate
+                print('[scan] sample-rate probe failed on {} ({}); using '
+                      '{:g} Hz'.format(backend.name, err,
+                                       backend.actual_rate), flush=True)
 
     def _require_stopped(self):
         if self._running:
@@ -875,7 +926,8 @@ class Controller:
                 },
                 'clock': {str(i): t.state()
                           for i, t in sorted(self._trackers.items())},
-                'dsp': dict({'workers_configured': self.dsp_workers},
+                'dsp': dict({'workers_configured': self.dsp_workers,
+                             'block_ms': self.block_ms},
                             **(self._pool.stats() if self._pool
                                else {'workers': 0, 'mode': 'inline'})),
                 'trigger': {
@@ -957,6 +1009,9 @@ class Controller:
                         iepe_local[local] = self.iepe.get(g, 1)
                         sens_local[local] = self.sensitivity.get(g, 1000.0)
                     backend.configure(self.sample_rate, iepe_local, sens_local)
+                # Before _build_processing(), never after: the DSP is built
+                # from these rates.
+                self._probe_rates()
 
                 triggered = bool(self.trigger_cfg.get('enabled'))
                 use_gpio = (triggered and
@@ -970,10 +1025,25 @@ class Controller:
                 started = []
                 try:
                     for backend in self._backends:
+                        built_for = backend.actual_rate
                         if triggered:
                             backend.arm_trigger()
                         backend.start(triggered=triggered)
                         started.append(backend)
+                        # The probe should have made this a non-event; if
+                        # it did not, say so loudly rather than silently
+                        # processing the device on a rate it never ran at.
+                        real = backend.actual_rate
+                        if abs(real - built_for) > max(1.0,
+                                                       built_for * 1e-4):
+                            skew = (built_for / real - 1) * 100.0 if real \
+                                else float('nan')
+                            print('[scan] WARNING: {} started at {:.4f} Hz '
+                                  'but the DSP was built for {:.4f} Hz -- '
+                                  'band centers and time weighting on this '
+                                  'device are off by {:+.2f}%'.format(
+                                      backend.name, real, built_for, skew),
+                                  flush=True)
                 except Exception:
                     for backend in started:
                         backend.stop()
@@ -1238,10 +1308,20 @@ class Controller:
         return {'running': self.running}
 
     def _acquire(self):
-        """Poll every device for new samples; store, process, broadcast."""
+        """Poll every device for new samples; store, process, broadcast.
+
+        The loop is *paced* to self.block_ms rather than spun as fast as the
+        devices allow. Block size is what the band DSP actually costs: the
+        filter bank runs one sosfilt call per band per channel per block, so
+        halving the block size nearly doubles the CPU per sample. Spinning
+        also starves whichever device is slowest to produce data -- with two
+        devices the loop never idles, so the USB device gets polled
+        thousands of times a second and hands the workers useless slivers.
+        """
+        period = self.block_ms / 1000.0
+        next_poll = monotonic() + period
         try:
             while not self._stop_event.is_set():
-                got_any = False
                 now = monotonic()
                 for dev_idx, backend in enumerate(self._backends):
                     with self._lock:
@@ -1256,7 +1336,6 @@ class Controller:
                         return
                     if data.size == 0:
                         continue
-                    got_any = True
                     if dev_idx in self._trigger_pending:
                         # First samples after an armed start: edge arrived.
                         self._trigger_pending.discard(dev_idx)
@@ -1310,8 +1389,16 @@ class Controller:
                         self._process_inline(dev_idx, backend, data)
                 if self._pool is not None:
                     self._emit_pool_frames()
-                if not got_any:
-                    sleep(0.002)
+                delay = next_poll - monotonic()
+                if delay <= -period:
+                    # Fell a whole period behind (a slow block, or the
+                    # devices are outrunning us); resync instead of
+                    # accumulating a backlog of instantly-due polls.
+                    next_poll = monotonic() + period
+                else:
+                    next_poll += period
+                    if delay > 0 and self._stop_event.wait(delay):
+                        break
         finally:
             with self._lock:
                 for backend in self._backends:
@@ -1996,6 +2083,7 @@ class Controller:
                 ('storage', 'buffer_seconds'): '{:g}'.format(
                     self.buffer_seconds),
                 ('dsp', 'workers'): str(self.dsp_workers),
+                ('dsp', 'block_ms'): '{:g}'.format(self.block_ms),
                 ('bands', 'enabled'): str(
                     bool(self.band_config.get('enabled'))).lower(),
                 ('bands', 'output'): self.band_config.get('output', 'level'),
@@ -2193,18 +2281,27 @@ class Controller:
         return {'buffer_seconds': self.buffer_seconds}
 
     def _cmd_set_dsp(self, req):
-        """Set the number of DSP worker processes (-1 auto, 0 inline)."""
+        """Set the DSP worker count (-1 auto, 0 inline) and block length."""
         self._require_stopped()
         if 'workers' in req:
             workers = int(req['workers'])
             if workers < -1:
                 raise CommandError('workers must be -1 (auto), 0, or more')
             self.dsp_workers = workers
+        if 'block_ms' in req:
+            block_ms = float(req['block_ms'])
+            if not 1.0 <= block_ms <= 200.0:
+                raise CommandError('block_ms must be 1..200')
+            self.block_ms = block_ms
         import os as _os
         return {'workers_configured': self.dsp_workers,
+                'block_ms': self.block_ms,
                 'cpu_count': _os.cpu_count(),
                 'note': 'applies from the next start; a worker serves one '
-                        'device, so the effective minimum is one per device'}
+                        'device, so the effective minimum is one per device. '
+                        'block_ms sets the acquisition block length -- larger '
+                        'blocks cut the per-block band-filter overhead, at '
+                        'the cost of that much extra level latency'}
 
     def _cmd_get_raw(self, req):
         """Dump the most recent buffered raw samples to the stream clients as
