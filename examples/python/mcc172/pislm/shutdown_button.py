@@ -75,7 +75,7 @@ BUTTON_PIN = int(os.environ.get('PISLM_SHUTDOWN_GPIO_PIN', 27))
 #: to the onboard status LED if this pin can't be opened). Must not
 #: collide with BUTTON_PIN or the trigger pin above. Override with the
 #: PISLM_SHUTDOWN_LED_GPIO_PIN env var.
-LED_PIN = int(os.environ.get('PISLM_SHUTDOWN_LED_GPIO_PIN', 22))
+LED_PIN = int(os.environ.get('PISLM_SHUTDOWN_LED_GPIO_PIN', 24))
 
 #: How long the button must be held continuously to trigger a shutdown.
 #: Override with the PISLM_SHUTDOWN_HOLD_SECONDS env var.
