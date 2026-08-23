@@ -88,6 +88,14 @@ HOLD_SECONDS = float(os.environ.get('PISLM_SHUTDOWN_HOLD_SECONDS', 3.0))
 UPS_ENABLED = os.environ.get('PISLM_UPS_ENABLED', '1') not in ('0', 'false', '')
 UPS_I2C_BUS = int(os.environ.get('PISLM_UPS_I2C_BUS', 1))
 UPS_I2C_ADDRESS = int(os.environ.get('PISLM_UPS_I2C_ADDRESS', '0x41'), 0)
+#: Bus voltage at 0% / 100% battery -- MUST match your actual pack's
+#: series cell count (default is Waveshare's own 2S Li-ion assumption,
+#: 2*3.0V .. 2*4.2V; confirmed in the field that this does not universally
+#: hold -- a 3S pack is 9.0V/12.6V). Getting this wrong doesn't error, it
+#: just silently clamps to a meaningless 0%/100% -- see ina219.py and
+#: INSTALL.md 14.1.
+UPS_V_MIN = float(os.environ.get('PISLM_UPS_V_MIN', 6.0))
+UPS_V_MAX = float(os.environ.get('PISLM_UPS_V_MAX', 8.4))
 #: Shut down once the battery has read at or below this percentage for
 #: PISLM_UPS_LOW_HOLD_SECONDS continuously (a sustained-low requirement,
 #: same idea as the button's hold -- one noisy/transient low reading must
@@ -304,10 +312,12 @@ def _open_ups():
         return None
     try:
         from ina219 import INA219
-        ups = INA219(bus=UPS_I2C_BUS, address=UPS_I2C_ADDRESS)
+        ups = INA219(bus=UPS_I2C_BUS, address=UPS_I2C_ADDRESS,
+                    v_min=UPS_V_MIN, v_max=UPS_V_MAX)
         ups.read_all()      # confirms the chip actually answers
-        print('shutdown_button: UPS monitor on I2C bus {} address 0x{:02x}'
-              .format(UPS_I2C_BUS, UPS_I2C_ADDRESS))
+        print('shutdown_button: UPS monitor on I2C bus {} address 0x{:02x} '
+              '({:.1f}V-{:.1f}V = 0%-100%)'
+              .format(UPS_I2C_BUS, UPS_I2C_ADDRESS, UPS_V_MIN, UPS_V_MAX))
         return ups
     except Exception as err:
         print('shutdown_button: no UPS at I2C bus {} address 0x{:02x} '
