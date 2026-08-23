@@ -29,6 +29,15 @@ ExecStart=/home/pi/pislm-venv/bin/python /home/pi/daqhats/examples/python/mcc172
 #Environment=PISLM_UPS_ENABLED=1
 #Environment=PISLM_UPS_I2C_BUS=1
 #Environment=PISLM_UPS_I2C_ADDRESS=0x41
+# Bus voltage at 0%/100% -- MUST match your actual pack's series cell
+# count, or the percentage silently clamps to a meaningless 0%/100% (this
+# happened in the field: default 6.0/8.4 assumes 2S, but a 3S pack is
+# really 9.0/12.6). See INSTALL.md 14.1.
+#Environment=PISLM_UPS_V_MIN=6.0
+#Environment=PISLM_UPS_V_MAX=8.4
+# Voltage-based percentage is a linear approximation, not true state of
+# charge (real Li-ion discharge curves are S-shaped) -- leave some
+# margin rather than cutting this close to 0.
 #Environment=PISLM_UPS_LOW_PERCENT=10.0
 #Environment=PISLM_UPS_LOW_HOLD_SECONDS=30.0
 #Environment=PISLM_UPS_POLL_SECONDS=10.0

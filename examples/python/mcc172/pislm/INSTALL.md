@@ -618,11 +618,30 @@ journalctl -u pislm-shutdown-button -f   # confirm "UPS monitor on I2C bus ..."
 
 Defaults: shuts down once the battery reads ≤10% continuously for 30s
 (a sustained-low requirement, like the button's hold, so one noisy
-reading can't trigger it), polled every 10s. The percentage formula
-assumes a 2S Li-ion pack (6.0V empty .. 8.4V full) — correct for
-Waveshare's own boards even when they support extra cells in parallel
-(parallel cells raise capacity, not pack voltage); adjust `ina219.py`'s
-`read_percentage()` bounds if your board's pack is wired differently.
+reading can't trigger it), polled every 10s.
+
+**Set `PISLM_UPS_V_MIN`/`PISLM_UPS_V_MAX` to match your actual pack --
+this is not optional.** The percentage is linear between these two bus
+voltages (0% at `V_MIN`, 100% at `V_MAX`); getting them wrong doesn't
+error, it just silently clamps to a meaningless 0% or 100% forever,
+which **quietly disables the low-battery shutdown** (it can never cross
+a threshold it's already pinned past). The default, 6.0V/8.4V, is
+Waveshare's own assumption for a 2S Li-ion pack (2 cells in series, 2 *
+3.0V empty .. 2 * 4.2V full) -- confirmed in the field that this does
+**not** universally hold across boards/packs, e.g. a 3S pack (3 cells in
+series) is 9.0V/12.6V. Multiple cells wired in *parallel* don't change
+this (parallel raises capacity, not voltage) -- only series count does.
+Check what you actually have with `cat /run/pislm-ups-status.json` right
+after a fresh full charge and again near what you believe is empty; if
+`percent` reads 100 or 0 immediately and stays pinned there while the
+`bus_voltage_v` is clearly still changing, `V_MIN`/`V_MAX` don't match
+your pack.
+
+This is also only a linear approximation of state of charge, not a true
+one -- real Li-ion discharge curves are S-shaped (fast drop near full,
+a flatter plateau through the middle, fast drop near empty), so treat
+the percentage as a rough estimate and leave real margin on
+`PISLM_UPS_LOW_PERCENT` (e.g. 20-25%) rather than cutting it close to 0.
 
 Every poll is also written to `/run/pislm-ups-status.json` (tmpfs,
 ephemeral) purely as a live status, not a log — `pislm.py` reads this

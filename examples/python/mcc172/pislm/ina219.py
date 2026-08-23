@@ -4,14 +4,20 @@
 INA219 battery/current monitor driver, as used on the Waveshare UPS HAT
 family (and most other INA219-based Raspberry Pi UPS boards).
 
-Register map, calibration constants, and the bus-voltage-to-percentage
-formula are the same ones Waveshare's own UPS HAT demo code uses (32V/2A
-calibration, current_lsb=0.1mA, power_lsb=2mW, cal_value=4096), so readings
-match what any Waveshare tool would show. The percentage formula assumes a
-2S Li-ion pack (6.0V empty .. 8.4V full, two cells in series -- true for
-the (B)/(C)/(D)/(E) boards even when they support more cells in parallel,
-since parallel cells raise capacity, not pack voltage); pass different
-``v_min``/``v_max`` if a specific board's pack is wired differently.
+Register map and calibration constants are the same ones Waveshare's own
+UPS HAT demo code uses (32V/2A calibration, current_lsb=0.1mA,
+power_lsb=2mW, cal_value=4096), so voltage/current/power readings match
+what any Waveshare tool would show.
+
+The bus-voltage-to-percentage formula is linear between v_min (empty) and
+v_max (full), defaulting to 6.0V/8.4V -- Waveshare's own default, for a 2S
+Li-ion pack (2 * 3.0V .. 2 * 4.2V). **This does NOT universally hold** --
+confirmed in the field on a board whose actual pack is 3S (9.0V/12.6V),
+reading a real ~95%-full 12.4V as a meaningless 100% under the 2S default
+(silently wrong, not an error, since anything above v_max just clamps).
+Always set v_min/v_max (constructor args, or PISLM_UPS_V_MIN/_V_MAX in
+shutdown_button.py) to match your actual pack's series cell count -- see
+INSTALL.md 14.1.
 
 Requires smbus2 (``pip install smbus2`` -- pure Python, no compile step).
 """
@@ -46,9 +52,11 @@ class INA219:
     directly would silently byte-swap every value.
     """
 
-    def __init__(self, bus=1, address=0x41):
+    def __init__(self, bus=1, address=0x41, v_min=6.0, v_max=8.4):
         import smbus2
         self.address = address
+        self.v_min = v_min
+        self.v_max = v_max
         self._bus = smbus2.SMBus(bus)
         self._write16(_REG_CONFIG, _CONFIG_32V_2A)
         self._write16(_REG_CALIBRATION, _CAL_VALUE)
@@ -85,22 +93,33 @@ class INA219:
         self._write16(_REG_CALIBRATION, _CAL_VALUE)
         return self._read16(_REG_POWER) * _POWER_LSB_W
 
-    def read_percentage(self, v_min=6.0, v_max=8.4):
+    def read_percentage(self, v_min=None, v_max=None):
         """Battery percentage from bus voltage, linear between v_min
-        (empty) and v_max (full) -- Waveshare's own formula for a 2S
-        Li-ion pack (2 * 3.0V .. 2 * 4.2V), clamped to [0, 100]."""
+        (empty) and v_max (full), clamped to [0, 100]. Defaults to the
+        instance's v_min/v_max (constructor args) if not given here --
+        Waveshare's own formula uses 6.0V/8.4V for a 2S Li-ion pack (2 *
+        3.0V .. 2 * 4.2V), but boards/packs vary: e.g. a 3S pack (3 *
+        3.0V .. 3 * 4.2V) is 9.0V/12.6V. Passing the wrong range doesn't
+        error -- it just clamps to a meaningless but harmless 0% or 100%,
+        so get this right for your actual pack (see INSTALL.md 14.1)."""
+        v_min = self.v_min if v_min is None else v_min
+        v_max = self.v_max if v_max is None else v_max
         pct = (self.read_bus_voltage_v() - v_min) / (v_max - v_min) * 100.0
         return max(0.0, min(100.0, pct))
 
     def read_all(self):
-        """One snapshot: bus voltage, current, power, and percentage."""
+        """One snapshot: bus voltage, current, power, and percentage.
+        Reads bus voltage once and derives percent from that same value
+        (rather than calling read_percentage(), which would read it
+        again) so both fields are consistent with each other."""
         bus_v = self.read_bus_voltage_v()
+        pct = (bus_v - self.v_min) / (self.v_max - self.v_min) * 100.0
         return {
             'bus_voltage_v': bus_v,
             'shunt_voltage_mv': self.read_shunt_voltage_mv(),
             'current_ma': self.read_current_ma(),
             'power_w': self.read_power_w(),
-            'percent': max(0.0, min(100.0, (bus_v - 6.0) / 2.4 * 100.0)),
+            'percent': max(0.0, min(100.0, pct)),
         }
 
     def close(self):
