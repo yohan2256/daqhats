@@ -252,10 +252,11 @@ sudo systemctl restart pislm
 
 What streams continuously, and what is computed on demand:
 
-- **LEVEL frames (default on).** The Pi applies the configured frequency
-  weighting (A/C/Z) and time weighting (Fast/Slow/Impulse) and streams the
-  broadband level in dB at `[level] output_rate` (default 10/s) — the live
-  needle. A few hundred bytes per second.
+- **LEVEL frames (default on).** The Pi applies an infrasound high-pass
+  (`[weighting] highpass_hz`, default 20 Hz — see below), the configured
+  frequency weighting (A/C/Z) and time weighting (Fast/Slow/Impulse), and
+  streams the broadband level in dB at `[level] output_rate` (default 10/s)
+  — the live needle. A few hundred bytes per second.
 - **Raw ring buffer + `get_metrics` + `get_raw`.** Raw samples are kept in
   RAM only (`[storage] buffer_seconds`, default 300 s, packed 8 B/sample —
   **nothing is ever written to the SD card**). The `get_metrics` command
@@ -396,6 +397,21 @@ weighting's 125 ms.
   Check each device's `actual_rate` in the handshake / `get_clock`, and watch
   the log for `hardware runs at … Hz` — a device processed on a rate its ADC
   never ran at reads wrong band centers and time constants.
+- **Infrasound high-pass.** The broadband level runs through a 20 Hz
+  Butterworth high-pass by default (`[weighting] highpass_hz`, 0 disables;
+  `highpass_order` sets the slope). IEPE inputs are AC coupled, but the
+  corner is well below 1 Hz, so sensor settling, drift, wind and structural
+  rumble reach the level detector as a slow "DC" term. A-weighting already
+  rejects it; **Z passes it at full gain and C is only −6 dB at 20 Hz** —
+  with a 94 dB 1 kHz tone plus 2 Pa DC and a 3 Pa 5 Hz rumble, Z-weighted
+  Leq reads 103.8 dB without the filter and 94.1 dB with it. Cost is −3.0 dB
+  at 20 Hz, −1.5 dB at 25 Hz, −0.65 dB at 31.5 Hz: irrelevant under A, but
+  lower the cutoff to 12.5 or 10 Hz if you are deliberately measuring low
+  frequencies with C or Z. It applies to LEVEL frames and `get_metrics`, but
+  **not** to the 1/3-octave bands (already band-passed) and **not** to the
+  raw ring buffer or `get_raw` — raw stays raw. It also does not remove the
+  startup transient when IEPE is still settling: the filter has to settle
+  too, so give the scan a couple of seconds before trusting the needle.
 - **Calibration → SPL.** With `set_sensitivity` in mV/Pa the samples are in
   pascals; `SPL = 20*log10(Prms/20e-6)` dB. The stream is unweighted
   (Z-weighting); apply A-weighting on the client for dB(A).

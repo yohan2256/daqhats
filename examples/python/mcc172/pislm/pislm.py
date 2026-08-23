@@ -238,6 +238,10 @@ def load_config(path):
         'weighting': {
             'frequency': parser.get('weighting', 'frequency', fallback='A'),
             'time': parser.get('weighting', 'time', fallback='Fast'),
+            'highpass_hz': parser.getfloat('weighting', 'highpass_hz',
+                                           fallback=20.0),
+            'highpass_order': parser.getint('weighting', 'highpass_order',
+                                            fallback=2),
         },
         'level': {
             'enabled': parser.getboolean('level', 'enabled', fallback=True),
@@ -690,6 +694,13 @@ class Controller:
 
         self.band_config = dict(settings.get('bands', {'enabled': False}))
         weighting = settings.get('weighting', {})
+        # Infrasound high-pass on the BROADBAND level path only (the band
+        # bank rejects DC per band already). An IEPE chain is AC coupled but
+        # its corner is well under 1 Hz, so settling, drift, wind and rumble
+        # ride into the level as a slow "DC" term -- at full gain under Z,
+        # and only -6 dB at 20 Hz under C. 0 disables it.
+        self.highpass_hz = float(weighting.get('highpass_hz', 20.0) or 0.0)
+        self.highpass_order = int(weighting.get('highpass_order', 2) or 2)
         self.freq_weighting = weighting.get('frequency', 'A')
         self.time_weighting = weighting.get('time', 'Fast')
         level = settings.get('level', {})
@@ -910,7 +921,9 @@ class Controller:
                           'order': self.band_config.get('order', 3),
                           'f_min': self.band_config.get('f_min', 20.0),
                           'f_max': self.band_config.get('f_max', 20000.0)},
-                'weighting': {'frequency': self.freq_weighting,
+                'weighting': {'highpass_hz': self.highpass_hz,
+                              'highpass_order': self.highpass_order,
+                              'frequency': self.freq_weighting,
                               'time': self.time_weighting},
                 'level': {'enabled': self.level_enabled,
                           'output_rate': self.level_rate},
@@ -1204,6 +1217,8 @@ class Controller:
             'level_enabled': self.level_enabled,
             'level_rate': self.level_rate,
             'freq_weighting': self.freq_weighting,
+            'highpass_hz': self.highpass_hz,
+            'highpass_order': self.highpass_order,
             'time_weighting': self.time_weighting,
             'band_output': band_output,
             'bands': {'f_min': cfg.get('f_min', 20.0),
@@ -1275,8 +1290,9 @@ class Controller:
         tau = slm.tau_for(self.time_weighting)
         if need_level:
             for dev_idx, backend in enumerate(self._backends):
-                self._wsos[dev_idx] = slm.design_weighting_sos(
-                    self.freq_weighting, self._rate(dev_idx))
+                self._wsos[dev_idx] = slm.design_level_sos(
+                    self.freq_weighting, self._rate(dev_idx),
+                    self.highpass_hz, self.highpass_order)
                 n_sec = (self._wsos[dev_idx].shape[0]
                          if self._wsos[dev_idx] is not None else 0)
                 for g in self._chan_map.globals_for_device(dev_idx):
@@ -2078,6 +2094,8 @@ class Controller:
                 ('acquisition', 'stream_raw'): str(self.stream_raw).lower(),
                 ('weighting', 'frequency'): self.freq_weighting,
                 ('weighting', 'time'): self.time_weighting,
+                ('weighting', 'highpass_hz'): '{:g}'.format(self.highpass_hz),
+                ('weighting', 'highpass_order'): str(self.highpass_order),
                 ('level', 'enabled'): str(self.level_enabled).lower(),
                 ('level', 'output_rate'): '{:g}'.format(self.level_rate),
                 ('storage', 'buffer_seconds'): '{:g}'.format(
@@ -2257,7 +2275,26 @@ class Controller:
             if tw not in ('Fast', 'Slow', 'Impulse'):
                 raise CommandError("time weighting must be Fast, Slow, Impulse")
             self.time_weighting = tw
-        return {'frequency': self.freq_weighting, 'time': self.time_weighting}
+        if 'highpass_hz' in req:
+            cutoff = float(req['highpass_hz'] or 0.0)
+            if cutoff < 0:
+                raise CommandError('highpass_hz must be >= 0 (0 disables)')
+            limit = (min(self._rate(i)
+                         for i in range(len(self._backends)))
+                     if self._backends else self.sample_rate)
+            if cutoff >= limit / 2.0:
+                raise CommandError(
+                    'highpass_hz must be below the lowest Nyquist '
+                    '({:g} Hz)'.format(limit / 2.0))
+            self.highpass_hz = cutoff
+        if 'highpass_order' in req:
+            order = int(req['highpass_order'])
+            if not 1 <= order <= 8:
+                raise CommandError('highpass_order must be 1..8')
+            self.highpass_order = order
+        return {'frequency': self.freq_weighting, 'time': self.time_weighting,
+                'highpass_hz': self.highpass_hz,
+                'highpass_order': self.highpass_order}
 
     def _cmd_set_level(self, req):
         self._require_stopped()
@@ -2424,7 +2461,8 @@ class Controller:
             metrics = slm.window_metrics(
                 data[:, ci], self._rate(dev_idx), weighting=weighting,
                 time_weighting=time_w, ref=self._ref_for(g),
-                percentiles=pct)
+                percentiles=pct, highpass_hz=self.highpass_hz,
+                highpass_order=self.highpass_order)
             metrics['units'] = self._units().get(str(g))
             metrics['calibrated'] = self.sensitivity.get(g, 1000.0) != 1000
             metrics['device'] = dev_idx

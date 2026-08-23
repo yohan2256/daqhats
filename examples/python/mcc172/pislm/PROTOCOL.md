@@ -312,7 +312,8 @@ The full configuration plus protocol metadata:
   "stream_raw": false,
   "bands": {"enabled": true, "output": "level", "fraction": 3, "order": 3,
             "f_min": 20.0, "f_max": 20000.0},
-  "weighting": {"frequency": "A", "time": "Fast"},
+  "weighting": {"highpass_hz": 20.0, "highpass_order": 2,
+                "frequency": "A", "time": "Fast"},
   "level": {"enabled": true, "output_rate": 10.0},
   "storage": {"buffer_seconds": 60.0},
   "trigger": {"enabled": false, "source": "gpio", "gpio_pin": 17,
@@ -499,7 +500,7 @@ All `channel` fields take **global** channel numbers.
 | `set_trigger` | `enable` (bool); optional `source` (`"gpio"`\|`"external"`), `gpio_pin` (BCM), `pulse_ms` | `{"enabled", "source", "gpio_pin", "pulse_ms", "mode": "RISING_EDGE", "note"}` |
 | `set_options` | optional `stream_raw` (bool) | `{"stream_raw"}` |
 | `set_bands` | optional `enabled` (bool), `output` (`level`\|`waveform`), `f_min`, `f_max`, `fraction`, `order`, `margin` | `{"enabled", "output", ..., "band_table": [per-device]}` |
-| `set_weighting` | optional `frequency` (`A`\|`C`\|`Z`), `time` (`Fast`\|`Slow`\|`Impulse`) | `{"frequency", "time"}` |
+| `set_weighting` | optional `frequency` (`A`\|`C`\|`Z`), `time` (`Fast`\|`Slow`\|`Impulse`), `highpass_hz` (0 disables), `highpass_order` (1–8) | `{"frequency", "time", "highpass_hz", "highpass_order"}` |
 | `set_level` | optional `enabled` (bool), `output_rate` (Hz) | `{"enabled", "output_rate"}` |
 | `set_storage` | `buffer_seconds` (raw ring-buffer length) | `{"buffer_seconds"}` |
 | `set_dsp` | `workers` (`-1` auto, `0` inline, `N` cap), `block_ms` (1–200, acquisition block length) | `{"workers_configured", "block_ms", "cpu_count", "note"}` |
@@ -543,7 +544,7 @@ the ADC clocks, which still drift a few ppm relative to each other.
 
 | cmd | fields | result |
 |-----|--------|--------|
-| `get_metrics` | optional `seconds`, `weighting`, `time_weighting`, `percentiles` (list), `channels` (list), `include_bands` (bool) | per-channel `{Leq, Lmax, Lmin, Lpeak, LN:{L10,...}, units, calibrated, window_seconds, n_samples[, bands]}` |
+| `get_metrics` | optional `seconds`, `weighting`, `time_weighting`, `percentiles` (list), `channels` (list), `include_bands` (bool) | per-channel `{Leq, Lmax, Lmin, Lpeak, LN:{L10,...}, units, calibrated, highpass_hz, window_seconds, n_samples[, bands]}` |
 
 `get_metrics` computes over the most-recent buffered raw samples (kept
 `buffer_seconds` long, per device), so it works while running **and** after
@@ -557,6 +558,7 @@ result carries its `device` index. Example result:
  "channels": {"0": {"Leq": 74.8, "Lmax": 88.1, "Lmin": 61.2, "Lpeak": 96.0,
                     "LN": {"L10": 78.9, "L50": 72.5, "L90": 64.1},
                     "weighting": "A", "time_weighting": "Fast",
+                    "highpass_hz": 20.0,
                     "units": "Pa", "calibrated": true, "device": 0,
                     "window_seconds": 10.0, "n_samples": 512000},
               "4": {"Leq": 71.2, "device": 1, "...": "..."}}}
@@ -731,6 +733,11 @@ The Pi already does the sound-level-meter math:
 - **LEVEL / BAND_LEVEL frames** are frequency-weighted (A/C/Z per
   `weighting.frequency`) and time-weighted (Fast/Slow/Impulse per
   `weighting.time`) levels in dB — display them directly (L_AF etc.).
+The broadband metrics use the same infrasound high-pass as the streamed
+LEVEL frames (`[weighting] highpass_hz`, echoed back as `highpass_hz`), so
+the two agree on the same signal. Per-band values in `bands` do not: each
+band is already a band-pass that rejects DC on its own.
+
 - **`get_metrics`** returns Leq, Lmax, Lmin, Lpeak, and LN percentiles over
   the buffered window, with optional per-band Leq.
 
