@@ -19,7 +19,7 @@ ExecStart=/home/pi/pislm-venv/bin/python /home/pi/daqhats/examples/python/mcc172
 
 # Override the GPIO pins or hold time without editing the script:
 #Environment=PISLM_SHUTDOWN_GPIO_PIN=27
-#Environment=PISLM_SHUTDOWN_LED_GPIO_PIN=22
+#Environment=PISLM_SHUTDOWN_LED_GPIO_PIN=24
 #Environment=PISLM_SHUTDOWN_HOLD_SECONDS=3.0
 
 # UPS battery monitoring (optional -- an INA219-based UPS HAT; needs
