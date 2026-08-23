@@ -191,6 +191,68 @@ def update_ini(path, values, note=None):
     return written
 
 
+#: Band fields that have a buildable range: (min, max, default, wording).
+#: ``set_bands`` rejects a violation and ``load_config`` falls back to the
+#: default, but both consult this table, so a value the command refuses can
+#: never sneak in through config.ini instead.
+BAND_LIMITS = {
+    'f_min':    (1e-9, None, 20.0,    '> 0'),
+    'f_max':    (1e-9, None, 20000.0, '> 0'),
+    'margin':   (1.0,  None, 1.0,     '>= 1.0'),
+    'fraction': (1,    24,   3,       '1..24 (3 = 1/3-octave)'),
+    'order':    (1,    8,    3,       '1..8'),
+}
+
+#: Band fields that must end up as ints.
+BAND_INT_FIELDS = ('fraction', 'order')
+
+
+def band_field_error(key, value):
+    """Why ``value`` is unusable for band field ``key``, or None if it is."""
+    low, high, _default, described = BAND_LIMITS[key]
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return '{} must be a number ({})'.format(key, described)
+    if value != value or value < low or (high is not None and value > high):
+        return '{} must be {}'.format(key, described)
+    return None
+
+
+def sanitize_band_config(cfg):
+    """Force a config-file band section into buildable values, in place.
+
+    Returns the list of complaints, for the caller to log. Without this, a
+    bad f_min in config.ini reached BandFilterBank and raised "math domain
+    error" at every start() -- and in the DSP-pool path that error kills the
+    worker before it reports ready, leaving start() waiting for it forever.
+    A boot-time fallback with a loud message beats either.
+    """
+    complaints = []
+    for key in BAND_LIMITS:
+        problem = band_field_error(key, cfg.get(key))
+        if problem is None:
+            if key in BAND_INT_FIELDS:
+                cfg[key] = int(float(cfg[key]))
+            else:
+                cfg[key] = float(cfg[key])
+            continue
+        default = BAND_LIMITS[key][2]
+        complaints.append('{} (using {:g})'.format(problem, default))
+        cfg[key] = default
+    if cfg['f_max'] < cfg['f_min']:
+        lo, hi = BAND_LIMITS['f_min'][2], BAND_LIMITS['f_max'][2]
+        complaints.append(
+            'f_max ({:g}) < f_min ({:g}) (using {:g}..{:g})'.format(
+                cfg['f_max'], cfg['f_min'], lo, hi))
+        cfg['f_min'], cfg['f_max'] = lo, hi
+    if cfg.get('output') not in ('level', 'waveform'):
+        complaints.append("output must be 'level' or 'waveform' "
+                          "(using 'level')")
+        cfg['output'] = 'level'
+    return complaints
+
+
 def load_config(path):
     """Load config.ini into a plain settings dict (the initial state)."""
     parser = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
@@ -225,16 +287,7 @@ def load_config(path):
         'stream_port': parser.getint('network', 'stream_port'),
         'max_queue_blocks': parser.getint('network', 'max_queue_blocks'),
         'autostart': parser.getboolean('control', 'autostart', fallback=True),
-        'bands': {
-            'enabled': parser.getboolean('bands', 'enabled', fallback=False),
-            'output': parser.get('bands', 'output', fallback='level'),
-            'f_min': parser.getfloat('bands', 'f_min', fallback=20.0),
-            'f_max': parser.getfloat('bands', 'f_max', fallback=20000.0),
-            'fraction': parser.getint('bands', 'fraction', fallback=3),
-            'order': parser.getint('bands', 'order', fallback=3),
-            'margin': parser.getfloat('bands', 'decimation_margin',
-                                      fallback=1.0),
-        },
+        'bands': _load_band_section(parser),
         'weighting': {
             'frequency': parser.get('weighting', 'frequency', fallback='A'),
             'time': parser.get('weighting', 'time', fallback='Fast'),
@@ -283,6 +336,22 @@ def load_config(path):
                 'ups', 'stale_after_seconds', fallback=60.0),
         },
     }
+
+
+def _load_band_section(parser):
+    """The [bands] section, forced into values the filter bank can build."""
+    cfg = {
+        'enabled': parser.getboolean('bands', 'enabled', fallback=False),
+        'output': parser.get('bands', 'output', fallback='level'),
+        'f_min': parser.getfloat('bands', 'f_min', fallback=20.0),
+        'f_max': parser.getfloat('bands', 'f_max', fallback=20000.0),
+        'fraction': parser.getint('bands', 'fraction', fallback=3),
+        'order': parser.getint('bands', 'order', fallback=3),
+        'margin': parser.getfloat('bands', 'decimation_margin', fallback=1.0),
+    }
+    for complaint in sanitize_band_config(cfg):
+        print('[bands] config.ini: {}'.format(complaint), flush=True)
+    return cfg
 
 
 # --------------------------------------------------------------------------
@@ -2222,21 +2291,40 @@ class Controller:
         return {'stream_raw': self.stream_raw}
 
     def _cmd_set_bands(self, req):
+        """Validate the whole setup on a copy, commit only if it builds.
+
+        Applying the fields to the live config first and letting the bank
+        constructor fail afterwards left a rejected request's values behind:
+        an f_min of 0 came back as "math domain error" and then broke every
+        later start() with the same error, even though the command had
+        reported failure. Everything below runs against ``cfg``, a copy, and
+        ``self.band_config`` is replaced only once every device has actually
+        produced a bank.
+        """
         self._require_stopped()
-        cfg = self.band_config
+        cfg = dict(self.band_config)
         if 'enabled' in req:
             cfg['enabled'] = bool(req['enabled'])
         if 'output' in req:
             if req['output'] not in ('level', 'waveform'):
                 raise CommandError("band output must be 'level' or 'waveform'")
             cfg['output'] = req['output']
-        for key in ('f_min', 'f_max', 'margin'):
+        for key in BAND_LIMITS:
             if key in req:
-                cfg[key] = float(req[key])
-        for key in ('fraction', 'order'):
-            if key in req:
-                cfg[key] = int(req[key])
+                problem = band_field_error(key, req[key])
+                if problem:
+                    raise CommandError(problem)
+                cfg[key] = (int(float(req[key])) if key in BAND_INT_FIELDS
+                            else float(req[key]))
+        f_min = cfg.get('f_min', 20.0)
+        f_max = cfg.get('f_max', 20000.0)
+        fraction = cfg.get('fraction', 3)
+        if f_max < f_min:
+            raise CommandError('f_max ({:g}) must be >= f_min ({:g})'.format(
+                f_max, f_min))
+
         table = None
+        summary = {}
         if cfg.get('enabled'):
             try:
                 from band_filter import BandFilterBank
@@ -2246,22 +2334,40 @@ class Controller:
                         err))
             table = []
             for dev_idx, backend in enumerate(self._backends):
+                rate = self._rate(dev_idx)
                 bank = BandFilterBank(
-                    self._rate(dev_idx),
-                    self._chan_map.globals_for_device(dev_idx),
-                    f_min=cfg.get('f_min', 20.0),
-                    f_max=cfg.get('f_max', 20000.0),
-                    fraction=cfg.get('fraction', 3),
+                    rate, self._chan_map.globals_for_device(dev_idx),
+                    f_min=f_min, f_max=f_max, fraction=fraction,
                     order=cfg.get('order', 3),
                     margin=cfg.get('margin', 1.0))
+                if not bank.bands:
+                    # Silently emitting nothing is the worst outcome here:
+                    # the client sees a successful set_bands and then no band
+                    # frames at all.
+                    raise CommandError(
+                        'no whole band fits {:g}-{:g} Hz on {} at {:g} Hz '
+                        '(highest usable center is {:g} Hz)'.format(
+                            f_min, f_max, backend.name, rate,
+                            bank.max_center))
                 table.append(dict(bank.metadata(), device=dev_idx))
-        return {'enabled': bool(cfg.get('enabled')),
-                'output': cfg.get('output', 'level'),
-                'fraction': cfg.get('fraction', 3),
-                'order': cfg.get('order', 3),
-                'f_min': cfg.get('f_min', 20.0),
-                'f_max': cfg.get('f_max', 20000.0),
-                'band_table': table}
+            summary = {
+                # Worst case across devices, so a client that ignores the
+                # per-device table still gets a number it can trust.
+                'max_center': min(e['max_center'] for e in table),
+                'dropped_above': max(e['dropped_above'] for e in table),
+                'dropped_below': max(e['dropped_below'] for e in table),
+            }
+
+        self.band_config = cfg          # commit only after everything built
+        result = {'enabled': bool(cfg.get('enabled')),
+                  'output': cfg.get('output', 'level'),
+                  'fraction': fraction,
+                  'order': cfg.get('order', 3),
+                  'f_min': f_min,
+                  'f_max': f_max,
+                  'band_table': table}
+        result.update(summary)
+        return result
 
     def _cmd_set_weighting(self, req):
         self._require_stopped()

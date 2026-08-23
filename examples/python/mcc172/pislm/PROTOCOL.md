@@ -385,6 +385,7 @@ BAND / BAND_LEVEL frames to its parameters at that device's rate:
 ```json
 "band_table": [
   {"device": 0, "fraction": 3, "order": 3, "input_rate": 51200.0,
+   "max_center": 20158.737, "dropped_above": 0, "dropped_below": 0,
    "channels": [0, 1],
    "bands": [
      {"index": 0, "center": 19.7, "f_lo": 17.5, "f_hi": 22.1,
@@ -499,7 +500,7 @@ All `channel` fields take **global** channel numbers.
 | `set_channels` | `device` (index), `channels` (that device's **local** channels; dt9837a must be contiguous from 0) | `{"device", "channels", "channel_map"}` — global numbering is rebuilt |
 | `set_trigger` | `enable` (bool); optional `source` (`"gpio"`\|`"external"`), `gpio_pin` (BCM), `pulse_ms` | `{"enabled", "source", "gpio_pin", "pulse_ms", "mode": "RISING_EDGE", "note"}` |
 | `set_options` | optional `stream_raw` (bool) | `{"stream_raw"}` |
-| `set_bands` | optional `enabled` (bool), `output` (`level`\|`waveform`), `f_min`, `f_max`, `fraction`, `order`, `margin` | `{"enabled", "output", ..., "band_table": [per-device]}` |
+| `set_bands` | optional `enabled` (bool), `output` (`level`\|`waveform`), `f_min` (>0), `f_max` (≥ `f_min`), `fraction` (1–24), `order` (1–8), `margin` (≥1) | `{"enabled", "output", ..., "max_center", "dropped_above", "dropped_below", "band_table": [per-device]}` |
 | `set_weighting` | optional `frequency` (`A`\|`C`\|`Z`), `time` (`Fast`\|`Slow`\|`Impulse`), `highpass_hz` (0 disables), `highpass_order` (1–8) | `{"frequency", "time", "highpass_hz", "highpass_order"}` |
 | `set_level` | optional `enabled` (bool), `output_rate` (Hz) | `{"enabled", "output_rate"}` |
 | `set_storage` | `buffer_seconds` (raw ring-buffer length) | `{"buffer_seconds"}` |
@@ -509,9 +510,30 @@ All `channel` fields take **global** channel numbers.
 | `calibration_write` | `channel`, `slope`, `offset` (**mcc172 channels only**) | `{"channel", "slope", "offset"}` |
 | `test_signals_write` | `mode` (int); optional `clock`, `sync` (**mcc172 only**) | `{"mode", "clock", "sync"}` |
 
-`set_bands` validates the settings immediately (building a filter bank per
-device) and returns the resulting per-device `band_table`; it errors if
-`numpy`/`scipy` are not installed on the Pi. `set_bands output=level` sends
+### Band range limits
+
+A band exists only when its **upper edge** fits below Nyquist, so the highest
+center a given sample rate can carry is
+
+    max_center = (sample_rate / 2) / 2**(1 / (2 * fraction))
+
+rounded down to the band grid — **20158.7 Hz for 1/3-octave at 51.2 kHz**, and
+the same on the DT9837A at 52.73 kHz. Bands above that are **dropped, not
+truncated**: a band whose top has been cut off reads low and is no longer the
+band it is labelled as. `max_center` and `dropped_above` / `dropped_below` in
+each `band_table` entry (and at the top level of the `set_bands` response)
+report the ceiling and how many requested bands fell outside it, so raising
+`f_max` past the limit is visible instead of silent. `f_lo` / `f_hi` per band
+are the real filter edges — nothing is clamped.
+
+`set_bands` validates everything before it commits: the request is applied to
+a copy, every device builds its bank, and only then does the live config
+change. A rejected request leaves the previous setup untouched. It errors if
+`numpy`/`scipy` are not installed on the Pi, if any field is out of the range
+above, or if the requested range yields **no whole band** at some device's
+rate (which would otherwise return success and then emit no band frames at
+all). Out-of-range values in `config.ini` are not fatal — each falls back to
+its default with a `[bands] config.ini: ...` line in the log. `set_bands output=level` sends
 per-band levels (`BAND_LEVEL`), `waveform` sends decimated band signals
 (`BAND`). `set_options stream_raw=false` stops raw `DATA` (levels still
 stream). After `set_channels` the global numbering changes — re-read the
