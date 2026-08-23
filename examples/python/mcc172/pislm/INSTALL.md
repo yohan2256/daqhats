@@ -555,6 +555,10 @@ GND (header pin 14 or 20) -------------------------------------+
   until you physically remove power either way — treat "stopped blinking"
   as *safe to remove power*, and wait a couple of seconds past that before
   actually unplugging it.
+- The service deliberately ignores `SIGTERM` once a shutdown starts:
+  `systemctl poweroff` stops every other service first, including this
+  one, and without that the blink would get cut off almost immediately by
+  systemd's own stop signal rather than surviving into the actual halt.
 
 Install the service:
 

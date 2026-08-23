@@ -53,6 +53,7 @@ from __future__ import print_function
 import glob
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -335,10 +336,21 @@ def _write_ups_status(reading, low_since):
 
 def _trigger_shutdown(led, reason):
     print('shutdown_button: {} -- powering off'.format(reason))
+    # `systemctl poweroff` stops every other service first, and that
+    # includes THIS one -- systemd sends SIGTERM as part of the normal
+    # shutdown-target ordering, which (Python's default disposition)
+    # kills the process almost immediately, cutting the blink off after
+    # a fraction of a cycle or none at all. Ignore SIGTERM from here on so
+    # the blink actually survives until the OS is truly going down (the
+    # eventual SIGKILL in the last teardown phase, or our own 60s cap,
+    # whichever comes first) -- safe to do only now, not for the whole
+    # process lifetime, so `systemctl stop` still works normally at any
+    # other time.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     led.start_blink()
     subprocess.Popen(['systemctl', 'poweroff'])
     # Keep blinking (and this service alive) until the system actually
-    # halts; systemd will kill us then.
+    # halts; the eventual SIGKILL (or this timeout) ends it.
     time.sleep(60.0)
 
 
