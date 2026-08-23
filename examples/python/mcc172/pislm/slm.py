@@ -7,6 +7,8 @@ Provides the pieces needed to behave like a class sound level meter:
 
 * IEC 61672 frequency weighting (A / C / Z) as digital filters, plus the
   analog weighting offset in dB at a given frequency (used for octave bands).
+* An optional infrasound high-pass, cascaded into the same filter, to keep
+  DC and sub-20 Hz content out of the broadband level.
 * Exponential time weighting (Fast / Slow / Impulse) as a stateful one-pole
   integrator on the squared signal, for a continuous time-weighted level.
 * Window metrics computed from stored raw samples on request: Leq, Lmax,
@@ -72,6 +74,52 @@ def design_weighting_sos(kind, fs):
         raise ValueError("weighting must be 'A', 'C', or 'Z'")
     z_d, p_d, k_d = signal.bilinear_zpk(z, p, k, fs)
     return signal.zpk2sos(z_d, p_d, k_d)
+
+
+def design_highpass_sos(cutoff_hz, fs, order=2):
+    """Butterworth high-pass sections, or None when disabled (cutoff <= 0).
+
+    Purpose is the broadband level, not the spectrum: an IEPE chain is AC
+    coupled but its corner sits well below 1 Hz, so sensor settling, thermal
+    drift, wind and structural rumble all land in the level as a slowly
+    varying "DC" term. Z-weighting passes that at full gain and C-weighting
+    is only -6 dB at 20 Hz, so on those the broadband reading follows
+    infrasound the microphone was never meant to measure.
+
+    Order 2 (12 dB/octave) is the default: enough to kill DC and settle
+    quickly, shallow enough that its phase/settling behavior does not
+    disturb the time weighting.
+    """
+    if not cutoff_hz or cutoff_hz <= 0:
+        return None
+    nyquist = fs / 2.0
+    if cutoff_hz >= nyquist:
+        raise ValueError('highpass cutoff must be below Nyquist ({:g} Hz)'
+                         .format(nyquist))
+    return signal.butter(int(order), float(cutoff_hz), btype='highpass',
+                         fs=fs, output='sos')
+
+
+def design_level_sos(kind, fs, highpass_hz=0.0, highpass_order=2):
+    """High-pass + frequency weighting as ONE sos stack (or None for neither).
+
+    Cascading the two into a single array matters: the level path is filtered
+    once per block per channel, and per-call overhead -- not per-sample work
+    -- is what dominates at block rate (see [dsp] block_ms). Stacking adds
+    sections to an existing call instead of adding a second call.
+
+    Note this is the *level* filter only. The 1/3-octave bank is not
+    high-passed: each band is already a band-pass that rejects DC on its own,
+    and running the level's high-pass into it would distort the 20/25 Hz
+    bands rather than clean them up.
+    """
+    high = design_highpass_sos(highpass_hz, fs, highpass_order)
+    weight = design_weighting_sos(kind, fs)
+    if high is None:
+        return weight
+    if weight is None:
+        return high
+    return np.vstack((high, weight))
 
 
 def weighting_offset_db(kind, freq):
@@ -210,7 +258,7 @@ class ExpLevel:
 
 def window_metrics(samples, fs, weighting='A', time_weighting='Fast',
                    ref=REFERENCE_PRESSURE, percentiles=(10, 50, 90),
-                   level_rate=100.0):
+                   level_rate=100.0, highpass_hz=0.0, highpass_order=2):
     """Compute sound-level-meter metrics over a block of raw samples.
 
     Args:
@@ -222,6 +270,10 @@ def window_metrics(samples, fs, weighting='A', time_weighting='Fast',
         percentiles (iterable[int]): N values for LN (level exceeded N %).
         level_rate (float): rate at which the time-weighted level is sampled
             for the statistical metrics.
+        highpass_hz (float): infrasound high-pass cutoff, 0 to disable. Must
+            match what the streamed level uses, or get_metrics and the live
+            needle disagree on the same signal.
+        highpass_order (int): Butterworth order for that high-pass.
 
     Returns:
         dict with Leq, Lmax, Lmin, Lpeak, LN, and metadata.
@@ -230,7 +282,7 @@ def window_metrics(samples, fs, weighting='A', time_weighting='Fast',
     if x.size == 0:
         return {'error': 'no samples'}
 
-    sos = design_weighting_sos(weighting, fs)
+    sos = design_level_sos(weighting, fs, highpass_hz, highpass_order)
     w = x if sos is None else signal.sosfilt(sos, x)
     ref2 = ref * ref
 
@@ -270,6 +322,7 @@ def window_metrics(samples, fs, weighting='A', time_weighting='Fast',
         'LN': ln,
         'weighting': weighting.upper(),
         'time_weighting': time_weighting,
+        'highpass_hz': float(highpass_hz or 0.0),
         'window_seconds': x.size / fs,
         'n_samples': int(x.size),
     }

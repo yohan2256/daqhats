@@ -118,7 +118,10 @@ class _WorkerState:
         self.refs = cfg['refs']                     # global chan -> reference
 
         tau = slm.tau_for(cfg['time_weighting'])
-        self.sos = slm.design_weighting_sos(cfg['freq_weighting'], self.rate)
+        # High-pass + weighting in one sos stack: one sosfilt call, not two.
+        self.sos = slm.design_level_sos(
+            cfg['freq_weighting'], self.rate,
+            cfg.get('highpass_hz', 0.0), cfg.get('highpass_order', 2))
         n_sec = self.sos.shape[0] if self.sos is not None else 0
         self.zi = {c: np.zeros((n_sec, 2)) for c in self.channels}
         self.level = {c: slm.ExpLevel(self.rate, tau, cfg['level_rate'],
