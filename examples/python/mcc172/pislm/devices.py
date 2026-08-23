@@ -21,6 +21,7 @@ analysis is only valid within a single device.
 Backend interface (duck-typed):
     name, num_channels, actual_rate, running
     configure(rate, iepe_by_local_chan, sensitivity_mv_by_local_chan)
+    probe_rate()            -> settle actual_rate BEFORE the DSP is built
     start()                 -> begin the continuous scan
     read_new()              -> (interleaved_samples, overrun_flag); non-blocking
     stop()
@@ -85,6 +86,11 @@ class Mcc172Backend:
             _src, self.actual_rate, synced = self._hat.a_in_clock_config_read()
             if not synced:
                 sleep(0.005)
+
+    def probe_rate(self):
+        """Nothing to do: a_in_clock_config_read() in configure() already
+        settled actual_rate against the hardware."""
+        return self.actual_rate
 
     def set_sensitivity(self, chan, mv_per_unit):
         self._hat.a_in_sensitivity_write(chan, mv_per_unit)
@@ -241,6 +247,7 @@ class Dt9837aBackend:
         self._view = None
         self._last_total = 0
         self.actual_rate = 51200.0
+        self._probed = {}        # (requested rate, n chans) -> achieved rate
         self.running = False
 
         # -- analog output: one channel, DT9837A only (see Usb9837x.cpp:
@@ -291,6 +298,54 @@ class Dt9837aBackend:
         # until then the requested rate is the best estimate (the DT9837A
         # supports nearly arbitrary rates up to 52.734 kHz).
         self.actual_rate = rate
+
+    def probe_rate(self):
+        """Settle ``actual_rate`` to the rate the hardware will really run.
+
+        uldaq only reports the achieved rate as the return value of
+        ``a_in_scan()``, so until a scan has actually been issued the
+        requested rate is a guess -- and the device rounds it (see
+        PROTOCOL.md, "sample_rate note"). The monitor builds its whole DSP
+        (A/C weighting filters, Fast/Slow integrators, 1/3-octave band
+        edges and decimation, ring-buffer length, clock tracker) from
+        ``actual_rate`` BEFORE the real scan starts, so without this the
+        DT9837A's channels are processed on a rate the ADC never ran at:
+        band centers and time constants scale by the rounding error while
+        the MCC 172 -- which reads its true rate back in configure() -- is
+        unaffected. That asymmetry is exactly what a "only the DT9837A
+        looks wrong" symptom looks like.
+
+        Runs a throwaway scan just long enough for the driver to report the
+        rate, then stops it. Cached per (rate, channel count), so this costs
+        one USB round trip after a rate/channel change and nothing after.
+        """
+        rate = getattr(self, '_requested_rate', self.actual_rate)
+        key = (rate, self.num_channels)
+        if key in self._probed:
+            self.actual_rate = self._probed[key]
+            return self.actual_rate
+        ul = self._ul
+        probe_buffer = ul.create_float_buffer(self.num_channels, 1000)
+        try:
+            achieved = self._ai.a_in_scan(
+                0, self.num_channels - 1, self._input_mode(), self._range,
+                1000, rate, ul.ScanOption.CONTINUOUS,
+                ul.AInScanFlag.DEFAULT, probe_buffer)
+        except ul.ULException as err:
+            print('[dt9837a] sample-rate probe failed ({}); assuming the '
+                  'requested {:g} Hz'.format(err, rate), flush=True)
+            return self.actual_rate
+        try:
+            self._ai.scan_stop()
+        except ul.ULException:
+            pass
+        self._probed[key] = achieved
+        self.actual_rate = achieved
+        if abs(achieved - rate) > max(1.0, rate * 1e-4):
+            print('[dt9837a] requested {:g} Hz; hardware runs at {:.4f} Hz '
+                  '-- the DSP is built for the latter'.format(rate, achieved),
+                  flush=True)
+        return achieved
 
     def set_sensitivity(self, chan, mv_per_unit):
         self._ai_config.set_chan_sensor_sensitivity(chan, mv_per_unit / 1000.0)
@@ -348,10 +403,22 @@ class Dt9837aBackend:
         buf_len = len(self._buffer)
         overrun = False
         if new > buf_len:
-            # The writer lapped us; drop to the newest full buffer.
+            # The writer lapped us; drop to the newest full buffer, rounding
+            # the resume point UP to a frame boundary so the interleave
+            # stays intact.
             self._last_total = total - buf_len
-            new = buf_len
+            remainder = self._last_total % self.num_channels
+            if remainder:
+                self._last_total += self.num_channels - remainder
+            new = total - self._last_total
             overrun = True
+        # uldaq's running count is a sample count, not a scan count, and a
+        # USB transfer is not obliged to end on a channel boundary. Consume
+        # whole frames only and leave any partial frame for the next poll:
+        # a half frame here would shift the interleave for the rest of the
+        # scan, so every downstream reshape(-1, num_channels) would either
+        # raise or silently rotate the channels.
+        new -= new % self.num_channels
         start = self._last_total % buf_len
         end = (start + new) % buf_len
         if self._view is None:
@@ -362,7 +429,7 @@ class Dt9837aBackend:
             data = self._view[start:end].copy()
         else:
             data = np.concatenate((self._view[start:], self._view[:end]))
-        self._last_total = total
+        self._last_total += new
         # A non-RUNNING status is an error only once data has flowed; an
         # armed scan waiting for its trigger edge must not be flagged.
         if status != ul.ScanStatus.RUNNING and self.running and total > 0:

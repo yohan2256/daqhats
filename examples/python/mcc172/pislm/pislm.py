@@ -769,6 +769,31 @@ class Controller:
                     iepe_local[local] = self.iepe.get(g, 1)
                     sens_local[local] = self.sensitivity.get(g, 1000.0)
                 backend.configure(self.sample_rate, iepe_local, sens_local)
+            self._probe_rates()
+
+    def _probe_rates(self):
+        """Settle every backend's actual_rate against its hardware.
+
+        Must run after configure() and before _build_processing(): ring
+        buffers, weighting filters, time-weighting integrators and the
+        1/3-octave band bank are all built from actual_rate. The MCC 172
+        reads its rate back in configure(); the DT9837A cannot report one
+        until a scan is issued, so its backend runs a throwaway scan here
+        (see Dt9837aBackend.probe_rate). Without this the DT9837A's DSP is
+        built for the *requested* rate while its ADC runs at the rounded
+        one -- band centers and time constants scale by the error, on that
+        device only.
+        """
+        for backend in self._backends:
+            probe = getattr(backend, 'probe_rate', None)
+            if probe is None:
+                continue
+            try:
+                probe()
+            except Exception as err:    # noqa: BLE001 - keep the estimate
+                print('[scan] sample-rate probe failed on {} ({}); using '
+                      '{:g} Hz'.format(backend.name, err,
+                                       backend.actual_rate), flush=True)
 
     def _require_stopped(self):
         if self._running:
@@ -957,6 +982,9 @@ class Controller:
                         iepe_local[local] = self.iepe.get(g, 1)
                         sens_local[local] = self.sensitivity.get(g, 1000.0)
                     backend.configure(self.sample_rate, iepe_local, sens_local)
+                # Before _build_processing(), never after: the DSP is built
+                # from these rates.
+                self._probe_rates()
 
                 triggered = bool(self.trigger_cfg.get('enabled'))
                 use_gpio = (triggered and
@@ -970,10 +998,25 @@ class Controller:
                 started = []
                 try:
                     for backend in self._backends:
+                        built_for = backend.actual_rate
                         if triggered:
                             backend.arm_trigger()
                         backend.start(triggered=triggered)
                         started.append(backend)
+                        # The probe should have made this a non-event; if
+                        # it did not, say so loudly rather than silently
+                        # processing the device on a rate it never ran at.
+                        real = backend.actual_rate
+                        if abs(real - built_for) > max(1.0,
+                                                       built_for * 1e-4):
+                            skew = (built_for / real - 1) * 100.0 if real \
+                                else float('nan')
+                            print('[scan] WARNING: {} started at {:.4f} Hz '
+                                  'but the DSP was built for {:.4f} Hz -- '
+                                  'band centers and time weighting on this '
+                                  'device are off by {:+.2f}%'.format(
+                                      backend.name, real, built_for, skew),
+                                  flush=True)
                 except Exception:
                     for backend in started:
                         backend.stop()

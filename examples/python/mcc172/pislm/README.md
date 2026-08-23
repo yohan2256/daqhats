@@ -366,6 +366,13 @@ while the workers only compute.
 - **Changing settings while streaming.** The MCC 172 rejects configuration
   changes during an active scan, so the server does too — send `stop`, make
   your change, then `start`.
+- **Per-device sample rates.** Each device rounds the requested rate its own
+  way. The MCC 172 reads its real rate back immediately; the DT9837A only
+  reports one once a scan is issued, so the monitor runs a short probe scan
+  when the rate is configured and builds the DSP for what the probe reports.
+  Check each device's `actual_rate` in the handshake / `get_clock`, and watch
+  the log for `hardware runs at … Hz` — a device processed on a rate its ADC
+  never ran at reads wrong band centers and time constants.
 - **Calibration → SPL.** With `set_sensitivity` in mV/Pa the samples are in
   pascals; `SPL = 20*log10(Prms/20e-6)` dB. The stream is unweighted
   (Z-weighting); apply A-weighting on the client for dB(A).
