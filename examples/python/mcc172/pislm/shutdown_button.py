@@ -17,13 +17,16 @@ indicator, a dedicated LED wired to a second GPIO pin is tried first:
     GPIO <led_pin> ----+---- resistor ----+---- LED (anode) ---- LED (cathode)
     GND       -----------------------------------------------------+
 
-The LED blinks while shutting down and goes dark once the process is
-killed (partway through the OS halt) -- treat "stopped blinking" as safe
-to remove power, not necessarily "fully powered off" the instant it goes
-dark. If that pin can't be opened (not wired, or in use for something
-else), this falls back to the Raspberry Pi's own onboard status LED
-(ACT / led0) over sysfs, so blinking still works with zero extra wiring
-either way.
+Three LED states, meant to be unambiguous at a glance: **steady on** while
+this service is up and running normally, **blinking** while a shutdown
+(button hold or low battery) is in progress, and **dark** once the
+process is killed partway through the OS halt -- treat "stopped
+blinking" as safe to remove power, not necessarily "fully powered off"
+the instant it goes dark. If that pin can't be opened (not wired, or in
+use for something else), this falls back to the Raspberry Pi's own
+onboard status LED (ACT / led0) over sysfs, so all three states still
+work with zero extra wiring either way (note this does repurpose the
+onboard LED away from its normal disk-activity blinking).
 
 This is intentionally a separate, standalone service from pislm.service
 (see pislm-shutdown-button.service) so the button still works to cleanly
@@ -204,6 +207,11 @@ class GpioLed:
         self._pin = GpioTrigger(pin)   # idles low, matching an LED off
         self._thread = None
 
+    def on(self):
+        """Steady on -- meant for "the system is up and running normally",
+        distinct from the shutdown blink."""
+        self._pin.set(True)
+
     def start_blink(self, interval=None):
         interval = BLINK_INTERVAL_S if interval is None else interval
 
@@ -257,6 +265,17 @@ class StatusLed:
     def _write(self, value):
         with open(self._brightness_path, 'w') as f:
             f.write(str(value))
+
+    def on(self):
+        """Steady on -- meant for "the system is up and running normally",
+        distinct from the shutdown blink. Best-effort, like everything
+        else on this class."""
+        if self._brightness_path is None:
+            return
+        try:
+            self._write(1)
+        except OSError:
+            pass
 
     def start_blink(self, interval=BLINK_INTERVAL_S):
         if self._brightness_path is None:
@@ -332,6 +351,8 @@ def main():
               'falling back to the onboard status LED'
               .format(LED_PIN, err), file=sys.stderr)
         led = StatusLed()
+    led.on()   # steady on while the system is running; start_blink() takes
+              # over (and this never goes solid again) once shutdown starts
     try:
         button = ButtonInput(BUTTON_PIN)
     except Exception as err:

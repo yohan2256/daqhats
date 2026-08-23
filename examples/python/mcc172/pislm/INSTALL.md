@@ -519,8 +519,11 @@ After editing `config.ini`: `sudo systemctl restart pislm`.
 ## 14. Physical shutdown button (optional)
 
 A momentary switch that powers off the Pi cleanly when held 3 seconds,
-blinking an LED as feedback while it shuts down — and it works even if
-`pislm.service` has crashed, since it runs as its own independent service.
+with an LED that's unambiguous at a glance: **steady on** while the
+service is up and running normally, **blinking** while it's shutting
+down, **dark** once it's safe to remove power. It works even if
+`pislm.service` has crashed, since it runs as its own independent
+service.
 
 ```
 GPIO 27 (BCM, header pin 13) --+-- switch --+
@@ -535,15 +538,17 @@ GND (header pin 14 or 20) -------------------------------------+
 - The LED is optional: wire it as above (anode toward the GPIO/resistor
   side, cathode toward GND) for a clearly visible external indicator. If
   you skip it, or GPIO 22 is unavailable, this automatically falls back to
-  blinking the Pi's own onboard status LED (ACT) instead — either way,
-  something blinks with zero required wiring beyond the button itself.
+  the Pi's own onboard status LED (ACT) instead — note that repurposes it
+  away from its normal disk-activity blinking (it goes steady on instead).
+  Either way, all three states work with zero required wiring beyond the
+  button itself.
 - **Do not use** a pin the MCC 172 occupies (BCM 0, 1, 5, 6, 8–13, 16, 19,
   20, 26) or the sync-start trigger pin if §4 is in use (default BCM 17).
   Override the pins with `PISLM_SHUTDOWN_GPIO_PIN` (button) /
   `PISLM_SHUTDOWN_LED_GPIO_PIN` (LED) in the service file below if 27/22
   are unavailable on your wiring.
 - Holding for less than 3 s does nothing and resets the timer on release —
-  only a continuous 3-second hold blinks the LED and shuts down.
+  only a continuous 3-second hold starts the blink and shuts down.
 - **The LED going dark means the process was killed partway through the
   OS halt, not necessarily "fully powered off."** On a plain USB-powered
   Pi with no smart power controller, the board stays electrically live
