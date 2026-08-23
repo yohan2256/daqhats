@@ -361,6 +361,29 @@ fine for levels-only use). The acquisition loop always keeps its own core:
 it reads the devices, fills the RAM ring buffer, and broadcasts frames,
 while the workers only compute.
 
+**Block size matters more than core count.** The band bank runs one IIR
+filter call per band per channel per *block*, whatever that block holds, so
+the fixed cost is charged per block, not per sample. The acquisition loop is
+therefore paced to `[dsp] block_ms` (default 20 ms ≈ 1024 samples at
+51.2 kHz) instead of spinning:
+
+| Block | Samples @51.2 kHz | Relative CPU, 31 bands × 2 ch |
+|------:|------------------:|------------------------------:|
+| 2.5 ms | 128 | 30× |
+| 5 ms | 256 | 16× |
+| 10 ms | 512 | 8× |
+| 20 ms | 1024 | **5× (default)** |
+| 80 ms | 4096 | 2× |
+
+An unpaced loop is worse than the top row: with two devices it never idles,
+so the USB device gets polled thousands of times a second and its workers
+receive slivers of a few dozen samples — which they then drop for lack of a
+free slot and reset their filter state across, so band levels jump around.
+Watch `dropped_blocks` (`get_config`, or `bench` in the test client): if it
+climbs with bands enabled, raise `block_ms` to 40–80 before lowering
+`f_max`. The cost is that much extra level latency, well inside Fast time
+weighting's 125 ms.
+
 ## Notes & tips
 
 - **Changing settings while streaming.** The MCC 172 rejects configuration
