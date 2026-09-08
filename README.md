@@ -1,3 +1,14 @@
+## Floor impact sound measurement program
+
+The paired PC application is in [pc_app](pc_app/README.md); the acquisition
+server is in [examples/python/mcc172/pislm](examples/python/mcc172/pislm/README.md).
+The PC folder includes the GUI, client library, simulator, tests and Windows
+launchers. See [the update notes](pc_app/PATCH_NOTES_20260908.md) before use.
+
+On Windows, open `pc_app` and run `run.bat --demo` for the simulator, or
+`run.bat --host <Pi-IP>` to connect to your acquisition server. Python must be
+installed. Keep server and PC versions together when updating.
+
 # MCC DAQ HAT Library for Raspberry Pi
 <table>
     <tr><td>Info</td><td>Contains C and Python Libraries for interacting with

@@ -221,16 +221,6 @@ payload = [4-byte band_index uint32][4-byte channel uint32][8-byte start_index u
   in an octave analyzer.
 - Like LEVEL, BAND_LEVEL frames are **never dropped** by network
   backpressure (§6).
-- **Filter order is a real tradeoff, not free selectivity.** `bands.order`
-  (default 3, a 6th-order Butterworth band-pass) only rejects a pure tone
-  in the *next* 1/3-octave band by ~18 dB. A sound with concentrated or
-  resonant energy (many real impacts have one) will visibly leak into
-  neighboring bands and read higher than you might expect — this is not a
-  bug, it's this filter's actual selectivity at low order. Raising `order`
-  (via `set_bands`) improves rejection (~35 dB at order=6) at the cost of
-  roughly doubling the filter's ringing on impulsive content. There is no
-  order that minimizes both; pick based on whether accurate per-band
-  separation or clean transient response matters more for your use case.
 
 ### 2.5 RAW_DUMP frames (type `0x06`) — on-demand buffer dump
 
@@ -300,9 +290,9 @@ The full configuration plus protocol metadata:
   ],
   "devices": [
     {"index": 0, "type": "mcc172",  "channels": [0, 1],
-     "actual_rate": 51200.0, "full_scale_v": 5.0},
+     "actual_rate": 51200.0},
     {"index": 1, "type": "dt9837a", "channels": [2, 3, 4, 5],
-     "actual_rate": 51200.0, "full_scale_v": 10.0}
+     "actual_rate": 51200.0}
   ],
   "sample_rate": 51200.0,
   "iepe": {"0": 1, "1": 1, "2": 1, "3": 1, "4": 1, "5": 1},
@@ -310,10 +300,9 @@ The full configuration plus protocol metadata:
                               "3": 50.0, "4": 50.0, "5": 50.0},
   "units": {"0": "Pa", "1": "V", "2": "Pa", "3": "Pa", "4": "Pa", "5": "Pa"},
   "stream_raw": false,
-  "bands": {"enabled": true, "output": "level", "fraction": 3, "order": 3,
+  "bands": {"enabled": true, "output": "level", "fraction": 3, "order": 6,
             "f_min": 20.0, "f_max": 20000.0},
-  "weighting": {"highpass_hz": 20.0, "highpass_order": 2,
-                "frequency": "A", "time": "Fast"},
+  "weighting": {"frequency": "A", "time": "Fast"},
   "level": {"enabled": true, "output_rate": 10.0},
   "storage": {"buffer_seconds": 60.0},
   "trigger": {"enabled": false, "source": "gpio", "gpio_pin": 17,
@@ -336,9 +325,6 @@ The full configuration plus protocol metadata:
   "output": {"available": true, "device": 1, "channels": [0],
              "output_rate": 48000.0, "full_scale_volts": 10.0,
              "running": false, "signal": null},
-  "ups": {"available": true, "stale": false, "age_seconds": 3.2,
-          "percent": 76.0, "bus_voltage_v": 7.82, "current_ma": -215.0,
-          "power_w": 1.68, "low_battery_hold_seconds": 0.0},
   "network": {"stream_clients": 1, "stream_frames_dropped": 0,
               "stream_frames_dropped_by_type": {}},
   "dtype": "float64",
@@ -357,25 +343,8 @@ The full configuration plus protocol metadata:
 - **`overload`** is the cumulative count of clipped samples per channel
   since the last `start()` (see the `overload` event below and §4). All
   zero means no clipping has been detected yet.
-- **`devices[].full_scale_v`** is that device's ADC input range in volts,
-  fixed by the hardware -- mcc172 is always 5.0 (+-5V AC coupled); dt9837a
-  is auto-detected per unit (10.0 or 1.0). This is the raw pre-calibration
-  clipping threshold used for `overload` (at 99% of this value) -- check it
-  *before* an impact/shock test to judge peak headroom, not just after one
-  clips (§9's implementation checklist has more on this).
 - **`network.stream_frames_dropped_by_type`** breaks the total down by
   frame kind (e.g. `{"DATA": 40, "BAND": 2}`) — see §6.
-- **`ups`** is an optional INA219-based UPS's battery status (INSTALL.md
-  §14.1), read from a small status file the separate
-  `pislm-shutdown-button` service writes -- `pislm.py` never touches the
-  I2C bus itself. `available: false` means no UPS/monitor service (not an
-  error). `stale: true` means the file is older than `[ups]
-  stale_after_seconds` in `config.ini` (default 60s) -- most likely that
-  service isn't running, so treat the accompanying values as unreliable
-  rather than current. `percent`/`bus_voltage_v`/`current_ma`/`power_w`
-  are the last reading; `low_battery_hold_seconds` is how long the battery
-  has continuously read at or below the shutdown threshold so far (0 if
-  currently above it).
 
 When band output is **active** (i.e. during a running scan with bands
 enabled, or in a `started` event), the handshake also carries a `band_table`:
@@ -384,15 +353,14 @@ BAND / BAND_LEVEL frames to its parameters at that device's rate:
 
 ```json
 "band_table": [
-  {"device": 0, "fraction": 3, "order": 3, "input_rate": 51200.0,
-   "max_center": 20158.737, "dropped_above": 0, "dropped_below": 0,
+  {"device": 0, "fraction": 3, "order": 6, "input_rate": 51200.0,
    "channels": [0, 1],
    "bands": [
      {"index": 0, "center": 19.7, "f_lo": 17.5, "f_hi": 22.1,
       "decimation": 1158, "decimated_rate": 44.2}
      /* ... */
    ]},
-  {"device": 1, "fraction": 3, "order": 3, "input_rate": 51200.0,
+  {"device": 1, "fraction": 3, "order": 6, "input_rate": 51200.0,
    "channels": [2, 3, 4, 5],
    "bands": [ /* ... */ ]}
 ]
@@ -500,40 +468,19 @@ All `channel` fields take **global** channel numbers.
 | `set_channels` | `device` (index), `channels` (that device's **local** channels; dt9837a must be contiguous from 0) | `{"device", "channels", "channel_map"}` — global numbering is rebuilt |
 | `set_trigger` | `enable` (bool); optional `source` (`"gpio"`\|`"external"`), `gpio_pin` (BCM), `pulse_ms` | `{"enabled", "source", "gpio_pin", "pulse_ms", "mode": "RISING_EDGE", "note"}` |
 | `set_options` | optional `stream_raw` (bool) | `{"stream_raw"}` |
-| `set_bands` | optional `enabled` (bool), `output` (`level`\|`waveform`), `f_min` (>0), `f_max` (≥ `f_min`), `fraction` (1–24), `order` (1–8), `margin` (≥1) | `{"enabled", "output", ..., "max_center", "dropped_above", "dropped_below", "band_table": [per-device]}` |
-| `set_weighting` | optional `frequency` (`A`\|`C`\|`Z`), `time` (`Fast`\|`Slow`\|`Impulse`), `highpass_hz` (0 disables), `highpass_order` (1–8) | `{"frequency", "time", "highpass_hz", "highpass_order"}` |
+| `set_bands` | optional `enabled` (bool), `output` (`level`\|`waveform`), `f_min`, `f_max`, `fraction`, `order`, `margin` | `{"enabled", "output", ..., "band_table": [per-device]}` |
+| `set_weighting` | optional `frequency` (`A`\|`C`\|`Z`), `time` (`Fast`\|`Slow`\|`Impulse`) | `{"frequency", "time"}` |
 | `set_level` | optional `enabled` (bool), `output_rate` (Hz) | `{"enabled", "output_rate"}` |
 | `set_storage` | `buffer_seconds` (raw ring-buffer length) | `{"buffer_seconds"}` |
-| `set_dsp` | `workers` (`-1` auto, `0` inline, `N` cap), `block_ms` (1–200, acquisition block length) | `{"workers_configured", "block_ms", "cpu_count", "note"}` |
+| `set_dsp` | `workers` (`-1` auto, `0` inline, `N` cap) | `{"workers_configured", "cpu_count", "note"}` |
 | `set_resample` | optional `enabled` (bool), `output_rate` (Hz), `taps`, `phases` | `{"enabled", "output_rate", "taps", "phases", "note"}` |
 | `save_config` | optional `path`, `include_settings` (bool) | `{"path", "saved": [...], "timestamp", "sensitivity_mv_per_unit"}` |
 | `calibration_write` | `channel`, `slope`, `offset` (**mcc172 channels only**) | `{"channel", "slope", "offset"}` |
 | `test_signals_write` | `mode` (int); optional `clock`, `sync` (**mcc172 only**) | `{"mode", "clock", "sync"}` |
 
-### Band range limits
-
-A band exists only when its **upper edge** fits below Nyquist, so the highest
-center a given sample rate can carry is
-
-    max_center = (sample_rate / 2) / 2**(1 / (2 * fraction))
-
-rounded down to the band grid — **20158.7 Hz for 1/3-octave at 51.2 kHz**, and
-the same on the DT9837A at 52.73 kHz. Bands above that are **dropped, not
-truncated**: a band whose top has been cut off reads low and is no longer the
-band it is labelled as. `max_center` and `dropped_above` / `dropped_below` in
-each `band_table` entry (and at the top level of the `set_bands` response)
-report the ceiling and how many requested bands fell outside it, so raising
-`f_max` past the limit is visible instead of silent. `f_lo` / `f_hi` per band
-are the real filter edges — nothing is clamped.
-
-`set_bands` validates everything before it commits: the request is applied to
-a copy, every device builds its bank, and only then does the live config
-change. A rejected request leaves the previous setup untouched. It errors if
-`numpy`/`scipy` are not installed on the Pi, if any field is out of the range
-above, or if the requested range yields **no whole band** at some device's
-rate (which would otherwise return success and then emit no band frames at
-all). Out-of-range values in `config.ini` are not fatal — each falls back to
-its default with a `[bands] config.ini: ...` line in the log. `set_bands output=level` sends
+`set_bands` validates the settings immediately (building a filter bank per
+device) and returns the resulting per-device `band_table`; it errors if
+`numpy`/`scipy` are not installed on the Pi. `set_bands output=level` sends
 per-band levels (`BAND_LEVEL`), `waveform` sends decimated band signals
 (`BAND`). `set_options stream_raw=false` stops raw `DATA` (levels still
 stream). After `set_channels` the global numbering changes — re-read the
@@ -566,7 +513,7 @@ the ADC clocks, which still drift a few ppm relative to each other.
 
 | cmd | fields | result |
 |-----|--------|--------|
-| `get_metrics` | optional `seconds`, `weighting`, `time_weighting`, `percentiles` (list), `channels` (list), `include_bands` (bool) | per-channel `{Leq, Lmax, Lmin, Lpeak, LN:{L10,...}, units, calibrated, highpass_hz, window_seconds, n_samples[, bands]}` |
+| `get_metrics` | optional `seconds`, `weighting`, `time_weighting`, `percentiles` (list), `channels` (list), `include_bands` (bool) | per-channel `{Leq, Lmax, Lmin, Lpeak, LN:{L10,...}, units, calibrated, window_seconds, n_samples[, bands]}` |
 
 `get_metrics` computes over the most-recent buffered raw samples (kept
 `buffer_seconds` long, per device), so it works while running **and** after
@@ -580,7 +527,6 @@ result carries its `device` index. Example result:
  "channels": {"0": {"Leq": 74.8, "Lmax": 88.1, "Lmin": 61.2, "Lpeak": 96.0,
                     "LN": {"L10": 78.9, "L50": 72.5, "L90": 64.1},
                     "weighting": "A", "time_weighting": "Fast",
-                    "highpass_hz": 20.0,
                     "units": "Pa", "calibrated": true, "device": 0,
                     "window_seconds": 10.0, "n_samples": 512000},
               "4": {"Leq": 71.2, "device": 1, "...": "..."}}}
@@ -713,13 +659,8 @@ frames. Like `get_metrics`, it works while running and after `stop`.
 The requested rate applies to every device; each rounds independently:
 
 - **MCC 172** generates `51200 / N` Hz (`N` = 1..256).
-- **DT9837A** supports nearly arbitrary rates up to 52.734 kHz. uldaq only
-  reports the achieved rate as the return value of the scan call, so the
-  monitor issues a short probe scan when the rate is configured and uses
-  what that reports — the DSP (weighting filters, time weighting,
-  1/3-octave band edges, ring buffers) is built for the rate the ADC will
-  really run at, not the requested one. `actual_rate` reflects the probe
-  before the scan starts.
+- **DT9837A** supports nearly arbitrary rates up to 52.734 kHz; the exact
+  achieved rate is reported when the scan starts.
 
 Read the per-device real rates from the `set_sample_rate` result,
 `get_clock`, or the handshake `devices` list. Because the devices round
@@ -755,11 +696,6 @@ The Pi already does the sound-level-meter math:
 - **LEVEL / BAND_LEVEL frames** are frequency-weighted (A/C/Z per
   `weighting.frequency`) and time-weighted (Fast/Slow/Impulse per
   `weighting.time`) levels in dB — display them directly (L_AF etc.).
-The broadband metrics use the same infrasound high-pass as the streamed
-LEVEL frames (`[weighting] highpass_hz`, echoed back as `highpass_hz`), so
-the two agree on the same signal. Per-band values in `bands` do not: each
-band is already a band-pass that rejects DC on its own.
-
 - **`get_metrics`** returns Leq, Lmax, Lmin, Lpeak, and LN percentiles over
   the buffered window, with optional per-band Leq.
 
@@ -767,20 +703,10 @@ If you prefer to compute on the client (from raw DATA or BAND waveforms),
 the definitions used are:
 
 ```
-# Time-weighted level -- Fast (tau=0.125 s) and Slow (tau=1 s) are symmetric
-# one-pole exponential averages of the squared signal, then to dB:
+# Time-weighted level (Fast tau=0.125 s, Slow tau=1 s, Impulse tau=0.035 s):
+#   one-pole exponential average of the squared signal, then to dB
 alpha  = exp(-1 / (fs * tau))
 ms[n]  = alpha * ms[n-1] + (1 - alpha) * x[n]^2
-L_tw   = 10 * log10(ms[n] / (20e-6)^2)
-
-# Impulse (IEC 60651/60804; IEC 61672-1 no longer defines it, kept for local
-# regs that still require it) is *asymmetric* -- fast 35 ms rise so it
-# catches short transients, slow 1.5 s decay so a brief peak stays readable
-# instead of collapsing back down immediately. Nonlinear: the pole used each
-# sample depends on whether the input is currently above or below the state.
-alpha_rise, alpha_decay = exp(-1 / (fs * 0.035)), exp(-1 / (fs * 1.5))
-a      = alpha_rise if x[n]**2 > ms[n-1] else alpha_decay
-ms[n]  = a * ms[n-1] + (1 - a) * x[n]^2
 L_tw   = 10 * log10(ms[n] / (20e-6)^2)
 
 # Equivalent continuous level over T seconds (energy average):
@@ -817,18 +743,6 @@ Leq_T  = 10 * log10( mean(x^2 over T) / (20e-6)^2 )
     from `get_config` or the handshake (**not** `status` — see §3), so a
     client can tell "quiet because nothing changed" from "quiet because
     frames are being lost" -- and, from the breakdown, *which* frame kind.
-- **DSP-pool backpressure (`[dsp] workers` != 0) is a separate, earlier
-  layer than the network queues above** -- it can drop a raw block before
-  a LEVEL/BAND/BAND_LEVEL frame is even computed, if a worker process falls
-  behind (`dsp.dropped_blocks`, §8). This is correctly reflected as a real
-  jump in `start_index` on the next frame from the affected channel/band --
-  it is not silently absorbed as if the gap never happened, and the
-  underlying time-weighted/band filters are reset across the gap rather
-  than splicing pre-gap and post-gap samples together (which would
-  otherwise show up as a spurious transient/spike, most visible in narrow
-  high-Q bands). A sustained rise in `dropped_blocks` means the Pi's DSP
-  genuinely cannot keep up at the current config -- see the troubleshooting
-  table in INSTALL.md.
 - **Ordering:** within a single connection, bytes are ordered (TCP). On the
   control port a command's `response` always follows the commands sent
   before it; an event may be interleaved (e.g. the `stopped` event can

@@ -266,7 +266,12 @@ What streams continuously, and what is computed on demand:
   itself to the laptop (chunked `RAW_DUMP` frames, reliable delivery), so
   after an event you can pull the last N seconds for post-analysis.
 - **1/3-octave spectrum (optional).** `[bands] enabled = true` adds per-band
-  output. `output = level` (default) streams Fast time-weighted band levels
+  output. The usable range is bounded by Nyquist: a band exists only if its
+  *upper edge* fits, so the top center is `(fs/2) / 2**(1/(2·fraction))` on
+  the band grid — **20158.7 Hz (nominal 20 kHz) at 51.2 kHz**, on either
+  device. Bands above that are dropped rather than truncated, and the
+  handshake `band_table` reports `max_center` / `dropped_above` so it is
+  visible. `output = level` (default) streams Fast time-weighted band levels
   in dB (`BAND_LEVEL` frames) — the octave-analyzer bar display, tiny
   bandwidth. `output = waveform` streams each band's decimated time signal
   (`BAND` frames) — heavy; the full 20 Hz–20 kHz set for 2 ch is ~36 Mbit/s,

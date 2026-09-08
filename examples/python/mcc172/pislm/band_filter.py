@@ -48,6 +48,14 @@ class BandFilterBank:
             accurate per-band spectral separation matters more than
             minimizing ringing (e.g. ISO 3382 / floor impact analysis).
         margin (float): keep the decimated rate >= 2 * upper_edge * margin.
+
+    A band is only created when its **upper edge** fits below Nyquist, so the
+    highest usable center is ``(fs / 2) / 2**(1 / (2 * fraction))`` rounded
+    down to the band grid -- 20158.7 Hz for 1/3-octave at 51.2 kHz. Bands
+    above that are dropped, not clamped: a band whose top has been cut off is
+    no longer the band it claims to be and reads low, which is worse than not
+    reporting it. ``dropped_above`` / ``dropped_below`` count what the
+    requested range asked for and could not be delivered.
     """
 
     #: Reference frequency for band centers (IEC 61260 uses 1 kHz).
@@ -67,18 +75,31 @@ class BandFilterBank:
 
         self.bands = []          # list of per-band dicts (metadata + sos + D)
         edge = 2.0 ** (1.0 / (2.0 * fraction))
+        #: Highest center this rate can carry as a WHOLE band, on the grid.
+        self.max_center = self.F_REF * 2.0 ** (
+            math.floor(fraction * math.log2(nyquist / edge / self.F_REF))
+            / fraction)
+        #: Bands the requested range asked for but this rate cannot deliver.
+        self.dropped_above = 0
+        self.dropped_below = 0
         for k in range(k_min, k_max + 1):
             center = self.F_REF * 2.0 ** (float(k) / fraction)
             f_lo = center / edge
             f_hi = center * edge
-            if f_lo <= 0.0 or f_lo >= nyquist:
+            if f_lo <= 0.0:
+                self.dropped_below += 1
                 continue
-            # Clamp the top band's upper edge below Nyquist.
-            f_hi_eff = min(f_hi, nyquist * 0.999)
-            sos = signal.butter(self.order, [f_lo, f_hi_eff],
+            # Whole bands only. Keeping a band whose upper edge sits above
+            # Nyquist would mean band-passing to a cut-off top: it reads low
+            # and it is not the band it is labelled as. Drop it instead, and
+            # let the caller see the count.
+            if f_hi >= nyquist:
+                self.dropped_above += 1
+                continue
+            sos = signal.butter(self.order, [f_lo, f_hi],
                                 btype='band', fs=self.fs, output='sos')
             decimation = max(1, int(math.floor(
-                self.fs / (2.0 * f_hi_eff * self.margin))))
+                self.fs / (2.0 * f_hi * self.margin))))
             self.bands.append({
                 'index': len(self.bands),
                 'center': center,
@@ -103,6 +124,12 @@ class BandFilterBank:
             'fraction': self.fraction,
             'order': self.order,
             'input_rate': self.fs,
+            # Highest center this input rate can carry as a whole band, and
+            # how many requested bands fell outside that. f_lo/f_hi below are
+            # the real filter edges -- nothing is clamped.
+            'max_center': round(self.max_center, 3),
+            'dropped_above': self.dropped_above,
+            'dropped_below': self.dropped_below,
             'channels': list(self.channels),
             'bands': [{'index': b['index'],
                        'center': round(b['center'], 3),
