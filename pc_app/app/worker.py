@@ -27,6 +27,7 @@ class CommandWorker(QtCore.QThread):
         super().__init__(parent)
         self._jobs: queue.Queue = queue.Queue()
         self._running = True
+        self._active = False
 
     def submit(self, name: str, func: Callable[[], Any], message: str = "") -> None:
         self._jobs.put((name, func, message))
@@ -35,6 +36,10 @@ class CommandWorker(QtCore.QThread):
         self._running = False
         self._jobs.put(None)
         self.wait(3000)
+
+    @property
+    def busy(self) -> bool:
+        return self._active or self.pending > 0
 
     @property
     def pending(self) -> int:
@@ -48,9 +53,12 @@ class CommandWorker(QtCore.QThread):
             name, func, message = item
             if message:
                 self.progress.emit(message)
+            self._active = True
             try:
                 result = func()
             except Exception as exc:  # noqa: BLE001 — every failure reaches the GUI
                 self.failed_job.emit(name, str(exc), traceback.format_exc())
             else:
                 self.finished_job.emit(name, result)
+            finally:
+                self._active = False

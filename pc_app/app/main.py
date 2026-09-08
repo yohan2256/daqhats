@@ -206,8 +206,18 @@ class MainWindow(QtWidgets.QMainWindow):
         other.room.volume = self.session.room.volume
         other.room.reverberation = dict(self.session.room.reverberation)
 
+    def _open_acoustic_modes(self):
+        if self.live.capturing or self.recorder.recording or self.worker.busy:
+            self._warn("Finish the current operation first")
+            return
+        from app.acoustic_modes import AcousticModes
+        dialog = AcousticModes(self)
+        dialog.exec()
+
     # ── UI construction ──
     def _build_ui(self, host: str, control: int, stream: int) -> None:
+        modes = self.menuBar().addMenu("&Measurement modes")
+        modes.addAction("Sound level / airborne / facade…", self._open_acoustic_modes)
         menu = self.menuBar().addMenu("&Settings")
         self.options_action = menu.addAction("Instrument options…")
         self.options_action.setShortcut("Ctrl+,")
