@@ -63,7 +63,10 @@ def no_modal_dialogs(monkeypatch):
         "warning",
         classmethod(lambda cls, *a, **k: calls.append(("warning", a[2] if len(a) > 2 else ""))),
     )
-    return calls
+    yield calls
+    # Always stop even if an assertion fails before a test's normal stop click.
+    # Keep one test's active scan from flipping the next test's Start to Stop.
+    pislm_sim.stop_scan()
 
 
 @pytest.fixture(scope="module")
@@ -608,7 +611,9 @@ class TestRecording:
             )
             window.src_pos_spin.setValue(1)
             for channel, box in window.channel_checks.items():
-                box.setChecked(channel in (0, 1))
+                # Channel 1 deliberately has sensitivity=1000 (volts) in the simulator.
+                # Use two calibrated channels; production must keep rejecting volts.
+                box.setChecked(channel in (0, 2))
             window._apply_session()
             assert wait_for(qapp, lambda: window.worker.pending == 0, 20.0)
 
@@ -692,6 +697,10 @@ class TestRecording:
         )
         window.recorder.options = window.recording
         assert ensure_scanning(qapp, window)
+
+        # A recording lifecycle test needs calibrated measurement channels.
+        for channel, box in window.channel_checks.items():
+            box.setChecked(channel in (0, 2))
 
         # Start a long capture and pull the window out from under it.
         window.duration_spin.setValue(3.0)
@@ -820,6 +829,8 @@ class TestRecordingIntegration:
             window.recording.directory = str(tmp_path)
             window.recorder.options = window.recording
 
+            for channel, box in window.channel_checks.items():
+                box.setChecked(channel in (0, 2))  # calibrated Pa channels
             window._apply_session()
             assert wait_for(qapp, lambda: window.worker.pending == 0, 20.0)
             assert ensure_scanning(qapp, window)

@@ -446,6 +446,7 @@ def start_scan() -> dict:
         if not STATE.running:
             STATE.running = True
             STATE.reset_counters()  # indices reset to 0 on every start (§1.3)
+            STATE.buffers = {}  # no history from the previous scan
             GENERATOR = Generator()
             GENERATOR.start()
         body = STATE.snapshot(include_band_table=True)
@@ -866,7 +867,7 @@ def start_dump(msg: dict) -> dict:
         if blocks:
             data = np.concatenate(blocks, axis=0)[-n:]
         else:
-            data = np.zeros((n, nch), dtype="<f8")
+            data = np.empty((0, nch), dtype="<f8")  # no invented raw history
         flat = data.ravel()
         total_chunks = max(1, math.ceil(flat.size / chunk_samples))
         # Dump start index = samples produced so far − the slice length (§1.2).

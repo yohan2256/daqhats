@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app import audio  # noqa: E402
-from pislm.standards.impact import fetch_heavy_levels
+from pislm.standards.impact import fetch_heavy_levels, prepare_heavy_capture
 from app.live import LiveState  # noqa: E402
 from app.options import (  # noqa: E402
     DeviceOptions,
@@ -1145,6 +1145,13 @@ class MainWindow(QtWidgets.QMainWindow):
         bands = tuple(source.bands)
         fraction = 3 if background else source.fraction
         heavy = source.is_heavy and not background
+        if heavy:
+            pi = self.pi
+            self.worker.progress.emit("Preparing raw history — wait before striking")
+            prepare_heavy_capture(
+                pi, seconds, channels,
+                cancelled=lambda: self._closing or self.pi is not pi)
+            self.worker.progress.emit(f"Capture now — {seconds:g} s")
         self.live.start_capture()
         try:
             time.sleep(seconds)
@@ -1230,7 +1237,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._submit(
             "capture",
             capture,
-            f"Capturing source position {source_pos}, {len(channels)} channels, {seconds:.0f} s\u2026",
+            ("Preparing — wait for Capture now before striking" if source.is_heavy else
+             f"Capturing source position {source_pos}, {len(channels)} channels, {seconds:.0f} s\u2026"),
         )
 
     def _capture_background(self) -> None:
