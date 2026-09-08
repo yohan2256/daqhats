@@ -53,6 +53,7 @@ class RatingResult:
     deviations: tuple[float, ...]
     fraction: int
     quantity: str = ""
+    deviation_limit: float | None = None
 
     @property
     def deviation_sum(self) -> float:
@@ -68,6 +69,8 @@ class RatingResult:
 
     @property
     def limit(self) -> float:
+        if self.deviation_limit is not None:
+            return self.deviation_limit
         return MAX_DEVIATION_THIRD_OCTAVE if self.fraction == 3 else MAX_DEVIATION_OCTAVE
 
     def table(self) -> list[tuple[float, float, float, float]]:

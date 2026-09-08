@@ -4,6 +4,12 @@ Laptop-side measurement software for the Raspberry Pi acquisition server
 (`pislm.py`). Communication, standards maths, session handling and the GUI all
 work, and it runs without hardware.
 
+## Legacy bang-machine / inverse-A analysis
+
+Select **Bang machine — 구법 역A (1/1 octave)** under Impact source, then
+Apply session. See [LEGACY_BANG.md](LEGACY_BANG.md) for the measurement workflow,
+reference curve, file compatibility and scope of the legacy assessment.
+
 ## 2026-09-08 measurement recovery update
 
 See [PATCH_NOTES_20260908.md](PATCH_NOTES_20260908.md) for installation,

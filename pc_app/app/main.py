@@ -721,6 +721,7 @@ class MainWindow(QtWidgets.QMainWindow):
         evaluate_btn = QtWidgets.QPushButton("Evaluate")
         evaluate_btn.clicked.connect(self._evaluate)
         curve_btn = QtWidgets.QPushButton("Load inverse-A curve…")
+        self.curve_load_btn = curve_btn
         curve_btn.clicked.connect(self._load_curve)
         export_btn = QtWidgets.QPushButton("Export result (text)")
         export_btn.clicked.connect(self._export_report)
@@ -838,6 +839,13 @@ class MainWindow(QtWidgets.QMainWindow):
         rating for data measured with a ball.
         """
         source = self._current_source()
+        if (source.is_heavy and self._sessions["heavy"].measurements
+                and self._sessions["heavy"].source != source):
+            blocked = self.source_combo.blockSignals(True)
+            self.source_combo.setCurrentIndex(list(ImpactSource).index(self.session.source))
+            self.source_combo.blockSignals(blocked)
+            self._warn("Save and reset the heavy measurements before changing between ball and bang sources")
+            return
         key = "heavy" if source.is_heavy else "light"
         if key != self._active:
             self._share_to_other_session()
@@ -847,6 +855,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spectrum_bars.set_captured({})
         self._update_quantity_labels()
         self._update_set_label()
+        self._refresh_measure_table()
 
     def _apply_session(self) -> None:
         # The source selector decides which half of the set is active, so
@@ -895,9 +904,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def configure():
             self.pi.stop()
-            # Analysis is always 1/3 octave, 6th-order Butterworth
+            # Match the analysis bandwidth to the selected source profile
             self.pi.set_bands(
-                enabled=True, output="level", fraction=3, order=FILTER_ORDER,
+                enabled=True, output="level", fraction=source.fraction, order=FILTER_ORDER,
                 f_min=f_min, f_max=f_max,
             )
             self.pi.set_weighting(frequency=frequency, time_weighting=time_weighting)
@@ -909,7 +918,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._submit(
             "configure",
             configure,
-            f"Configuring 1/3 octave {f_min:g}\u2013{f_max:g} Hz, {frequency}/{time_weighting}",
+            f"Configuring 1/{source.fraction} octave {f_min:g}\u2013{f_max:g} Hz, {frequency}/{time_weighting}",
         )
 
     def _absorb_band_table(self, body: dict) -> None:
@@ -924,6 +933,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._output_event.emit(event, dict(body))
 
     def _update_quantity_labels(self) -> None:
+        if hasattr(self, "curve_load_btn"):
+            self._update_curve_label()
         source = self.session.source
         self.spectrum_bars.set_quantity(
             f"Lp,{source.quantity}", source.frequency_weighting
@@ -1086,7 +1097,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         source = source or self.session.source
         bands = tuple(source.bands)
-        fraction = source.fraction
+        fraction = 3 if background else source.fraction
         heavy = source.is_heavy and not background
         self.live.start_capture()
         try:
@@ -1214,7 +1225,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # otherwise the next capture silently measures the wrong range.
                 self.pi.stop()
                 self.pi.set_bands(
-                    enabled=True, output="level", fraction=3, order=FILTER_ORDER,
+                    enabled=True, output="level", fraction=source.fraction, order=FILTER_ORDER,
                     f_min=min(source.bands), f_max=max(source.bands),
                 )
                 self.pi.start()
@@ -1746,10 +1757,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_curve_label()
 
     def _update_curve_label(self) -> None:
-        mark = "verified" if self.curve.verified else "unverified"
-        self.curve_label.setText(f"Inverse-A curve: {self.curve.source} [{mark}]")
+        curve = InverseACurve.legacy_heavy() if self.session.source is ImpactSource.BANG else self.curve
+        self.curve_load_btn.setEnabled(self.session.source is not ImpactSource.BANG)
+        mark = "verified" if curve.verified else "unverified"
+        self.curve_label.setText(f"Inverse-A curve: {curve.source} [{mark}]")
         self.curve_label.setStyleSheet(
-            "color:#4ade80;" if self.curve.verified else "color:#fbbf24;"
+            "color:#4ade80;" if curve.verified else "color:#fbbf24;"
         )
 
     def _evaluate(self) -> None:
@@ -1918,6 +1931,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 weighting=source.frequency_weighting,
                 valid=result["valid"],
                 note=note,
+                fraction=self.session.fraction,
             )
             for channel, levels in sorted(filled.items())
         )
@@ -2129,6 +2143,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.snq_label.setStyleSheet("color:#9aa0a6;")
             return
 
+        if session.source is ImpactSource.BANG:
+            if result.inverse_a is None:
+                self.snq_label.setText("Legacy inverse-A unavailable: " + "; ".join(result.warnings))
+            else:
+                self.snq_label.setText(f"구법 L'i,Fmax,AW = {result.inverse_a.value:.0f} dB "
+                    f"(상회값 합 {result.inverse_a.deviation_sum:.1f}/8 dB; 참고 분석)")
+            self.snq_label.setStyleSheet("color:#fbbf24;")
+            return
         symbol = result.post_verification_symbol
         if result.post_verification is None:
             reason = result.warnings[0] if result.warnings else "not enough data yet"

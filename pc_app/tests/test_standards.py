@@ -852,7 +852,7 @@ class TestPostVerificationQuantity:
             "the tapping-machine rating must not collapse to L_A,eq"
         )
 
-    @pytest.mark.parametrize("source_name", ["RUBBER_BALL", "BANG"])
+    @pytest.mark.parametrize("source_name", ["RUBBER_BALL"])
     def test_heavy_impact_is_rated_by_the_a_weighted_maximum(self, source_name):
         from pislm.session import ImpactSource
 

@@ -124,6 +124,17 @@ class InverseACurve:
     verified: bool = False
 
     @classmethod
+    def legacy_heavy(cls) -> InverseACurve:
+        """Published KS F 2863-2 method; see LEGACY_BANG.md for provenance.
+
+        Table and 8 dB procedure checked against the 2013 published test
+        report, not a licensed copy of every historical KS edition.
+        """
+        return cls(values={63.:83.,125.:73.,250.:66.,500.:60.},
+                   max_deviation=8., source="KS F 2863-2 legacy; published test report (2013), p.34",
+                   verified=False)
+
+    @classmethod
     def generated(
         cls, bands=HEAVY_THIRD_OCTAVE_BANDS, max_deviation: float = 32.0
     ) -> InverseACurve:
@@ -181,8 +192,14 @@ class InverseACurve:
 def rate_with_curve(spectrum: Spectrum, curve: InverseACurve) -> RatingResult:
     """Inverse-A curve shifting. Same procedure as ISO 717-2, different curve."""
     centers = curve.bands
+    if not centers or not np.isfinite(list(curve.values.values())).all():
+        raise ValueError("inverse-A reference must be nonempty and finite")
+    if not np.isfinite(curve.max_deviation) or curve.max_deviation < 0:
+        raise ValueError("invalid inverse-A deviation budget")
     selected = spectrum.select(centers)
     measured = round_half_up_1dp(selected.array())
+    if not np.isfinite(measured).all():
+        raise ValueError("inverse-A measurements must be finite")
     reference = np.array([curve.values[c] for c in centers], dtype=float)
     shift = _find_shift(measured, reference, curve.max_deviation, 1.0)
     shifted = reference + shift
@@ -195,6 +212,7 @@ def rate_with_curve(spectrum: Spectrum, curve: InverseACurve) -> RatingResult:
         deviations=tuple(float(v) for v in np.maximum(0.0, measured - shifted)),
         fraction=spectrum.fraction,
         quantity="inverse-A single number",
+        deviation_limit=curve.max_deviation,
     )
 
 
@@ -215,13 +233,14 @@ class DualEvaluation:
     inverse_a: RatingResult | None = None
     #: ISO 717-2 curve shifting (for international comparison)
     iso_717_2: RatingResult | None = None
+    legacy: bool = False
     limit_db: float = POST_VERIFICATION_LIMIT_DB
     warnings: list[str] = field(default_factory=list)
 
     @property
     def passes(self) -> bool | None:
         """Does it pass the post-construction limit? None when unknown."""
-        if self.post_verification is None:
+        if self.legacy or self.post_verification is None:
             return None
         return self.post_verification <= self.limit_db
 
@@ -235,7 +254,8 @@ class DualEvaluation:
                 f"[limit {self.limit_db:.0f} dB -> {verdict}]"
             )
         if self.inverse_a is not None:
-            lines.append(f"{'KS F 2863 (inverse-A)':<24}: {self.inverse_a.value:.0f} dB")
+            label = "Legacy bang L'i,Fmax,AW" if self.legacy else "KS F 2863 (inverse-A)"
+            lines.append(f"{label:<24}: {self.inverse_a.value:.0f} dB")
         if self.iso_717_2 is not None:
             lines.append(f"{'ISO 717-2 (reference)':<24}: {self.iso_717_2.value:.0f} dB")
         for warning in self.warnings:
