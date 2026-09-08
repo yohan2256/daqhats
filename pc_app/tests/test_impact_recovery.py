@@ -134,17 +134,68 @@ def test_capture_routes_heavy_to_raw_and_background_to_leq(monkeypatch):
     ns = dict(Spectrum=Spectrum, a_weighted_single_number=a_weighted_single_number,
               nominal_center=nominal_center, FILTER_ORDER=6)
     calls = []
+    ns['prepare_heavy_capture'] = lambda *args, **kw: calls.append('prepare')
     ns['fetch_heavy_levels'] = lambda *args, **kw: (calls.append('raw') or {0:{500:80}}, 'raw proof')
     exec(compile(ast.Module(body=[method],type_ignores=[]),str(path),'exec'),ns)
     def metrics(**kwargs):
         calls.append('leq')
         return {'channels':{'0':{'bands':[{'center':500,'Leq':40}]}}}
-    owner = SimpleNamespace(live=LiveState(), session=SimpleNamespace(source=ImpactSource.RUBBER_BALL,fraction=3),
+    owner = SimpleNamespace(worker=SimpleNamespace(progress=SimpleNamespace(emit=lambda text: None)),
+                            _closing=False, live=LiveState(), session=SimpleNamespace(source=ImpactSource.RUBBER_BALL,fraction=3),
                             pi=SimpleNamespace(get_metrics=metrics,measurement_valid=(True,[])))
     monkeypatch.setattr(time,'sleep',lambda seconds: None)
     heavy = ns['_collect'](owner,2,[0])
     background = ns['_collect'](owner,2,[0],background=True)
-    assert calls == ['raw','leq']
+    assert calls == ['prepare','raw','leq']
     assert heavy['levels'][0][500] == 80 and heavy['analysis_note'] == 'raw proof'
     assert background['levels'][0][500] == 40
     assert not owner.live.capturing
+
+
+def test_prepare_waits_for_real_history_on_every_channel(monkeypatch):
+    from pislm.standards import impact
+    now = [0.0]
+    monkeypatch.setattr(impact.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(impact.time, 'sleep', lambda dt: now.__setitem__(0, now[0] + dt))
+    calls = []
+    pi = fake_pi()
+    def fetch(**kwargs):
+        calls.append(kwargs['seconds'])
+        n = 100 if len(calls) == 1 else int(kwargs['seconds'] * 8000)
+        return {0: RawDump(1, 0, np.zeros((26000, 1)), channels=[0], sample_rate=8000, start_index=0),
+                1: RawDump(1, 1, np.zeros((n, 1)), channels=[1], sample_rate=8000, start_index=0)}
+    pi.fetch_raw = fetch
+    impact.prepare_heavy_capture(pi, 1, [0, 1])
+    assert calls == [3.25, 3.25]
+    assert now[0] == 1
+
+
+def test_prepare_timeout_and_cancellation_do_not_accept_short_data(monkeypatch):
+    from pislm.standards import impact
+    now = [0.0]
+    monkeypatch.setattr(impact.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(impact.time, 'sleep', lambda dt: now.__setitem__(0, now[0] + dt))
+    pi = fake_pi()
+    pi.fetch_raw = lambda **kwargs: {}
+    with pytest.raises(TimeoutError, match='not ready'):
+        impact.prepare_heavy_capture(pi, 1, [0], timeout=2)
+    assert now[0] == 2
+    with pytest.raises(RuntimeError, match='cancelled'):
+        impact.prepare_heavy_capture(pi, 1, [0], cancelled=lambda: True)
+
+
+def test_prepare_rejects_configuration_before_waiting():
+    from pislm.standards.impact import prepare_heavy_capture
+    pi = fake_pi()
+    pi.config.buffer_seconds = 3
+    with pytest.raises(ValueError, match='at least 4'):
+        prepare_heavy_capture(pi, 1, [0])
+
+
+def test_prepare_preserves_uncalibrated_channel_guard():
+    from pislm.standards.impact import prepare_heavy_capture
+    pi = fake_pi()
+    pi.config.channel_info = lambda ch: SimpleNamespace(calibrated=False)
+    pi.fetch_raw = lambda **kwargs: pytest.fail('must reject before network request')
+    with pytest.raises(ValueError, match='not calibrated'):
+        prepare_heavy_capture(pi, 1, [0])

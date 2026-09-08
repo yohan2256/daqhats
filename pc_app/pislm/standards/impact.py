@@ -7,6 +7,7 @@ Fmax. There is deliberately no shorter-window or live-level fallback.
 from __future__ import annotations
 
 import math
+import time
 import numpy as np
 from scipy import signal
 
@@ -55,6 +56,53 @@ def raw_band_fmax(samples, fs, seconds, bands, *, fraction=3, order=6):
             raise ValueError('non-finite Fast detector result')
         levels[float(band)] = 10 * math.log10(max(value, 1e-30) / (20e-6)**2)
     return levels
+
+
+def prepare_heavy_capture(pi, seconds, channels, *, timeout=10.0, cancelled=lambda: False):
+    """Wait BEFORE the measurement window for real filter history on all channels.
+
+    Probe the existing raw-dump protocol so older pislm/4 servers also work.
+    Never invent samples or extend/retry a measurement after the impact.
+    A small block allowance covers acquisition block delivery at the boundary.
+    """
+    from pislm.control import CommandError
+    wanted = seconds + PRE_ROLL_SECONDS
+    if pi.config.buffer_seconds and pi.config.buffer_seconds < wanted:
+        raise ValueError(f'Raw buffer must hold at least {wanted:g} s; increase it before capture')
+    for channel in channels:
+        if not pi.config.channel_info(channel).calibrated:
+            raise ValueError(f'Channel {channel} is not calibrated in Pa')
+    deadline = time.monotonic() + timeout
+    history = PRE_ROLL_SECONDS + min(.25, seconds / 2)
+    while True:
+        if cancelled():
+            raise RuntimeError('Capture preparation cancelled')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Raw history is not ready; check acquisition/trigger and retry before striking')
+        dumps = {}
+        try:
+            dumps = pi.fetch_raw(seconds=history, timeout=min(5.0, remaining))
+        except CommandError as exc:
+            if not any(text in exc.error for text in ('no data buffered', 'not enough data buffered')):
+                raise
+        ready = bool(channels)
+        for channel in channels:
+            matches = [dump for dump in dumps.values() if channel in dump.channels]
+            if len(matches) != 1:
+                ready = False
+                continue
+            dump = matches[0]
+            if dump.start_index < 0:
+                raise ValueError('Raw dump has no sample index; pislm/4 is required')
+            if dump.channel(channel).size < int(history * dump.sample_rate):
+                ready = False
+        if ready:
+            if cancelled():
+                raise RuntimeError('Capture preparation cancelled')
+            return
+        # Poll slowly: a short initial buffer normally needs only two probes.
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
 def fetch_heavy_levels(pi, seconds, channels, bands, *, fraction=3, order=6):
