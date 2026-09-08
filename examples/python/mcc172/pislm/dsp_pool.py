@@ -128,6 +128,9 @@ class _WorkerState:
                                       ref=self.refs[c])
                       for c in self.channels} if self.level_enabled else {}
 
+        self.gates = {('level', (c,)): slm.RecoveryGate(
+            self.sos, self.rate, tau, self.rate / self.level[c]._step)
+            for c in self.level}
         self.bank = None
         self.band_level = {}
         self.band_offset = {}
@@ -145,6 +148,24 @@ class _WorkerState:
                         self.band_level[(band['index'], c)] = slm.ExpLevel(
                             band['decimated_rate'], tau, cfg['level_rate'],
                             ref=self.refs[c])
+
+        for band in self.bank.bands if self.bank is not None else []:
+            for c in self.channels:
+                kind = 'band' if self.band_output == 'waveform' else 'band_level'
+                output_rate = band['decimated_rate']
+                detector_tau = (0.0, 0.0)
+                if kind == 'band_level':
+                    output_rate /= self.band_level[(band['index'], c)]._step
+                    detector_tau = tau
+                self.gates[(kind, (band['index'], c))] = slm.RecoveryGate(
+                    band['sos'], self.rate, detector_tau, output_rate)
+
+    def _append(self, out, kind, key, values):
+        values, skipped = self.gates[(kind, key)].take(values)
+        if skipped:
+            out.append((kind + '_gap', key, skipped))
+        if values.size:
+            out.append((kind, key, values.astype('<f8', copy=False).tobytes()))
 
     def band_metadata(self):
         return self.bank.metadata() if self.bank is not None else None
@@ -167,6 +188,10 @@ class _WorkerState:
         from scipy import signal
         out = []
         if gap_frames:
+            for gate in self.gates.values():
+                gate.reset()
+            for state in self.zi.values():
+                state.fill(0.0)
             if self.level_enabled:
                 for c in self.channels:
                     n = self.level[c].skip(gap_frames)
@@ -189,14 +214,11 @@ class _WorkerState:
                 if self.sos is not None:
                     x, self.zi[c] = signal.sosfilt(self.sos, x, zi=self.zi[c])
                 levels = self.level[c].process(x)
-                if levels.size:
-                    out.append(('level', (c,),
-                                levels.astype('<f8', copy=False).tobytes()))
+                self._append(out, 'level', (c,), levels)
         if self.bank is not None:
             for band_index, chan, samples in self.bank.process_2d(data):
                 if self.band_output == 'waveform':
-                    out.append(('band', (band_index, chan),
-                                samples.astype('<f8', copy=False).tobytes()))
+                    self._append(out, 'band', (band_index, chan), samples)
                     continue
                 integrator = self.band_level.get((band_index, chan))
                 if integrator is None:
@@ -204,8 +226,7 @@ class _WorkerState:
                 levels = integrator.process(samples)
                 if levels.size:
                     levels = levels + self.band_offset.get(band_index, 0.0)
-                    out.append(('band_level', (band_index, chan),
-                                levels.astype('<f8', copy=False).tobytes()))
+                    self._append(out, 'band_level', (band_index, chan), levels)
         return out
 
 
@@ -306,11 +327,13 @@ class DspPool:
                 worker['dropped'] += 1
                 worker['dropped_frames'] += total_frames
                 continue
+            prior_gap = worker['dropped_frames']
+            tail_gap = 0
             n_frames = total_frames
             cap = worker['per_slot'] // worker['n_cols']
             if n_frames > cap:
                 # The tail beyond the slot's capacity is lost too.
-                worker['dropped_frames'] += n_frames - cap
+                tail_gap = n_frames - cap
                 n_frames = cap
             slot = worker['free'].pop()
             start = slot * worker['per_slot']
@@ -318,8 +341,8 @@ class DspPool:
             # Copy only this worker's columns into its shared slot.
             worker['flat'][start:start + size] = \
                 block_2d[:n_frames, spec['columns']].reshape(-1)
-            worker['task_q'].put((slot, n_frames, worker['dropped_frames']))
-            worker['dropped_frames'] = 0
+            worker['task_q'].put((slot, n_frames, prior_gap))
+            worker['dropped_frames'] = tail_gap
             worker['pending'] += 1
 
     def drain(self):

@@ -438,12 +438,14 @@ class RawRingBuffer:
         self._num_channels = num_channels
         self._max_interleaved = int(max_seconds * sample_rate) * num_channels
         self._blocks = []            # list of float64 numpy arrays
+        self._total_frames = 0       # lifetime count, protected by the same lock
         self._count = 0              # total interleaved samples held
         self._lock = threading.Lock()
 
     def append(self, interleaved):
         """Store one interleaved block (a float64 numpy array)."""
         with self._lock:
+            self._total_frames += interleaved.size // self._num_channels
             self._blocks.append(interleaved)
             self._count += interleaved.size
             while (self._blocks and
@@ -454,10 +456,15 @@ class RawRingBuffer:
     def get_recent(self, seconds, sample_rate):
         """Return the most recent ``seconds`` as one interleaved float64
         numpy array (trimmed to whole frames)."""
+        return self.snapshot_recent(seconds, sample_rate)[0]
+
+    def snapshot_recent(self, seconds, sample_rate):
+        """Return (waveform, first frame index) from one atomic snapshot."""
         import numpy as np
         want = int(seconds * sample_rate) * self._num_channels
         with self._lock:
             blocks = list(self._blocks)
+            end_index = self._total_frames
         picked = []
         total = 0
         for block in reversed(blocks):
@@ -467,13 +474,14 @@ class RawRingBuffer:
                 break
         picked.reverse()
         if not picked:
-            return np.empty(0, dtype=np.float64)
+            return np.empty(0, dtype=np.float64), end_index
         data = (picked[0] if len(picked) == 1
                 else np.concatenate(picked))
         if want and data.size > want:
             data = data[-want:]
         extra = data.size % self._num_channels
-        return data[extra:] if extra else data
+        data = data[extra:] if extra else data
+        return data, end_index - data.size // self._num_channels
 
 
 # --------------------------------------------------------------------------
@@ -1208,6 +1216,7 @@ class Controller:
         self._level = {}
         self._band_level = {}
         self._band_offset = {}
+        self._recovery_gates = {}
 
         # A new scan is a new time axis: every per-stream sample counter and
         # overload tally starts over at 0.
@@ -1841,6 +1850,14 @@ class Controller:
                 band_frame(band_index, g_chan, start,
                           samples.astype('<f8').tobytes()), 'BAND')
 
+    def _settled_levels(self, key, levels, sos, fs, integrator):
+        from slm import RecoveryGate, tau_for
+        if key not in self._recovery_gates:
+            self._recovery_gates[key] = RecoveryGate(
+                sos, fs, tau_for(self.time_weighting),
+                integrator[0] / integrator[1]._step)
+        return self._recovery_gates[key].take(levels)
+
     def _emit_levels(self, dev_idx, backend, raw_data):
         """Broadband weighted level (dB) LEVEL frames for one device block."""
         import numpy as np
@@ -1855,6 +1872,10 @@ class Controller:
                 x, self._wzi[g_chan] = signal.sosfilt(
                     sos, x, zi=self._wzi[g_chan])
             levels = self._level[g_chan].process(x)
+            levels, skipped = self._settled_levels(
+                ('level', g_chan), levels, sos, self._rate(dev_idx),
+                (self._rate(dev_idx), self._level[g_chan]))
+            self._next_index(self._level_count, g_chan, skipped)
             if levels.size:
                 start = self._next_index(
                     self._level_count, g_chan, levels.size)
@@ -1869,6 +1890,11 @@ class Controller:
             if integrator is None:
                 continue
             levels = integrator.process(samples)
+            band = bank.bands[band_index]
+            levels, skipped = self._settled_levels(
+                ('band_level', band_index, g_chan), levels, band['sos'], bank.fs,
+                (band['decimated_rate'], integrator))
+            self._next_index(self._band_level_count, (band_index, g_chan), skipped)
             if levels.size:
                 levels = levels + self._band_offset.get(
                     (dev_idx, band_index), 0.0)
@@ -2474,7 +2500,7 @@ class Controller:
             if buffer_ is None:
                 continue
             rate = self._rate(dev_idx)
-            data = buffer_.get_recent(seconds, rate)
+            data, dump_start = buffer_.snapshot_recent(seconds, rate)
             nch = backend.num_channels
             if len(data) < nch:
                 continue
@@ -2483,7 +2509,6 @@ class Controller:
             # Same grid as DATA for this device: the ring buffer holds the
             # most recent samples, so the dump's first sample is this many
             # samples behind the device's running total.
-            dump_start = self._data_count.get(dev_idx, 0) - samples_per_channel
             plan.append((dev_idx, data, total_chunks, dump_start, nch))
             info.append({
                 'device': dev_idx,

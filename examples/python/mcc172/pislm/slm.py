@@ -186,6 +186,35 @@ def _asymmetric_exp(x2, alpha_rise, alpha_decay, state):
     return out, y
 
 
+class RecoveryGate:
+    """Withhold reset transients while DSP continues to update its state.
+
+    A numerical settling guard, not an IEC filter class certification: allow
+    the slowest SOS pole to decay by 120 dB, then ten time constants for the
+    detector. Withheld outputs MUST still advance the stream sample index.
+    """
+
+    def __init__(self, sos, fs, tau, output_rate):
+        radius = 0.0
+        if sos is not None:
+            for section in sos:
+                radius = max(radius, float(np.max(np.abs(
+                    np.roots(section[3:])))))
+        if radius >= 1.0:
+            raise ValueError('unstable filter cannot recover')
+        decay = math.log(1e-6) / math.log(radius) / fs if radius > 0 else 0.0
+        self.count = int(math.ceil((decay + 10 * max(tau)) * output_rate)) + 1
+        self.reset()
+
+    def reset(self):
+        self.remaining = self.count
+
+    def take(self, values):
+        skipped = min(len(values), self.remaining)
+        self.remaining -= skipped
+        return values[skipped:], skipped
+
+
 class ExpLevel:
     """Stateful exponential-time-weighted level, downsampled to out_rate.
 
