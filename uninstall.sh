@@ -5,16 +5,13 @@ if [ "$(id -u)" != "0" ]; then
    exit 1
 fi
 
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+
 # Remove the C library and headers
 echo "Removing shared library"
 echo
 make -C lib uninstall
-echo
-
-# Removed compiled examples
-echo "Removing compiled examples"
-echo
-make -C examples/c clean
 echo
 
 # Remove tools
