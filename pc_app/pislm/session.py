@@ -31,14 +31,14 @@ from .standards import (
     rate_with_curve,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class ImpactSource(str, Enum):
     """Standard impact sources.
 
-    Analysis is **always 1/3 octave**. Use `standards.octave_from_third()` when
-    a 1/1-octave report is required.
+    Legacy bang uses directly measured 1/1-octave Fmax. Ball and tapping
+    use 1/3 octave. Do not sum separately timed third-octave maxima.
     """
 
     TAPPING = "tapping"          # tapping machine (light, KS F 2810-1)
@@ -49,7 +49,7 @@ class ImpactSource(str, Enum):
     def label(self) -> str:
         return {
             "tapping": "Tapping machine (light)",
-            "bang": "Bang machine (heavy)",
+            "bang": "Bang machine — 구법 역A (1/1 octave)",
             "rubber_ball": "Rubber ball (heavy)",
         }[self.value]
 
@@ -59,12 +59,14 @@ class ImpactSource(str, Enum):
 
     @property
     def bands(self) -> tuple[float, ...]:
-        """[SPEC] ISO 16283-2 §5.1/§5.2 — required 1/3-octave bands per source."""
+        """Required bands for the selected source and assessment profile."""
+        if self is ImpactSource.BANG:
+            return (63, 125, 250, 500)
         return HEAVY_THIRD_OCTAVE_BANDS if self.is_heavy else LIGHT_THIRD_OCTAVE_BANDS
 
     @property
     def fraction(self) -> int:
-        return 3  # analysis is always 1/3 octave
+        return 1 if self is ImpactSource.BANG else 3
 
     @property
     def quantity(self) -> str:
@@ -104,10 +106,14 @@ class ImpactSource(str, Enum):
           spectrum. *Not* an A-weighted sum of the bands.
         * heavy (impact ball) -> **L'iA,Fmax**, A-가중 최대 바닥충격음레벨.
         """
+        if self is ImpactSource.BANG:
+            return "L'i,Fmax,AW"
         return "L'iA,Fmax" if self.is_heavy else "L'nT,w"
 
     @property
     def single_number_method(self) -> str:
+        if self is ImpactSource.BANG:
+            return "KS F 2863-2 legacy inverse-A (8 dB)"
         return (
             "A-weighted maximum" if self.is_heavy
             else "ISO 717-2 reference-curve shifting"
@@ -153,6 +159,7 @@ class Measurement:
     timestamp: str = ""
     valid: bool = True
     note: str = ""
+    fraction: int = 3  # old files were 1/3 octave; never reinterpret as octaves
 
     def spectrum(self, fraction: int = 3) -> Spectrum:
         return Spectrum.from_mapping(
@@ -294,10 +301,18 @@ class Session:
         if not valid:
             raise ValueError("no valid measurements")
 
+        if self.source is ImpactSource.BANG:
+            if any(m.fraction != 1 or set(m.levels) != set(self.bands)
+                   or not np.isfinite(list(m.levels.values())).all() for m in valid):
+                raise ValueError("Legacy bang requires four measured octave Fmax bands; recapture old third-octave data")
         per_source: list[Spectrum] = []
         for s in sorted({m.source_position for m in valid}):
             group = [m.spectrum(self.fraction) for m in valid if m.source_position == s]
             per_source.append(average_spectra(group))
+        if self.source is ImpactSource.BANG:
+            return Spectrum.from_mapping(
+                {b: float(np.mean([s.as_dict()[b] for s in per_source])) for b in self.bands},
+                fraction=1, quantity="Fmax", weighting="Z")
         return average_spectra(per_source)
 
     def channel_spectrum(self, channel: int) -> Spectrum:
@@ -319,7 +334,12 @@ class Session:
         """
         if not self.background:
             return None
-        wanted = {float(b): self.background[b] for b in self.background
+        background = self.background
+        if self.source is ImpactSource.BANG and set(background) != set(self.bands):
+            # Background is Leq: third-octave energy summation is valid here.
+            from .standards.korea import octave_from_third
+            background = octave_from_third(Spectrum.from_mapping(background, fraction=3)).as_dict()
+        wanted = {float(b): background[b] for b in background
                   if float(b) in {float(x) for x in self.bands}}
         if len(wanted) < len(self.bands):
             return None  # incomplete for this source; treated as "not measured"
@@ -412,6 +432,18 @@ class Session:
                 result.warnings.append(
                     "volume/reverberation missing — values are not standardised"
                 )
+
+        if self.source is ImpactSource.BANG:
+            result.legacy = True
+            try:
+                legacy_curve = InverseACurve.legacy_heavy()
+                result.inverse_a = rate_with_curve(spectrum, legacy_curve)
+                result.inverse_a.quantity = "L'i,Fmax,AW (legacy bang)"
+                result.warnings.append("Legacy method: receiver energy average, source arithmetic average; no 49 dB post-verification verdict")
+                result.warnings.append("Curve checked against published 2013 test report; confirm the project's applicable KS edition")
+            except (KeyError, ValueError) as exc:
+                result.warnings.append(f"legacy inverse-A rating failed: {exc}")
+            return result
 
         # 1) Post-verification single number. The two impact sources are rated by
         #    different procedures — 국토교통부 고시 제2022-868호 replaced the old
@@ -535,6 +567,7 @@ class Session:
                     timestamp=raw.get("timestamp", ""),
                     valid=bool(raw.get("valid", True)),
                     note=raw.get("note", ""),
+                    fraction=int(raw.get("fraction", 3)),
                 )
             )
         session.measurements.sort(key=lambda m: m.key)
