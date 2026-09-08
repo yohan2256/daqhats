@@ -31,6 +31,7 @@ from app.options import (  # noqa: E402
 )
 from app.widgets import LevelBars, SpectrumGrid, StatusLight, channel_label  # noqa: E402
 from app.worker import CommandWorker  # noqa: E402
+from app.health import HealthPanel  # noqa: E402
 from pislm import CommandError, Handshake, PiSLM  # noqa: E402
 from pislm.excitation import (  # noqa: E402
     ExcitationSettings,
@@ -149,6 +150,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_ui(host, control, stream)
 
+        # Separate worker: a capture can occupy the command worker for minutes.
+        # Only one health request may be queued/in flight at a time.
+        self._health_pending = False
+        self.health_worker = CommandWorker(self)
+        self.health_worker.finished_job.connect(self._on_health_done)
+        self.health_worker.failed_job.connect(self._on_health_failed)
+        self.health_worker.start()
+        self.health_timer = QtCore.QTimer(self)
+        self.health_timer.timeout.connect(self._poll_health)
+        self.health_timer.start(2000)
+
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._refresh_live)
         self.timer.start(60)
@@ -237,6 +249,9 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(self.record_label)
         bar.addWidget(self.status)
         layout.addLayout(bar)
+
+        self.health_panel = HealthPanel()
+        layout.addWidget(self.health_panel)
 
         # Live meters
         meters = QtWidgets.QHBoxLayout()
@@ -773,6 +788,36 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.device_text, 1)
         return page
 
+    def _poll_health(self) -> None:
+        if self._closing or self.pi is None or self._health_pending:
+            return
+        pi = self.pi
+        self._health_pending = True
+
+        def query():
+            try:
+                return pi, pi.health(), None
+            except Exception as exc:
+                return pi, None, str(exc)
+
+        self.health_worker.submit("health", query)
+
+    def _on_health_done(self, _name, result) -> None:
+        self._health_pending = False
+        pi, payload, error = result
+        # Replies from a disconnected/replaced client must not overwrite the UI.
+        if self._closing or pi is not self.pi:
+            return
+        if error is not None or not isinstance(payload, dict):
+            self.health_panel.unavailable("조회 실패 — 연결 상태 확인")
+        else:
+            self.health_panel.update_snapshot(payload)
+
+    def _on_health_failed(self, _name, _message, _traceback) -> None:
+        self._health_pending = False
+        if not self._closing and self.pi is not None:
+            self.health_panel.unavailable("조회 실패")
+
     # ── Job submission ──
     def _submit(self, name: str, func, message: str = "") -> None:
         if self.pi is None and name != "connect":
@@ -787,6 +832,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _toggle_connection(self) -> None:
         if self.pi is not None:
             pi, self.pi = self.pi, None
+            self.health_panel.unavailable("연결 안 됨")
             self.worker.submit("disconnect", pi.close, "Disconnecting")
             self.connect_btn.setText("Connect")
             self.scan_btn.setEnabled(False)
@@ -1811,6 +1857,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_job_done(self, name: str, result) -> None:
         if name == "connect":
             self.pi = result
+            self.health_panel.unavailable("조회 중")
+            self._poll_health()
             self.connect_btn.setText("Disconnect")
             self.scan_btn.setEnabled(True)
             self.live.configure_bands(self.pi.config)
@@ -2274,6 +2322,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._closing = True
         self._player.stop()          # do not leave a tone playing after close
         self.timer.stop()
+        self.health_timer.stop()
+        self.health_worker.stop()
         self.worker.stop()
         self._stop_recording()  # finalise open WAV headers
         if self.pi is not None:

@@ -518,3 +518,23 @@ loss (`--drop`) and overloads (`--overload`).
 1. **Report output** — currently text export only; a docx/PDF template is needed
 2. **Position layout checks** — ISO 16283-2 Annexes E/F position rules
 3. **Continuous session recording** — only ring-buffer snapshots today
+
+### 라즈베리파이 / UPS 상태 표시
+
+연결하면 화면 상단에서 2초마다 Pi 전체 CPU 사용률, CPU 온도/클럭,
+메모리 사용률과 가용/전체 용량, 루트 디스크 여유, 가동 시간을 조회합니다.
+별도 상태 조회 스레드를 사용하고 동시에 한 요청만 허용하므로 측정 작업
+대기열에 상태 요청이 쌓이지 않습니다. 타임아웃은 1초이며 조회 실패 또는
+연결 해제 시 이전 정상값을 지웁니다. 이전 서버에서는 정보 없음으로 표시됩니다.
+서버와 PC 프로그램을 함께 업데이트해야 시스템 정보를 확인할 수 있습니다.
+
+UPS 잔량은 전압 기반 추정치이며 전압/전류/전력과 자료 경과 시간도 표시됩니다.
+UPS는 기존 INA219 모니터 서비스가 `/run/pislm-ups-status.json`에 기록한 값을
+읽습니다. 설치/활성화는 `pi_server/INSTALL.md`의 14.1절을 따르세요.
+배터리 팩에 맞는 전압 범위 설정이 필요합니다. UPS 서비스가 없거나 값이
+오래되면 정보 없음/갱신 지연을 표시하며 잔여 운전시간이나 충전 상태를
+추측하지 않습니다. PC 앱은 UPS 자동 종료 정책을 변경하지 않습니다.
+
+표시상 주의 기준은 CPU/메모리 사용률 90%, CPU 온도 80°C, UPS 잔량 20%입니다.
+이는 측정 적합성 판정이나 실제 스로틀링 검출이 아닌 운영 참고 경고입니다.
+Pi 4의 실제 측정 부하와 UPS 실장비 연동은 현장에서 확인해야 합니다.

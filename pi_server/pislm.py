@@ -79,6 +79,7 @@ except ImportError:  # pragma: no cover - Python 2 fallback
     import Queue as queue
 
 from devices import open_backends, ChannelMap, Mcc172Backend
+from health import SystemHealth, ups_snapshot
 
 PROTOCOL_VERSION = 'pislm/4'
 
@@ -786,6 +787,7 @@ class Controller:
         storage = settings.get('storage', {})
         self.buffer_seconds = storage.get('buffer_seconds', 60.0)
         self.ups_cfg = dict(settings.get('ups', {}))
+        self._system_health = SystemHealth()
         # DSP worker processes: -1 = auto (cpu_count-1), 0 = inline.
         self.dsp_workers = settings.get('dsp', {}).get('workers', -1)
         # Target acquisition block length. The band bank costs one
@@ -1609,24 +1611,9 @@ class Controller:
         connection. Missing/stale/malformed is reported, never raised:
         a UPS (or its monitor service) being absent must not affect
         anything else pislm does."""
-        path = self.ups_cfg.get('status_file', '/run/pislm-ups-status.json')
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            return {'available': False}
-        age = wall_time() - data.get('timestamp', 0)
-        stale_after = self.ups_cfg.get('stale_after_seconds', 60.0)
-        return {
-            'available': True,
-            'stale': age > stale_after,
-            'age_seconds': round(age, 1),
-            'percent': data.get('percent'),
-            'bus_voltage_v': data.get('bus_voltage_v'),
-            'current_ma': data.get('current_ma'),
-            'power_w': data.get('power_w'),
-            'low_battery_hold_seconds': data.get('low_battery_hold_seconds'),
-        }
+        return ups_snapshot(
+            self.ups_cfg.get('status_file', '/run/pislm-ups-status.json'),
+            self.ups_cfg.get('stale_after_seconds', 60.0))
 
     def _require_output_configured(self):
         if self._output_dev_idx is None:
@@ -1935,6 +1922,8 @@ class Controller:
     def _cmd_status(self, _req):
         armed = bool(self.trigger_cfg.get('enabled')) and self._running
         return {'running': self._running,
+                'system': self._system_health.snapshot(),
+                'ups': self._ups_snapshot(),
                 'devices': [{'index': i, 'type': b.name,
                              'running': b.running,
                              'actual_rate': b.actual_rate,

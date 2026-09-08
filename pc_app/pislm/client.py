@@ -289,6 +289,10 @@ class PiSLM:
     def ping(self, timeout: float = 3.0) -> bool:
         return self.control.ping(timeout)
 
+    def health(self) -> dict:
+        """Small read-only status request; compatible with older servers."""
+        return self.control.send("status", timeout=1.0)
+
     def status(self) -> dict:
         """Small per-device snapshot. No dsp/network — use get_config (§9.10)."""
         return self.control.send("status")

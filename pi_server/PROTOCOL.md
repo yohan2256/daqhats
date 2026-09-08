@@ -1203,3 +1203,22 @@ normal, not a bug.
 - The output is held at 0 V from server startup until the first
   `output_start`.
 - Only channel `0` exists; `set_output` rejects any other `channel` value.
+
+### Host health in `status` (optional, backward-compatible)
+
+`status` now includes `system` and `ups` alongside existing scan/device fields.
+No acquisition is required. Older servers omit these fields; clients must show
+unavailable rather than zero. DSP/network counters remain in `get_config`.
+
+`system` contains `available`, Unix `timestamp`, `cpu_percent` (aggregate 0–100,
+first sample null), `temperature_c`, `cpu_frequency_mhz` (CPU 0),
+`memory_total_bytes`, `memory_available_bytes`, `memory_used_percent`,
+`disk_total_bytes`, `disk_free_bytes` (root filesystem), and `uptime_seconds`.
+Unavailable readings are null. CPU is the delta between queries; readings are
+cached for one second across clients. Memory uses Linux MemAvailable, including
+reclaimable memory. Kernel definitions: https://docs.kernel.org/filesystems/proc.html
+
+`ups` uses the existing handshake/get_config schema and configured status file.
+Missing/malformed files return `available:false`. Non-finite values become null;
+future or expired timestamps are stale. The measurement server does not poll I2C
+or change the independent UPS shutdown service.
