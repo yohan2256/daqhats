@@ -114,7 +114,7 @@ class AcousticModes(W.QDialog):
         self.role.setCurrentText('SLM' if general else ('PAIR' if key=='facade_traffic' else 'L1'))
         self.guide.setText({
             'SLM':'Calibrated A/C/Z levels, full-rate Fast/Slow maxima and peak; 10 ms LN/history. General spectrum 31.5–8000 Hz.',
-            'rooms':'L1: source room; L2: receiving room; B2: source OFF; T: switch noise OFF at Capture now. Keep each source ID separate. Use multiple spatial positions.',
+            'rooms':'L1: source room; L2: receiving room; B2: source OFF; T: SET + 3 gated-noise cycles (XL2 procedure). Keep each source ID separate. Use multiple spatial positions.',
             'facade_ls':'Whole facade: L1 microphone 2 m outside facade; L2/B2/T indoors. External loudspeaker must remain stable between phases.',
             'facade_traffic':'Road traffic: PAIR captures the outside 2 m reference and indoor channels in the SAME acquisition device/window. Take B2 separately with the test source absent.',
             'element_45':'Window/element: L1 is a SURFACE microphone; loudspeaker incidence 45°. Enter specimen area, receiving volume and T. R′45° includes flanking transmission; it is not laboratory Rw.'}[key])
@@ -144,6 +144,18 @@ class AcousticModes(W.QDialog):
                     raise ValueError('PAIR must use one acquisition device to guarantee a common sample window')
             if not settings['position']: raise ValueError('Enter a microphone position')
         except Exception as exc: self.notice.setText(str(exc)); return
+        if settings['role']=='T':
+            from app.rt_sequence import RTSequence
+            dialog=RTSequence(self,self.pi,settings['channels'],airborne.BANDS,3)
+            if dialog.exec() and dialog.accepted_results is not None:
+                report=dialog.report()
+                for ch,entries in report['summary'].items():
+                    self.records.append(dict(settings,channel=ch,position=f"{settings['position']}/Ch{ch+1}",
+                        origin='rt_sequence',captured_at=datetime.now(timezone.utc).isoformat(),
+                        data=dict(bands={b:e['mean_s'] for b,e in entries.items()},rt_sequence=report)))
+                self.last_dumps=None; self._invalidate(); self._render_records(); self._update_t()
+                self.notice.setText('Repeated RT stored with cycle diagnostics and comparison data')
+            return
         self.busy=True; self.cancel.clear(); self.controls.setEnabled(False); self.start.setEnabled(False)
         def run():
             frac=settings['fraction'] if settings['mode']=='SLM' else 3

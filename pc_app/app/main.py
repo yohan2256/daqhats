@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from pislm.standards.interrupted import interrupted_spectrum
+
 import logging
 import sys
 import time
@@ -214,10 +216,25 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = AcousticModes(self)
         dialog.exec()
 
+    def _open_rt_sequence(self):
+        if self.pi is None or self.live.capturing or self.recorder.recording or self.worker.busy:
+            self._warn("Connect and finish the current operation first")
+            return
+        channels = self._reverb_selected_channels()
+        if not channels:
+            self._warn("Select microphones for reverberation")
+            return
+        from app.rt_sequence import RTSequence
+        dialog = RTSequence(self, self.pi, channels, self.session.bands, self.session.fraction)
+        if dialog.exec() and dialog.accepted_results is not None:
+            self.session.reverberation_records.append(dialog.report())
+            self._store_reverberation(dialog.accepted_results)
+
     # ── UI construction ──
     def _build_ui(self, host: str, control: int, stream: int) -> None:
         modes = self.menuBar().addMenu("&Measurement modes")
         modes.addAction("Sound level / airborne / facade…", self._open_acoustic_modes)
+        modes.addAction("Reverberation — XL2 procedure / comparison…", self._open_rt_sequence)
         menu = self.menuBar().addMenu("&Settings")
         self.options_action = menu.addAction("Instrument options…")
         self.options_action.setShortcut("Ctrl+,")
@@ -489,7 +506,7 @@ class MainWindow(QtWidgets.QMainWindow):
         external_row = QtWidgets.QHBoxLayout(self.external_box)
         self.external_method = QtWidgets.QComboBox()
         self.external_method.addItem("Play from this computer", "soundcard")
-        self.external_method.addItem("Interrupted noise — record the decay", "noise")
+        self.external_method.addItem("Interrupted noise — XL2 procedure / 3 cycles", "noise")
         self.external_method.addItem("Sine sweep file — deconvolve", "sweep")
         self.external_method.currentIndexChanged.connect(self._on_reverb_source_changed)
 
@@ -562,6 +579,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reverb_seconds.setSuffix(" s")
         self.reverb_method = QtWidgets.QComboBox()
         self.reverb_method.addItems(["T20", "T30"])
+        sequence_btn = QtWidgets.QPushButton("SET / 3 cycles — XL2")
+        sequence_btn.clicked.connect(self._open_rt_sequence)
         measure_btn = QtWidgets.QPushButton("Capture decay \u2192 compute T")
         measure_btn.clicked.connect(self._measure_reverberation)
         auto_btn = QtWidgets.QPushButton("Output + measure")
@@ -573,7 +592,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for widget in (
             QtWidgets.QLabel("Window"), self.reverb_seconds,
             QtWidgets.QLabel("Method"), self.reverb_method,
-            auto_btn, measure_btn, clear_btn,
+            sequence_btn, auto_btn, measure_btn, clear_btn,
         ):
             controls.addWidget(widget)
         controls.addStretch(1)
@@ -1399,18 +1418,23 @@ class MainWindow(QtWidgets.QMainWindow):
             if settings is not None and settings.signal.is_deterministic:
                 signal = impulse_response(signal, settings, dump.sample_rate)
             try:
-                _, results = reverberation_spectrum(
+                analyse = (reverberation_spectrum if settings is not None and
+                           settings.signal.is_deterministic else interrupted_spectrum)
+                _, results = analyse(
                     signal, dump.sample_rate, bands, method=method, fraction=fraction
                 )
             except Exception as exc:  # noqa: BLE001
                 failures.append(f"{channel_label(channel)}: {exc}")
                 continue
-            if results:
+            rejected = [b for b in bands if b not in results or not results[b].reliable]
+            if rejected:
+                failures.append(f"{channel_label(channel)}: unreliable RT bands {rejected}")
+            else:
                 per_channel.append(results)
 
-        if not per_channel:
+        if failures or not per_channel:
             raise RuntimeError(
-                "No microphone produced a usable decay. " + "; ".join(failures)
+                "Reverberation not stored: incomplete or unreliable measurement. " + "; ".join(failures)
             )
         self._reverb_failures = failures
         return self._merge_channels(per_channel)
@@ -1685,6 +1709,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _toggle_external_recording(self) -> None:
+        if self.external_method.currentData() == "noise":
+            self._open_rt_sequence()
+            return
         if self.pi is None or not self.pi.config.running:
             self._warn("The scan must be running before you can record")
             return
