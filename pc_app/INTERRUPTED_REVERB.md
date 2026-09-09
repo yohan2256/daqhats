@@ -35,3 +35,52 @@ trigger UI is added here. Low-frequency single-run fluctuations and filter
 ring-down still limit fits. This is a conservative first correction, not a
 claim of complete standards compliance. Full GUI regression was not rerun:
 pytest/PySide6 are unavailable in this runtime. Modified Python files compile.
+
+## XL2-style guided procedure (September 9 follow-up)
+
+Open **Measurement modes → Reverberation — XL2 procedure / comparison**, or
+**SET / 3 cycles — XL2** on the reverberation tab. Airborne/facade phase T also
+opens this workflow. External noise recording uses the same dialog. The
+operator controls the external pink-noise source; this does not control an
+XL2 or its generator by USB.
+
+1. Keep the source OFF and click SET. Three seconds of fresh background are
+   captured. Each band shows its background level and target source-on level:
+   background +35 dB for T20, +45 dB for T30.
+2. Click START and follow NOISE (ON) / DECAY (OFF) countdowns for three cycles.
+   Default ON/OFF durations are 5/5 seconds and adjustable before SET. Allow
+   enough OFF time for the decay to reach background with at least 1 s tail.
+3. Inspect CYC curves, regression lines and noise floors. AVRG is the arithmetic
+   mean of per-cycle RT at each microphone. Repeat sample SD is displayed;
+   it is NOT the XL2 uncertainty factor. Add cycles or exclude a bad cycle;
+   excluded diagnostics remain in the JSON audit record.
+4. Every selected band/microphone needs at least three usable fits. Incomplete
+   bands cannot be applied. Correlation/curvature warnings are visible for
+   operator review rather than automatically labelling the room invalid based
+   on the legacy r>=0.98 gate. Applying requires an explicit curve/quality
+   review checkbox. This review is not a standards-compliance certification.
+5. Enter the XL2's band RT values to view differences in seconds. Match T20/T30,
+   band resolution, position and source cycles. The optional 1/1-octave view
+   covers 63–8000 Hz; mismatched bands cannot be applied to the impact session.
+   No 1/3-octave RT values are inferred by combining octave RTs.
+6. Export JSON (curves, SET, cycles, exclusions, quality and reference values)
+   and CSV (cycles, mean, SD, XL2 differences). Applied impact results also
+   retain diagnostics in the saved session; acoustic-mode sessions retain them
+   in their T records. A fresh SET is required after calibration/rate changes.
+
+Sources: NTi's [public procedure](https://www.nti-audio.com/en/applications/room-building-acoustics/reverberation-time)
+requires SET in a quiet room and three on/off cycles. The manufacturer's
+[XL2 manual](https://www.nti-audio.com/wp-content/uploads/XL2-Manual.pdf)
+describes CYC/AVRG, per-band level markers, correlation and uncertainty, and
+uses the term Schroeder method for its RT function. This implementation does
+NOT claim firmware equivalence: trigger details, internal decay processing,
+acceptance logic and uncertainty formula are not reproduced. Our noise path
+remains documented direct short-time-power regression, with no blanket
+Schroeder integration of the entire source-on recording. Matching the visible
+procedure is a starting point for comparison against the user's XL2.
+
+Validation: 10 sequence/backend tests plus the four prior interrupted-noise
+tests pass. Two added GUI state tests are available but skipped in this runtime
+because PySide6 is unavailable; no physical XL2 or Pi was exercised. The
+uploaded 27 s file has only one interruption and is not treated as three
+independent measurements. Absolute agreement with XL2 remains unverified.

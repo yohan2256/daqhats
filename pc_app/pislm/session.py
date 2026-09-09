@@ -221,6 +221,8 @@ class Session:
     #: Calibration record (channel -> sensitivity)
     calibration: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    #: Auditable SET/cycle/quality records for applied reverberation measurements.
+    reverberation_records: list[dict] = field(default_factory=list)
 
     # ── Bands ──
     @property
@@ -512,6 +514,7 @@ class Session:
             "background": {str(k): v for k, v in self.background.items()},
             "calibration": dict(self.calibration),
             "notes": list(self.notes),
+            "reverberation_records": list(self.reverberation_records),
             "measurements": [
                 {**asdict(m), "levels": {str(k): v for k, v in m.levels.items()}}
                 for m in self.measurements
@@ -553,6 +556,7 @@ class Session:
             background={float(k): float(v) for k, v in data.get("background", {}).items()},
             calibration=dict(data.get("calibration", {})),
             notes=list(data.get("notes", [])),
+            reverberation_records=list(data.get("reverberation_records", [])),
         )
         for raw in data.get("measurements", []):
             session.measurements.append(

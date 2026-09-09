@@ -42,7 +42,8 @@ def switch_off(x, fs):
     return off
 
 
-def interrupted_spectrum(x, fs, centers, *, method='T20', fraction=3):
+def interrupted_spectrum(x, fs, centers, *, method='T20', fraction=3,
+                         background_power=None, headroom_db=5., diagnostics=None):
     if method not in EVALUATION_RANGES:
         raise ValueError('Choose T20 or T30')
     x = np.asarray(x, dtype=float)
@@ -56,8 +57,12 @@ def interrupted_spectrum(x, fs, centers, *, method='T20', fraction=3):
             y = signal.sosfilt(signal.butter(6, [low, high], 'bandpass', fs=fs, output='sos'), x)
             reference = np.mean(y[max(0, off-round(.5*fs)):off]**2)
             noise = np.mean(y[-round(fs):]**2)
+            if background_power is not None:
+                noise = max(noise, float(background_power[center]))
+                if not np.isfinite(noise) or noise <= 0:
+                    raise ValueError("Invalid SET background")
             snr = 10*np.log10(reference/max(noise, np.finfo(float).tiny))
-            required = abs(EVALUATION_RANGES[method][1])+5
+            required = abs(EVALUATION_RANGES[method][1])+headroom_db
             if not np.isfinite(snr) or snr < required:
                 raise ValueError('Insufficient band signal-to-background range')
             n = max(1, round(.01*fs))
@@ -65,7 +70,7 @@ def interrupted_spectrum(x, fs, centers, *, method='T20', fraction=3):
             curve = 10*np.log10(np.maximum(e/reference, np.finfo(float).tiny))
             def fit(which):
                 upper, lower = EVALUATION_RANGES[which]
-                if snr < abs(lower)+5:
+                if snr < abs(lower)+headroom_db:
                     raise ValueError('Insufficient range')
                 # A brief stochastic dip must not choose the end of the decay.
                 def crossing(level):
@@ -84,17 +89,26 @@ def interrupted_spectrum(x, fs, centers, *, method='T20', fraction=3):
                 rt = -60/slope
                 if n/fs >= rt/12:
                     raise ValueError('Decay too short for averaging interval')
-                return float(rt), _correlation(v, slope*t+intercept)
-            rt, corr = fit(method)
+                return float(rt), _correlation(v, slope*t+intercept), (a, b, float(slope), float(intercept))
+            rt, corr, fitted = fit(method)
             curvature = None
             try:
-                t20, _ = fit('T20'); t30, _ = fit('T30')
+                t20, _, _ = fit('T20'); t30, _, _ = fit('T30')
                 curvature = 100*(t30/t20-1)
             except ValueError:
                 pass
             result = DecayResult(rt, method, corr, float(snr), curvature, center)
+            if diagnostics is not None:
+                a, b, slope, intercept = fitted
+                diagnostics[center] = dict(off_seconds=off/fs,
+                    time_s=((np.arange(len(curve))+.5)*n/fs).tolist(),
+                    level_db=curve.tolist(), fit_start_s=(a+.5)*n/fs,
+                    fit_end_s=(b+.5)*n/fs, slope=slope, intercept=intercept,
+                    noise_db=-float(snr), reference_power=float(reference))
             results[center] = result
             values.append(rt)
-        except (ValueError, FloatingPointError):
+        except (ValueError, FloatingPointError) as exc:
+            if diagnostics is not None:
+                diagnostics[center] = dict(error=str(exc))
             values.append(float('nan'))
     return Spectrum(centers=tuple(centers), levels=tuple(values), fraction=fraction, label=f"interrupted noise {method} (s)"), results
