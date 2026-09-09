@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from pislm.standards.interrupted import interrupted_spectrum
+
 import logging
 import sys
 import time
@@ -1399,18 +1401,23 @@ class MainWindow(QtWidgets.QMainWindow):
             if settings is not None and settings.signal.is_deterministic:
                 signal = impulse_response(signal, settings, dump.sample_rate)
             try:
-                _, results = reverberation_spectrum(
+                analyse = (reverberation_spectrum if settings is not None and
+                           settings.signal.is_deterministic else interrupted_spectrum)
+                _, results = analyse(
                     signal, dump.sample_rate, bands, method=method, fraction=fraction
                 )
             except Exception as exc:  # noqa: BLE001
                 failures.append(f"{channel_label(channel)}: {exc}")
                 continue
-            if results:
+            rejected = [b for b in bands if b not in results or not results[b].reliable]
+            if rejected:
+                failures.append(f"{channel_label(channel)}: unreliable RT bands {rejected}")
+            else:
                 per_channel.append(results)
 
-        if not per_channel:
+        if failures or not per_channel:
             raise RuntimeError(
-                "No microphone produced a usable decay. " + "; ".join(failures)
+                "Reverberation not stored: incomplete or unreliable measurement. " + "; ".join(failures)
             )
         self._reverb_failures = failures
         return self._merge_channels(per_channel)

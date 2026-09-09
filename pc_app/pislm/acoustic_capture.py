@@ -4,7 +4,7 @@ import numpy as np
 from .control import CommandError
 from .standards.sound_level import PREHISTORY, levels
 from .standards.airborne import BANDS
-from .standards.reverberation import reverberation_spectrum
+from .standards.interrupted import interrupted_spectrum
 
 
 def capture(pi, seconds, channels, *, role='SLM', time_weighting='Fast', fraction=3,
@@ -64,7 +64,7 @@ def capture(pi, seconds, channels, *, role='SLM', time_weighting='Fast', fractio
             n = int(seconds*d.sample_rate)
             if x.size < n or not np.isfinite(x).all():
                 raise ValueError('Incomplete/non-finite decay')
-            _,decays = reverberation_spectrum(x[-n:], d.sample_rate, BANDS, method='T20')
+            _,decays = interrupted_spectrum(x, d.sample_rate, BANDS, method='T20')
             if any(b not in decays or not decays[b].reliable for b in BANDS):
                 raise ValueError('Decay fit incomplete/unreliable; increase signal-to-noise and repeat')
             result = dict(bands={b:decays[b].t60 for b in BANDS},
